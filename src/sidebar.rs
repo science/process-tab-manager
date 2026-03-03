@@ -1,9 +1,15 @@
+use std::rc::Rc;
+
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{Label, ListBox, ListBoxRow};
+use x11rb::rust_connection::RustConnection;
 
 use crate::filter::Filter;
+use crate::geometry;
 use crate::state::AppState;
+use crate::x11::actions;
+use crate::x11::connection::AtomCache;
 
 /// Sidebar manages the GTK ListBox displaying tracked windows.
 #[derive(Clone)]
@@ -22,9 +28,55 @@ impl Sidebar {
         &self.listbox
     }
 
+    /// Set up click handler for focusing/snapping windows.
+    pub fn connect_click(
+        &self,
+        conn: Rc<RustConnection>,
+        atoms: Rc<AtomCache>,
+        root: u32,
+        window: gtk::ApplicationWindow,
+    ) {
+        self.listbox.connect_row_activated(move |_listbox, row| {
+            let wid = parse_wid_from_name(&row.widget_name());
+            let Some(wid) = wid else { return };
+
+            // Check for Ctrl modifier
+            let ctrl_pressed = gdk4::Display::default()
+                .and_then(|d| d.default_seat())
+                .and_then(|seat| seat.keyboard())
+                .map(|kb| {
+                    let modifiers = kb.modifier_state();
+                    modifiers.contains(gdk4::ModifierType::CONTROL_MASK)
+                })
+                .unwrap_or(false);
+
+            // Activate the window
+            if let Err(e) = actions::activate_window(&conn, root, wid, &atoms) {
+                log::error!("Failed to activate window 0x{:08x}: {}", wid, e);
+                return;
+            }
+
+            if !ctrl_pressed {
+                // Get sidebar geometry for snap calculation
+                let sidebar_rect = geometry::Rect {
+                    x: 0, // GTK4 doesn't expose toplevel position easily; default to 0
+                    y: 0,
+                    width: window.width() as u32,
+                    height: window.height() as u32,
+                };
+
+                let workarea = get_workarea_estimate(&window);
+                let pos = geometry::snap_position(&sidebar_rect, &workarea);
+
+                if let Err(e) = actions::move_window(&conn, wid, pos.x, pos.y) {
+                    log::error!("Failed to move window 0x{:08x}: {}", wid, e);
+                }
+            }
+        });
+    }
+
     /// Fully rebuild the ListBox from current state + filter.
     pub fn rebuild(&self, state: &AppState, filter: &Filter) {
-        // Remove all existing rows
         while let Some(child) = self.listbox.first_child() {
             self.listbox.remove(&child);
         }
@@ -47,8 +99,6 @@ impl Sidebar {
 
             let row = ListBoxRow::new();
             row.set_child(Some(&label));
-
-            // Store window ID as widget name for lookup
             row.set_widget_name(&format!("wid-{}", entry.id));
 
             if Some(entry.id) == active {
@@ -59,7 +109,6 @@ impl Sidebar {
         }
     }
 
-    /// Highlight the active window row.
     pub fn set_active(&self, wid: u32) {
         let target_name = format!("wid-{}", wid);
         let mut idx = 0;
@@ -74,14 +123,12 @@ impl Sidebar {
         }
     }
 
-    /// Update a single window's title in the list (avoids full rebuild).
     pub fn update_title(&self, wid: u32, title: &str) {
         let target_name = format!("wid-{}", wid);
         let mut idx = 0;
         while let Some(row) = self.listbox.row_at_index(idx) {
             if row.widget_name() == target_name {
                 if let Some(label) = row.child().and_then(|c| c.downcast::<Label>().ok()) {
-                    // Keep the class prefix in the display text
                     let current = label.text();
                     if let Some(colon_pos) = current.find(": ") {
                         let class_prefix = &current[..colon_pos];
@@ -95,5 +142,31 @@ impl Sidebar {
             }
             idx += 1;
         }
+    }
+}
+
+fn parse_wid_from_name(name: &str) -> Option<u32> {
+    name.strip_prefix("wid-")?.parse().ok()
+}
+
+fn get_workarea_estimate(window: &gtk::ApplicationWindow) -> geometry::Rect {
+    let display = gtk::prelude::WidgetExt::display(window);
+    if let Some(surface) = window.surface() {
+        if let Some(monitor) = display.monitor_at_surface(&surface) {
+            let geo = monitor.geometry();
+            return geometry::Rect {
+                x: geo.x(),
+                y: geo.y(),
+                width: geo.width() as u32,
+                height: geo.height() as u32,
+            };
+        }
+    }
+
+    geometry::Rect {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
     }
 }

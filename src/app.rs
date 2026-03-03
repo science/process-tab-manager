@@ -166,6 +166,9 @@ fn activate(app: &Application) {
         .child(&vbox)
         .build();
 
+    // Connect click handler for focus + snap
+    sidebar.connect_click(Rc::clone(&conn), Rc::clone(&atoms), root, window.clone());
+
     window.present();
 }
 

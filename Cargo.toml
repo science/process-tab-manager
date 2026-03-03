@@ -8,8 +8,8 @@ description = "Vertical sidebar for managing application windows on Linux/X11"
 [dependencies]
 gtk4 = "0.10"
 gdk4 = "0.10"
-glib = "0.20"
-gio = "0.20"
+glib = "0.21"
+gio = "0.21"
 x11rb = { version = "0.13", features = ["extra-traits"] }
 x11rb-protocol = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -21,15 +21,3 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "spike-x11"
-path = "src/bin/spike_x11.rs"
-
-[[bin]]
-name = "spike-gtk"
-path = "src/bin/spike_gtk.rs"
-
-[[bin]]
-name = "spike-bridge"
-path = "src/bin/spike_bridge.rs"

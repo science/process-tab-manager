@@ -130,8 +130,8 @@ process-tab-manager/
 [dependencies]
 gtk4 = "0.10"
 gdk4 = "0.10"
-glib = "0.20"
-gio = "0.20"
+glib = "0.21"
+gio = "0.21"
 x11rb = { version = "0.13", features = ["extra-traits"] }
 x11rb-protocol = "0.13"              # For testable protocol type parsing
 serde = { version = "1", features = ["derive"] }

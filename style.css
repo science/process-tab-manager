@@ -1,0 +1,42 @@
+/* Process Tab Manager — Dark theme CSS for GTK4 */
+
+window {
+    background-color: #2b2b2b;
+    color: #e0e0e0;
+}
+
+listbox {
+    background-color: #2b2b2b;
+}
+
+listbox row {
+    padding: 6px 10px;
+    border-bottom: 1px solid #3a3a3a;
+    color: #e0e0e0;
+}
+
+listbox row:hover {
+    background-color: #3a3a3a;
+}
+
+listbox row:selected {
+    background-color: #264f78;
+    color: #ffffff;
+}
+
+.ptm-active {
+    background-color: #264f78;
+    color: #ffffff;
+}
+
+label {
+    font-family: "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 13px;
+}
+
+.ptm-header {
+    font-weight: bold;
+    font-size: 14px;
+    padding: 8px 10px;
+    color: #cccccc;
+}

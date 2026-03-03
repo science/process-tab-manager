@@ -2,6 +2,43 @@
 
 A vertical sidebar app for managing application windows on Linux/X11. Think "Firefox vertical tabs" but for any application — terminals, browsers, image editors, whatever you configure.
 
+## Current Status
+
+**Phase 1 (MVP) — COMPLETE.** Phase 1.9 (cleanup) is next.
+
+| Phase | Status | What it delivered |
+|-------|--------|-------------------|
+| Phase 0 | DONE | Rust + GTK4 + x11rb proven, spikes deleted |
+| Phase 1.1 | DONE | Config + Filter modules (14 tests) |
+| Phase 1.2 | DONE | X11 window discovery — EWMH parsing (15 tests) |
+| Phase 1.3 | DONE | Event loop bridge — PtmEvent translation (8 tests) |
+| Phase 1.4 | DONE | GTK4 sidebar with live window list (9 state tests) |
+| Phase 1.5 | DONE | Click to focus + snap positioning (5 geometry tests) |
+| Phase 1.6 | DONE | Double-click inline rename (6 tests) |
+| Phase 1.7 | DONE | Up/down reorder buttons (5 tests) |
+| Phase 1.8 | DONE | JSON persistence to ~/.config/ (10 tests) |
+| VM E2E | DONE | Test infra: cinnamon-dev VM, 8 E2E tests passing |
+| **Phase 1.9** | **NEXT** | **Cleanup: filter self, cross-workspace, row.rs extraction** |
+| Phase 2.1 | Planned | Visual polish (icons, keyboard nav, context menus) |
+| Phase 2.2 | Planned | Tab groups |
+| Phase 2.3 | Planned | Snap-to-adopt window capture |
+
+**Total tests:** 72 unit + 8 E2E = 80
+
+**How to run it:**
+```bash
+# Build (on host)
+cd ~/dev/process-tab-manager
+source ~/.cargo/env && cargo build --release
+
+# Run in VM (where there's an X11 desktop)
+./vm/vm-ctl.sh ssh "DISPLAY=:0 /mnt/host-dev/process-tab-manager/target/release/process-tab-manager &"
+./vm/vm-ctl.sh viewer   # SPICE viewer to see the desktop
+
+# Or run unit tests (no display needed)
+cargo test
+```
+
 ## Core Concept
 
 This is a **window management tool**, not a terminal emulator. It doesn't embed or control applications — it discovers running windows, displays them in a vertical sidebar, and manages focus/positioning when you click one. Your existing terminal (or any app) is fine as-is.
@@ -189,7 +226,7 @@ In order to test this application, repeated E2E testing is necessary — use the
 **Build utility scripts to aid VM testing:** Scripts to uninstall everything, to run tests, to screenshot at key moments, to crop screenshots to correctly areas of screen, etc.
 ---
 
-## Phase 0 — Prerequisites + Verification Spikes
+## Phase 0 — Prerequisites + Verification Spikes ✅ DONE
 
 ### 0.1 — System setup
 ```bash
@@ -220,9 +257,11 @@ glib::unix_fd_source_new(fd, IOCondition::IN, Priority::DEFAULT, move |_fd, _con
 
 ---
 
-## Phase 1 — MVP (the 80/20)
+## Phase 1 — MVP (the 80/20) ✅ DONE
 
 Goal: a working vertical sidebar that lists terminal windows and focuses/positions them on click. Persistence included so restarts don't lose your organization.
+
+> **All sub-phases 1.1–1.8 are complete.** See Phase 1 Retrospective below for details. Phase 1.9 (cleanup) is the next work item.
 
 ### 1.1 — Config + Filter (TDD)
 1. **Test first:** `tests/config_test.rs` — default includes terminal classes, round-trips JSON, merges with defaults
@@ -320,7 +359,7 @@ pub enum PtmEvent {
 4. **E2E tests need expansion** — rename persistence, reorder persistence, snap behavior untested
 5. **Sidebar row construction is inline** — needs `row.rs` extraction before Phase 2 adds icons/menus
 
-### 1.9 — Pre-Phase 2 Cleanup
+### 1.9 — Pre-Phase 2 Cleanup ⬜ NEXT
 1. **Filter PTM's own window** from the list (match WM_CLASS or `_NET_WM_PID`)
 2. **Cross-workspace click:** detect target window's desktop, call `switch_desktop()` before `activate_window()`, skip snap for cross-workspace
 3. **Save on exit:** connect to `GtkApplication::shutdown` signal to save state
@@ -409,7 +448,7 @@ Rapidly open 10 xterms in quick succession. Verify all 10 appear in the sidebar 
 
 ---
 
-## Phase 2 — Polish & Grouping
+## Phase 2 — Polish & Grouping ⬜ PLANNED
 
 Phase 2 reordered based on Phase 1 experience: polish the single-list UX first (keyboard nav, icons, context menus), then add grouping on a solid foundation. The sidebar row widget needs extraction into `row.rs` before any of this (done in Phase 1.9).
 
@@ -458,7 +497,7 @@ The primary way to associate an arbitrary window with a group.
 
 ---
 
-## Phase 3 — Advanced (future ideas, not MVP)
+## Phase 3 — Advanced (future ideas, not MVP) ⬜ FUTURE
 
 ### 3.1 — Session persistence / restore
 - Save session: remember which app was running, with what working directory (for terminals, read /proc/PID/cwd), window title, group assignment

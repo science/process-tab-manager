@@ -40,3 +40,23 @@ label {
     padding: 8px 10px;
     color: #cccccc;
 }
+
+.ptm-reorder-btn {
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0px 4px;
+    font-size: 9px;
+    background-color: transparent;
+    color: #999999;
+    border: none;
+    box-shadow: none;
+}
+
+.ptm-reorder-btn:hover {
+    color: #ffffff;
+    background-color: #444444;
+}
+
+.ptm-reorder-btn:disabled {
+    color: #555555;
+}

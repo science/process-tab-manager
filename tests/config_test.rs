@@ -1,3 +1,4 @@
+use std::fs;
 use process_tab_manager::config::Config;
 
 #[test]
@@ -77,4 +78,45 @@ fn empty_json_gives_empty_config() {
 fn invalid_json_returns_error() {
     let result = Config::from_json("not json");
     assert!(result.is_err());
+}
+
+// -- Persistence tests (Phase 1.8) --
+
+#[test]
+fn save_and_load_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+
+    let config = Config::default();
+    config.save_to_file(&path).expect("save");
+
+    let loaded = Config::load_from_file(&path).expect("load");
+    assert_eq!(config.wm_classes(), loaded.wm_classes());
+}
+
+#[test]
+fn load_from_nonexistent_file_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nonexistent.json");
+    let result = Config::load_from_file(&path);
+    assert!(result.is_none());
+}
+
+#[test]
+fn load_from_invalid_file_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.json");
+    fs::write(&path, "not valid json").unwrap();
+    let result = Config::load_from_file(&path);
+    assert!(result.is_none());
+}
+
+#[test]
+fn save_creates_parent_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested").join("dir").join("config.json");
+
+    let config = Config::default();
+    config.save_to_file(&path).expect("save should create dirs");
+    assert!(path.exists());
 }

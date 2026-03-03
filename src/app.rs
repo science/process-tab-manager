@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use glib::IOCondition;
@@ -13,11 +14,46 @@ use crate::bridge::{self, AtomIds, PtmEvent};
 use crate::config::Config;
 use crate::filter::Filter;
 use crate::sidebar::Sidebar;
-use crate::state::AppState;
+use crate::state::{AppState, SavedState};
 use crate::x11::connection::{self as x11conn, AtomCache};
 use crate::x11::monitor;
 
 const APP_ID: &str = "com.github.science.ptm";
+
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("process-tab-manager")
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+fn state_path() -> PathBuf {
+    config_dir().join("state.json")
+}
+
+/// Schedule a debounced save of the current state.
+fn schedule_save(state: &Rc<RefCell<AppState>>, save_pending: &Rc<RefCell<bool>>) {
+    if *save_pending.borrow() {
+        return; // Already scheduled
+    }
+    *save_pending.borrow_mut() = true;
+
+    let state = Rc::clone(state);
+    let save_pending = Rc::clone(save_pending);
+    glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+        *save_pending.borrow_mut() = false;
+        let s = state.borrow();
+        let saved = s.to_saved();
+        if let Err(e) = saved.save_to_file(&state_path()) {
+            log::error!("Failed to save state: {}", e);
+        } else {
+            log::debug!("State saved");
+        }
+    });
+}
 
 pub fn run() -> glib::ExitCode {
     env_logger::init();
@@ -47,10 +83,15 @@ fn activate(app: &Application) {
     // Subscribe to root window events
     monitor::subscribe_root_events(&conn, root).expect("Failed to subscribe to root events");
 
-    // Set up shared state
-    let config = Config::default();
+    // Load config (file overrides merged with defaults)
+    let config = if let Some(user_config) = Config::load_from_file(&config_path()) {
+        Config::default().merge(&user_config)
+    } else {
+        Config::default()
+    };
     let filter = Filter::new(config.wm_classes().to_vec());
     let state = Rc::new(RefCell::new(AppState::new()));
+    let save_pending = Rc::new(RefCell::new(false));
 
     // Build sidebar
     let sidebar = Sidebar::new();
@@ -58,8 +99,24 @@ fn activate(app: &Application) {
     // Connect double-click rename handler
     sidebar.connect_rename(Rc::clone(&state));
 
+    // Store state+filter for reorder buttons
+    sidebar.set_reorder_state(Rc::clone(&state), filter.clone());
+
+    // Set up save-on-change callback
+    let state_for_save = Rc::clone(&state);
+    let save_pending_for_cb = Rc::clone(&save_pending);
+    sidebar.set_on_change(move || {
+        schedule_save(&state_for_save, &save_pending_for_cb);
+    });
+
     // Initial population
     refresh_state(&conn, root, &atoms, &filter, &state, &sidebar);
+
+    // Restore saved state (renames and ordering)
+    if let Some(saved) = SavedState::load_from_file(&state_path()) {
+        state.borrow_mut().restore_from(&saved);
+        sidebar.rebuild(&state.borrow(), &filter);
+    }
 
     // Bridge atom IDs
     let bridge_atoms = AtomIds {

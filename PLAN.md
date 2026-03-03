@@ -70,8 +70,13 @@ Investigated Python+GTK3+Wnck, TypeScript+GJS, and Rust+GTK4. Rust wins for this
   * Terminal: npm run dev
   * Firefox: UAT
 ```
-2. The design is that Tabs of various applications can be selected and grouped together to form a project. Grabbing a particular application instance/window for attaching to a project is the key idea, and UX for handling that will need to be designed. Mostly like a "color dropper" analogy would be effect. Click a "capture" button in the tab manager, and then click on a window, and the system will attach that window to the project.
+2. The design is that Tabs of various applications can be selected and grouped together to form a project. Grabbing a particular application instance/window for attaching to a project uses a **snap-to-adopt** gesture: drag any application window so its left edge snaps against PTM's right edge, and PTM adopts that window into the currently selected group. This is a spatial, discoverable interaction — no mode switch or special button needed.
 3. All windows of a particular class (such a Terminal) may be declared to be always managed by the tab manager (that's what "Add App Filter" would be for)
+
+**Persistence model:**
+- **Between restarts:** Only group names and structure persist. Individual window-to-group associations are lost (window IDs change). User reopens application windows and re-associates them via snap-to-adopt.
+- **During a session:** Full state — renames, ordering, group membership — is preserved and saved to disk on change.
+- This is acceptable for early phases. Phase 3 explores session restore (re-launching apps in saved directories).
 
 **Data flow:**
 1. x11rb monitors X11 events (PropertyNotify on root window) for window open/close/rename
@@ -153,6 +158,25 @@ Work using TDD methods throughout the project. Every module gets tests first, th
 **Impure modules** → VM E2E tests via bash + xdotool + screenshots
 
 The **event loop bridge** (`bridge.rs`) is the most architecturally critical module. Its event translation function is extracted as a pure function and thoroughly unit-tested. Integration (FD monitoring, GLib loop) is verified via VM E2E.
+
+## Visual Review Checkpoints
+
+At key milestones, pause for a "show your work" visual review. This is not UAT — it's an early alignment check to catch miscommunication before it compounds. The review consists of:
+- **VM screenshots** of the app in its current state (captured via E2E test infra or manually)
+- **Brief walkthrough** of what the user sees and how to interact
+- **User can SSH into the VM** to try it live: `./vm/vm-ctl.sh ssh` then `DISPLAY=:0 /mnt/host-dev/process-tab-manager/target/release/process-tab-manager`
+- **SPICE viewer** for full desktop access: `./vm/vm-ctl.sh viewer`
+
+**Checkpoint schedule:**
+
+| When | What to show | Key questions |
+|------|-------------|---------------|
+| **Phase 1 complete** (NOW) | Dark sidebar listing terminal windows, click-to-focus, up/down reorder buttons, inline rename | Does the basic interaction feel right? Is the sidebar too wide/narrow? |
+| **Phase 1.9 complete** | Same but PTM no longer in own list, cross-workspace works, cleaner rows | Any UX papercuts before we add complexity? |
+| **Phase 2.1 complete** | Keyboard nav, app icons, right-click menu, DnD reorder | Does the polish level feel like a usable tool? |
+| **Phase 2.2 complete** | Groups with headers, collapse/expand | Does the group model match your mental model? |
+| **Phase 2.3 complete** | Snap-to-adopt demo: drag window → it joins the group | Does the snap gesture feel natural? Is the detection reliable? |
+| **Phase 3 milestones** | Session save/restore demo | Worth the complexity? |
 
 ## VM Testing
 
@@ -273,6 +297,37 @@ pub enum PtmEvent {
 5. Load on startup, reload config on SIGHUP
 6. **VM E2E:** Rename window, close PTM, reopen → name persists.
 
+### Phase 1 — Retrospective & Status
+
+**Completed.** 72 unit tests + 8 VM E2E tests. All phases 1.1–1.8 implemented and committed.
+
+**What worked well:**
+- Pure/impure module separation — 72 unit tests run instantly, no display needed
+- TDD caught real bugs at each phase (glib version mismatch, AtomEnum ambiguity, etc.)
+- Bridge pattern (pure `translate_event` + impure FD wiring) kept X11 types contained
+- VM E2E infra reuse from Cinnamon projects (virtiofs mount = instant code sharing)
+
+**Implementation notes for future reference:**
+- Phase 1.7 used up/down buttons (plan's fallback) instead of GTK4 DnD — works fine
+- Phase 1.8 SavedState uses `class:instance` keys + window ID list for cross-restart rename mapping
+- Debounced save via `glib::timeout_add_local_once` (2s delay)
+- `dirs` crate added for cross-platform `~/.config` resolution
+
+**Known gaps carried to Phase 1.9 (cleanup before Phase 2):**
+1. **PTM shows itself in its own list** — need to filter out our own WM_CLASS
+2. **Cross-workspace click not fully implemented** — `switch_desktop()` exists but isn't called
+3. **No save on graceful exit** — state only saves on rename/reorder, not on shutdown
+4. **E2E tests need expansion** — rename persistence, reorder persistence, snap behavior untested
+5. **Sidebar row construction is inline** — needs `row.rs` extraction before Phase 2 adds icons/menus
+
+### 1.9 — Pre-Phase 2 Cleanup
+1. **Filter PTM's own window** from the list (match WM_CLASS or `_NET_WM_PID`)
+2. **Cross-workspace click:** detect target window's desktop, call `switch_desktop()` before `activate_window()`, skip snap for cross-workspace
+3. **Save on exit:** connect to `GtkApplication::shutdown` signal to save state
+4. **Extract `row.rs`:** move row construction (label + buttons + HBox) into a dedicated module
+5. **Expand E2E tests:** rename persistence across restart, reorder persistence, rapid window churn (10 xterms in 1 second)
+6. **VISUAL REVIEW CHECKPOINT:** Screenshots + live VM demo. Last chance for UX feedback before adding groups.
+
 ---
 
 ## Event Loop Bridge — TDD Strategy
@@ -345,38 +400,61 @@ Rapidly open 10 xterms in quick succession. Verify all 10 appear in the sidebar 
 
 ## Known Challenges
 
-1. **PTM's own window in the list:** Filter by application ID (`com.github.science.ptm`) as WM_CLASS.
+1. **PTM's own window in the list:** Filter by WM_CLASS or `_NET_WM_PID` matching our own process. **→ Fix in Phase 1.9.**
 2. **Multi-monitor snap geometry:** Use GTK4's `gdk4::Display::monitors()` for per-monitor geometry, not the giant `_NET_WORKAREA`.
-3. **GTK4 DnD complexity:** DragSource + DropTarget is more code than GTK3's `set_reorderable(true)`. Fallback: up/down arrow buttons for MVP.
-4. **Window identity across restarts:** Match by `(WM_CLASS, WM_INSTANCE)` for Phase 1. Imperfect for multiple same-class windows but sufficient for rename persistence. Full identity matching is a Phase 2 problem.
+3. **GTK4 DnD complexity:** DragSource + DropTarget is more code than GTK3's `set_reorderable(true)`. Phase 1 used up/down buttons as fallback. **→ DnD in Phase 2.1.**
+4. **Window identity across restarts:** Window IDs change every launch. Group names persist but window-to-group associations are lost. User re-associates after restart. PID-based tracking during a live session helps within a session. Full session restore is Phase 3.
 5. **x11rb event buffering:** The `while poll_for_event()` drain loop + 1-second safety timer handles the race condition.
+6. **Snap-to-adopt geometry detection:** Requires knowing PTM's own X11 window position (GTK4 abstracts this away). Solution: find our X11 window ID via `_NET_WM_PID` matching, query position via `get_geometry`. **→ Phase 2.3.**
 
 ---
 
-## Phase 2 — Grouping & Polish
+## Phase 2 — Polish & Grouping
 
-### 2.1 — Tab groups
-- GTK4 ListBox with nested sections (or TreeListModel for hierarchy)
-- Groups are collapsible
-- User can create named groups ("Terminals", "Browsers", etc.)
-- Drag windows between groups
-- Auto-assign to groups by WM_CLASS (configurable: "all Gnome-terminal windows go in Terminals group")
+Phase 2 reordered based on Phase 1 experience: polish the single-list UX first (keyboard nav, icons, context menus), then add grouping on a solid foundation. The sidebar row widget needs extraction into `row.rs` before any of this (done in Phase 1.9).
 
-### 2.2 — Visual polish
-- Right-click context menu on rows: rename, move to group, close window
-- Keyboard navigation: arrow keys to move, Enter to focus, F2 to rename
-- Visual indicator for windows that are minimized vs. visible
-- Subtle animation or color change on the row when a window wants attention (X11 urgency hint via `_NET_WM_STATE`)
-- App icon next to the window name (read from `_NET_WM_ICON` via x11rb)
+### 2.1 — Visual Polish (TDD where possible)
+Do this first — these are high-impact, low-risk improvements to the existing single-list UX.
+1. **Keyboard navigation:** arrow keys to move selection, Enter to focus window, F2 to rename, Delete to remove from list
+2. **App icon:** read `_NET_WM_ICON` via x11rb, display 16x16 icon next to window name in each row
+3. **Right-click context menu:** rename, close window (via `_NET_CLOSE_WINDOW` ClientMessage), remove from list
+4. **Minimized indicator:** read `_NET_WM_STATE` for `_NET_WM_STATE_HIDDEN`, show dimmed/italic text
+5. **Urgency hint:** detect `_NET_WM_STATE_DEMANDS_ATTENTION`, pulse or highlight the row
+6. **GTK4 DnD reorder:** replace up/down buttons with DragSource + DropTarget (now that the row widget is extracted)
+7. **VM E2E:** keyboard navigation test, icon rendering screenshot, context menu test
+8. **VISUAL REVIEW CHECKPOINT:** Screenshots showing icons, keyboard nav, context menus. User tries the polished single-list UX before grouping is added.
 
-### 2.3 — Multi-monitor awareness
+### 2.2 — Tab Groups (TDD)
+Groups are named collections of windows. This is the core organizational feature.
+1. **Test first:** `tests/state_test.rs` — create group, add window to group, remove, reorder groups, persist groups
+2. **State model:** `Group { name: String, window_ids: Vec<u32> }` in AppState. Default group for unassigned windows.
+3. **UI:** collapsible sections in the ListBox (GTK4 expander rows or nested ListBox approach). Group header row with name + collapse toggle.
+4. **Persistence:** group names and structure saved across restarts. Window-to-group associations are lost on restart (window IDs change). User re-associates windows after reopening them.
+5. **Auto-assign by WM_CLASS:** configurable rules (e.g., "all Gnome-terminal windows go in Terminals group"). Optional — user can also just manually assign.
+6. **VM E2E:** create group, assign windows, collapse/expand, verify persistence of group names.
+7. **VISUAL REVIEW CHECKPOINT:** Demo groups with real windows. Does the group model match the user's mental model?
+
+### 2.3 — Snap-to-Adopt Window Capture (TDD)
+The primary way to associate an arbitrary window with a group.
+
+**UX:** Drag any application window so its left edge snaps against PTM's right edge → PTM adopts that window into the currently selected group. No mode switch, no capture button — just a spatial gesture.
+
+**Implementation:**
+1. **Bridge:** Add `PtmEvent::WindowMoved(wid, x, y, width, height)` — translate `ConfigureNotify` events from root's `SubstructureNotify` (already subscribed)
+2. **PTM self-geometry:** find our own X11 window ID (match against `_NET_CLIENT_LIST` by WM_CLASS or `_NET_WM_PID`), query position via `get_geometry`
+3. **Snap detection:** when any window's left edge lands within ~20px of PTM's right edge with sufficient vertical overlap, and the window is not already managed → adopt into current group
+4. **Visual feedback:** briefly highlight PTM's right edge or the target row when a window enters the snap zone
+5. **Test first:** `tests/geometry_test.rs` — snap zone detection (edge proximity + vertical overlap math)
+6. **VM E2E:** open a non-managed window, drag it to PTM's edge, verify it appears in the group
+
+**Fallback:** if spatial detection proves unreliable (window positions reported inconsistently by WM), add a "+" button that enters single-click capture mode (next focused window gets adopted). Keep snap-to-adopt as the primary gesture.
+
+7. **VISUAL REVIEW CHECKPOINT:** Live demo of snap-to-adopt. User drags windows to PTM and verifies the gesture feels natural and detection is reliable.
+
+### 2.4 — Multi-monitor awareness
 - Detect which monitor the sidebar is on
 - Snap focused windows to that monitor specifically
 - Option to show only windows on the sidebar's monitor, or all monitors
-
-### 2.4 — Window capture UX
-- "Color dropper" style capture: click a "capture" button in the tab manager, then click on any window to attach it to a project group
-- Uses X11 grab pointer to intercept the next click
 
 ---
 
@@ -404,7 +482,7 @@ Rapidly open 10 xterms in quick succession. Verify all 10 appear in the sidebar 
 
 ## Research Questions
 
-1. **Identity problem:** How do we re-identify a window across restarts? PID changes every launch. WM_CLASS + title is fragile (terminal titles change with `cd`). Phase 1 uses WM_CLASS + WM_INSTANCE for best-effort matching. Phase 2 may explore PID-based tracking during a session + fuzzy title matching for restore.
+1. **Identity problem:** How do we re-identify a window across restarts? PID changes every launch. WM_CLASS + title is fragile (terminal titles change with `cd`). **Resolution for Phase 1-2:** We don't try. Group names persist, window associations are lost on restart. User re-adopts windows via snap-to-adopt. During a live session, PID-based tracking keeps identity stable. **Phase 3** explores session restore (re-launching apps in saved working directories).
 
 ---
 

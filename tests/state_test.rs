@@ -121,3 +121,60 @@ fn filtered_windows() {
     assert_eq!(filtered.len(), 2);
     assert!(filtered.iter().all(|w| w.wm_class == "Gnome-terminal"));
 }
+
+// -- Rename tests (Phase 1.6) --
+
+#[test]
+fn rename_window() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "original")]);
+    state.rename_window(1, "my custom name");
+    assert_eq!(state.display_name(1), "my custom name");
+}
+
+#[test]
+fn display_name_returns_title_when_no_rename() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "native title")]);
+    assert_eq!(state.display_name(1), "native title");
+}
+
+#[test]
+fn rename_survives_title_update() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "original")]);
+    state.rename_window(1, "my name");
+    // Title updates (from X11) should not override user rename
+    state.update_title(1, "new native title");
+    assert_eq!(state.display_name(1), "my name");
+    // But native title should still be accessible
+    assert_eq!(state.native_title(1), "new native title");
+}
+
+#[test]
+fn clear_rename_reverts_to_native() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "native")]);
+    state.rename_window(1, "custom");
+    assert_eq!(state.display_name(1), "custom");
+    state.clear_rename(1);
+    assert_eq!(state.display_name(1), "native");
+}
+
+#[test]
+fn rename_unknown_window_is_noop() {
+    let mut state = AppState::new();
+    state.rename_window(999, "name");
+    assert_eq!(state.display_name(999), "");
+}
+
+#[test]
+fn rename_persists_across_window_list_updates() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "t1")]);
+    state.rename_window(1, "my terminal");
+
+    // Window list refresh (same window, new title)
+    state.update_windows(vec![make_entry(1, "Gnome-terminal", "t1-updated")]);
+    assert_eq!(state.display_name(1), "my terminal");
+}

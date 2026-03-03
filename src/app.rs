@@ -55,6 +55,9 @@ fn activate(app: &Application) {
     // Build sidebar
     let sidebar = Sidebar::new();
 
+    // Connect double-click rename handler
+    sidebar.connect_rename(Rc::clone(&state));
+
     // Initial population
     refresh_state(&conn, root, &atoms, &filter, &state, &sidebar);
 

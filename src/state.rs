@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::filter::Filter;
 
 /// A window entry tracked by PTM.
@@ -15,6 +17,8 @@ pub struct WindowEntry {
 pub struct AppState {
     windows: Vec<WindowEntry>,
     active: Option<u32>,
+    /// User-assigned names, keyed by window ID.
+    renames: HashMap<u32, String>,
 }
 
 impl AppState {
@@ -22,6 +26,7 @@ impl AppState {
         Self {
             windows: Vec::new(),
             active: None,
+            renames: HashMap::new(),
         }
     }
 
@@ -36,12 +41,11 @@ impl AppState {
     /// Update window list from fresh X11 data.
     /// Preserves ordering of existing windows; appends new ones at the end (in input order).
     /// Removes windows no longer present. Updates titles of existing windows.
+    /// Does NOT clear user renames.
     pub fn update_windows(&mut self, entries: Vec<WindowEntry>) {
-        // Build lookup for updating existing entries
-        let mut update_map: std::collections::HashMap<u32, &WindowEntry> =
+        let mut update_map: HashMap<u32, &WindowEntry> =
             entries.iter().map(|e| (e.id, e)).collect();
 
-        // Update existing windows in place (preserve order), remove dead ones
         self.windows.retain_mut(|w| {
             if let Some(updated) = update_map.remove(&w.id) {
                 w.title = updated.title.clone();
@@ -52,19 +56,22 @@ impl AppState {
             }
         });
 
-        // Existing IDs (after retain)
         let existing_ids: std::collections::HashSet<u32> =
             self.windows.iter().map(|w| w.id).collect();
 
-        // Append new windows in their input order
         for entry in entries {
             if !existing_ids.contains(&entry.id) {
                 self.windows.push(entry);
             }
         }
+
+        // Clean up renames for windows that no longer exist
+        let live_ids: std::collections::HashSet<u32> =
+            self.windows.iter().map(|w| w.id).collect();
+        self.renames.retain(|id, _| live_ids.contains(id));
     }
 
-    /// Update a single window's title without a full refresh.
+    /// Update a single window's native title without a full refresh.
     pub fn update_title(&mut self, wid: u32, title: &str) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
             w.title = title.to_string();
@@ -75,7 +82,45 @@ impl AppState {
         self.active = wid;
     }
 
+    /// Set a user-assigned name for a window.
+    pub fn rename_window(&mut self, wid: u32, name: &str) {
+        if self.windows.iter().any(|w| w.id == wid) {
+            self.renames.insert(wid, name.to_string());
+        }
+    }
+
+    /// Clear the user-assigned name, reverting to native title.
+    pub fn clear_rename(&mut self, wid: u32) {
+        self.renames.remove(&wid);
+    }
+
+    /// Get the display name: user rename if set, otherwise native title.
+    pub fn display_name(&self, wid: u32) -> &str {
+        if let Some(name) = self.renames.get(&wid) {
+            return name;
+        }
+        self.windows
+            .iter()
+            .find(|w| w.id == wid)
+            .map(|w| w.title.as_str())
+            .unwrap_or("")
+    }
+
+    /// Get the native X11 title (regardless of rename).
+    pub fn native_title(&self, wid: u32) -> &str {
+        self.windows
+            .iter()
+            .find(|w| w.id == wid)
+            .map(|w| w.title.as_str())
+            .unwrap_or("")
+    }
+
     pub fn filtered_windows<'a>(&'a self, filter: &'a Filter) -> impl Iterator<Item = &'a WindowEntry> {
         self.windows.iter().filter(move |w| filter.matches(&w.wm_class))
+    }
+
+    /// Check if a window has a user-assigned rename.
+    pub fn has_rename(&self, wid: u32) -> bool {
+        self.renames.contains_key(&wid)
     }
 }

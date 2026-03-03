@@ -1,3 +1,3 @@
-fn main() {
-    println!("Process Tab Manager — Phase 1 not yet implemented.");
+fn main() -> glib::ExitCode {
+    process_tab_manager::app::run()
 }

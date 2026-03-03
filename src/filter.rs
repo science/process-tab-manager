@@ -1,4 +1,5 @@
 /// Decides whether a window's WM_CLASS should be managed by PTM.
+#[derive(Clone)]
 pub struct Filter {
     classes_lower: Vec<String>,
 }

@@ -3,6 +3,8 @@ pub mod bridge;
 pub mod config;
 pub mod filter;
 pub mod geometry;
+pub mod icon_cache;
+pub mod row;
 pub mod sidebar;
 pub mod state;
 pub mod x11;

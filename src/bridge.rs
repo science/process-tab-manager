@@ -7,6 +7,7 @@ pub struct AtomIds {
     pub net_active_window: u32,
     pub net_wm_name: u32,
     pub net_current_desktop: u32,
+    pub net_wm_state: u32,
 }
 
 /// Domain events — no x11rb types leak out.
@@ -15,6 +16,7 @@ pub enum PtmEvent {
     WindowListChanged,
     ActiveWindowChanged,
     WindowTitleChanged(u32),
+    WindowStateChanged(u32),
     DesktopChanged,
     WindowDestroyed(u32),
 }
@@ -36,6 +38,8 @@ pub fn translate_event(event: &Event, atoms: &AtomIds, root: u32) -> Option<PtmE
         Event::PropertyNotify(pn) => {
             if pn.atom == atoms.net_wm_name {
                 Some(PtmEvent::WindowTitleChanged(pn.window))
+            } else if pn.atom == atoms.net_wm_state {
+                Some(PtmEvent::WindowStateChanged(pn.window))
             } else {
                 None
             }

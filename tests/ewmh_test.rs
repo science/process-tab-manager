@@ -118,3 +118,60 @@ fn parse_desktop_number() {
     let desktop = ewmh::parse_window_id(data);
     assert_eq!(desktop, Some(2));
 }
+
+// -- WM state flags tests (Phase 2.1.2) --
+
+use process_tab_manager::x11::ewmh::WmStateFlags;
+
+const HIDDEN_ATOM: u32 = 500;
+const ATTENTION_ATOM: u32 = 501;
+
+#[test]
+fn parse_wm_state_empty() {
+    let flags = ewmh::parse_wm_state_flags(&[], HIDDEN_ATOM, ATTENTION_ATOM);
+    assert_eq!(flags, WmStateFlags::default());
+}
+
+#[test]
+fn parse_wm_state_hidden() {
+    // _NET_WM_STATE contains HIDDEN atom
+    let data: &[u8] = &[
+        0xF4, 0x01, 0x00, 0x00, // 500 (HIDDEN_ATOM)
+    ];
+    let flags = ewmh::parse_wm_state_flags(data, HIDDEN_ATOM, ATTENTION_ATOM);
+    assert!(flags.is_hidden);
+    assert!(!flags.demands_attention);
+}
+
+#[test]
+fn parse_wm_state_demands_attention() {
+    let data: &[u8] = &[
+        0xF5, 0x01, 0x00, 0x00, // 501 (ATTENTION_ATOM)
+    ];
+    let flags = ewmh::parse_wm_state_flags(data, HIDDEN_ATOM, ATTENTION_ATOM);
+    assert!(!flags.is_hidden);
+    assert!(flags.demands_attention);
+}
+
+#[test]
+fn parse_wm_state_both_flags() {
+    let data: &[u8] = &[
+        0x0A, 0x00, 0x00, 0x00, // some other atom (10)
+        0xF4, 0x01, 0x00, 0x00, // 500 (HIDDEN_ATOM)
+        0xF5, 0x01, 0x00, 0x00, // 501 (ATTENTION_ATOM)
+    ];
+    let flags = ewmh::parse_wm_state_flags(data, HIDDEN_ATOM, ATTENTION_ATOM);
+    assert!(flags.is_hidden);
+    assert!(flags.demands_attention);
+}
+
+#[test]
+fn parse_wm_state_unrelated_atoms_only() {
+    let data: &[u8] = &[
+        0x0A, 0x00, 0x00, 0x00, // 10
+        0x0B, 0x00, 0x00, 0x00, // 11
+    ];
+    let flags = ewmh::parse_wm_state_flags(data, HIDDEN_ATOM, ATTENTION_ATOM);
+    assert!(!flags.is_hidden);
+    assert!(!flags.demands_attention);
+}

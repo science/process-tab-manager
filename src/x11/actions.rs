@@ -1,8 +1,10 @@
 use anyhow::Result;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ClientMessageData, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask,
+    AtomEnum, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt as _, EventMask, PropMode,
 };
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 use super::connection::AtomCache;
@@ -38,6 +40,46 @@ pub fn activate_window(conn: &RustConnection, root: u32, wid: u32, atoms: &AtomC
 /// Move a window to a specific position. Does NOT resize — user's window size is preserved.
 pub fn move_window(conn: &RustConnection, wid: u32, x: i32, y: i32) -> Result<()> {
     conn.configure_window(wid, &ConfigureWindowAux::new().x(x).y(y))?;
+    conn.flush()?;
+    Ok(())
+}
+
+/// Close a window via _NET_CLOSE_WINDOW ClientMessage.
+pub fn close_window(conn: &RustConnection, root: u32, wid: u32, atoms: &AtomCache) -> Result<()> {
+    let data = ClientMessageData::from([
+        0u32, // timestamp (0 = current)
+        2u32, // source indication: 2 = pager
+        0, 0, 0,
+    ]);
+
+    let event = ClientMessageEvent {
+        response_type: 33,
+        format: 32,
+        sequence: 0,
+        window: wid,
+        type_: atoms.net_close_window,
+        data,
+    };
+
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    conn.flush()?;
+    Ok(())
+}
+
+/// Set _NET_WM_WINDOW_TYPE to UTILITY so the WM doesn't auto-focus on click.
+pub fn set_window_type_utility(conn: &RustConnection, wid: u32, atoms: &AtomCache) -> Result<()> {
+    conn.change_property32(
+        PropMode::REPLACE,
+        wid,
+        atoms.net_wm_window_type,
+        AtomEnum::ATOM,
+        &[atoms.net_wm_window_type_utility],
+    )?;
     conn.flush()?;
     Ok(())
 }

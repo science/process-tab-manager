@@ -3,14 +3,16 @@ use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk::{Button, Entry, GestureClick, Label, ListBox, ListBoxRow};
+use gtk::{GestureClick, ListBox};
 use x11rb::rust_connection::RustConnection;
 
 use crate::filter::Filter;
-use crate::geometry;
+use crate::geometry::{self, FrameExtents};
+use crate::icon_cache::IconCache;
+use crate::row;
 use crate::state::AppState;
 use crate::x11::actions;
-use crate::x11::connection::AtomCache;
+use crate::x11::connection::{self as x11conn, AtomCache};
 
 /// Sidebar manages the GTK ListBox displaying tracked windows.
 #[derive(Clone)]
@@ -18,16 +20,46 @@ pub struct Sidebar {
     listbox: ListBox,
     state: Rc<RefCell<Option<(Rc<RefCell<AppState>>, Filter)>>>,
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    icon_cache: Rc<RefCell<IconCache>>,
+    /// WID of the row currently under the mouse cursor (tracked via EventControllerMotion).
+    /// Used for focus pass-through: when PTM gains focus from a background click,
+    /// the hovered row's target is activated immediately.
+    hover_wid: Rc<RefCell<Option<u32>>>,
 }
 
 impl Sidebar {
     pub fn new() -> Self {
         let listbox = ListBox::new();
         listbox.set_selection_mode(gtk::SelectionMode::Single);
+        // Track which row the cursor hovers over (for focus pass-through)
+        let hover_wid: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+        let hover_for_motion = Rc::clone(&hover_wid);
+        let listbox_for_motion = listbox.clone();
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(move |_, _x, y| {
+            *hover_for_motion.borrow_mut() = find_row_wid_at_y(&listbox_for_motion, y);
+        });
+
+        let hover_for_enter = Rc::clone(&hover_wid);
+        let listbox_for_enter = listbox.clone();
+        motion.connect_enter(move |_, _x, y| {
+            *hover_for_enter.borrow_mut() = find_row_wid_at_y(&listbox_for_enter, y);
+        });
+
+        let hover_for_leave = Rc::clone(&hover_wid);
+        motion.connect_leave(move |_| {
+            *hover_for_leave.borrow_mut() = None;
+        });
+
+        listbox.add_controller(motion);
+
         Self {
             listbox,
             state: Rc::new(RefCell::new(None)),
             on_change: Rc::new(RefCell::new(None)),
+            icon_cache: Rc::new(RefCell::new(IconCache::new())),
+            hover_wid,
         }
     }
 
@@ -47,15 +79,19 @@ impl Sidebar {
     }
 
     /// Set up click handler for focusing/snapping windows.
+    /// Uses row_activated which fires on click/Enter when PTM is in the foreground.
+    /// Background clicks are handled separately by connect_focus_passthrough().
     pub fn connect_click(
         &self,
         conn: Rc<RustConnection>,
         atoms: Rc<AtomCache>,
         root: u32,
         window: gtk::ApplicationWindow,
+        state: Rc<RefCell<AppState>>,
+        ptm_wid: Rc<RefCell<Option<u32>>>,
     ) {
         self.listbox.connect_row_activated(move |_listbox, row| {
-            let wid = parse_wid_from_name(&row.widget_name());
+            let wid = row::parse_wid_from_name(&row.widget_name());
             let Some(wid) = wid else { return };
 
             // Check for Ctrl modifier
@@ -68,24 +104,34 @@ impl Sidebar {
                 })
                 .unwrap_or(false);
 
+            // Detect cross-workspace: compare target desktop to current desktop
+            let target_desktop = state.borrow().window_desktop(wid);
+            let current_desktop = x11conn::get_current_desktop(&conn, root, &atoms)
+                .ok()
+                .flatten();
+            let cross_workspace = match (target_desktop, current_desktop) {
+                (Some(td), Some(cd)) => td != cd,
+                _ => false,
+            };
+
+            // Switch desktop first if cross-workspace
+            if cross_workspace {
+                if let Some(td) = target_desktop {
+                    if let Err(e) = actions::switch_desktop(&conn, root, td, &atoms) {
+                        log::error!("Failed to switch desktop to {}: {}", td, e);
+                    }
+                }
+            }
+
             // Activate the window
             if let Err(e) = actions::activate_window(&conn, root, wid, &atoms) {
                 log::error!("Failed to activate window 0x{:08x}: {}", wid, e);
                 return;
             }
 
-            if !ctrl_pressed {
-                // Get sidebar geometry for snap calculation
-                let sidebar_rect = geometry::Rect {
-                    x: 0, // GTK4 doesn't expose toplevel position easily; default to 0
-                    y: 0,
-                    width: window.width() as u32,
-                    height: window.height() as u32,
-                };
-
-                let workarea = get_workarea_estimate(&window);
-                let pos = geometry::snap_position(&sidebar_rect, &workarea);
-
+            // Snap to sidebar only on same workspace + no Ctrl
+            if !ctrl_pressed && !cross_workspace {
+                let pos = compute_snap_position(&conn, &atoms, root, &ptm_wid, wid, &window);
                 if let Err(e) = actions::move_window(&conn, wid, pos.x, pos.y) {
                     log::error!("Failed to move window 0x{:08x}: {}", wid, e);
                 }
@@ -93,36 +139,122 @@ impl Sidebar {
         });
     }
 
+    /// Connect right-click context menu (Rename, Close Window, Remove from List).
+    pub fn connect_context_menu(
+        &self,
+        conn: Rc<RustConnection>,
+        atoms: Rc<AtomCache>,
+        root: u32,
+        state: Rc<RefCell<AppState>>,
+    ) {
+        let gesture = GestureClick::new();
+        gesture.set_button(gdk4::BUTTON_SECONDARY);
+
+        let listbox = self.listbox.clone();
+        let on_change = Rc::clone(&self.on_change);
+        let sidebar = self.clone();
+
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            // Find which row was right-clicked
+            let mut idx = 0;
+            let mut target_row = None;
+            let mut target_wid = None;
+            while let Some(row_widget) = listbox.row_at_index(idx) {
+                let row_y = row_widget.allocation().y();
+                let row_h = row_widget.allocation().height();
+                if y >= row_y as f64 && y < (row_y + row_h) as f64 {
+                    if let Some(wid) = row::parse_wid_from_name(&row_widget.widget_name()) {
+                        target_row = Some(row_widget);
+                        target_wid = Some(wid);
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+
+            let Some(row_widget) = target_row else { return };
+            let Some(wid) = target_wid else { return };
+
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+
+            // Build menu model
+            let menu = gio::Menu::new();
+            menu.append(Some("Rename (F2)"), Some("ptm.rename"));
+            menu.append(Some("Close Window"), Some("ptm.close-window"));
+            menu.append(Some("Remove from List"), Some("ptm.remove-from-list"));
+
+            // Create action group
+            let actions = gio::SimpleActionGroup::new();
+
+            // Rename action
+            let rename_state = Rc::clone(&state);
+            let rename_on_change = Rc::clone(&on_change);
+            let rename_row = row_widget.clone();
+            let rename_action = gio::SimpleAction::new("rename", None);
+            rename_action.connect_activate(move |_, _| {
+                row::start_inline_rename(&rename_row, wid, &rename_state, &rename_on_change);
+            });
+            actions.add_action(&rename_action);
+
+            // Close Window action
+            let close_conn = Rc::clone(&conn);
+            let close_atoms = Rc::clone(&atoms);
+            let close_action = gio::SimpleAction::new("close-window", None);
+            close_action.connect_activate(move |_, _| {
+                if let Err(e) = actions::close_window(&close_conn, root, wid, &close_atoms) {
+                    log::error!("Failed to close window 0x{:08x}: {}", wid, e);
+                }
+            });
+            actions.add_action(&close_action);
+
+            // Remove from List action
+            let remove_state = Rc::clone(&state);
+            let remove_sidebar = sidebar.clone();
+            let remove_action = gio::SimpleAction::new("remove-from-list", None);
+            remove_action.connect_activate(move |_, _| {
+                remove_state.borrow_mut().hide_window(wid);
+                if let Some((ref app_state, ref filt)) = *remove_sidebar.state.borrow() {
+                    remove_sidebar.rebuild(&app_state.borrow(), filt);
+                }
+                remove_sidebar.notify_change();
+            });
+            actions.add_action(&remove_action);
+
+            listbox.insert_action_group("ptm", Some(&actions));
+
+            // Create and show popover
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&row_widget);
+            popover.set_pointing_to(Some(&gdk4::Rectangle::new(x as i32, (y - row_widget.allocation().y() as f64) as i32, 1, 1)));
+            popover.popup();
+        });
+
+        self.listbox.add_controller(gesture);
+    }
+
     /// Connect double-click handler for inline rename.
     pub fn connect_rename(&self, state: Rc<RefCell<AppState>>) {
         let state_for_rename = state;
         let on_change = Rc::clone(&self.on_change);
 
-        // Double-click on a row triggers rename
         let gesture = GestureClick::new();
         gesture.set_button(gdk4::BUTTON_PRIMARY);
 
         let listbox = self.listbox.clone();
         gesture.connect_pressed(move |gesture, n_press, _x, y| {
             if n_press != 2 {
-                return; // Only handle double-click
+                return;
             }
 
-            // Find which row was double-clicked by y coordinate
             let mut idx = 0;
-            while let Some(row) = listbox.row_at_index(idx) {
-                let (_, row_y, _, row_h) = (
-                    row.allocation().x(),
-                    row.allocation().y(),
-                    row.allocation().width(),
-                    row.allocation().height(),
-                );
+            while let Some(row_widget) = listbox.row_at_index(idx) {
+                let row_y = row_widget.allocation().y();
+                let row_h = row_widget.allocation().height();
 
-                // Check if click is within this row
                 if y >= row_y as f64 && y < (row_y + row_h) as f64 {
-                    let wid = parse_wid_from_name(&row.widget_name());
+                    let wid = row::parse_wid_from_name(&row_widget.widget_name());
                     if let Some(wid) = wid {
-                        start_inline_rename(&row, wid, &state_for_rename, &on_change);
+                        row::start_inline_rename(&row_widget, wid, &state_for_rename, &on_change);
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
                     return;
@@ -134,7 +266,155 @@ impl Sidebar {
         self.listbox.add_controller(gesture);
     }
 
-    /// Store state+filter references so reorder buttons can trigger rebuilds.
+    /// Connect keyboard handler for navigation and actions.
+    pub fn connect_keyboard(&self, state: Rc<RefCell<AppState>>) {
+        let key_controller = gtk::EventControllerKey::new();
+        let listbox = self.listbox.clone();
+        let sidebar = self.clone();
+        let on_change = Rc::clone(&self.on_change);
+        let state_for_kb = Rc::clone(&state);
+
+        key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+            let Some(selected) = listbox.selected_row() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(wid) = row::parse_wid_from_name(&selected.widget_name()) else {
+                return glib::Propagation::Proceed;
+            };
+
+            let alt = modifiers.contains(gdk4::ModifierType::ALT_MASK);
+
+            match keyval {
+                gdk4::Key::F2 => {
+                    row::start_inline_rename(&selected, wid, &state_for_kb, &on_change);
+                    glib::Propagation::Stop
+                }
+                gdk4::Key::Delete => {
+                    state_for_kb.borrow_mut().hide_window(wid);
+                    if let Some((ref app_state, ref filt)) = *sidebar.state.borrow() {
+                        sidebar.rebuild(&app_state.borrow(), filt);
+                    }
+                    sidebar.notify_change();
+                    glib::Propagation::Stop
+                }
+                gdk4::Key::Up if alt => {
+                    let idx = selected.index() as usize;
+                    if idx > 0 {
+                        if let Some((ref app_state, ref filt)) = *sidebar.state.borrow() {
+                            app_state.borrow_mut().reorder(idx, idx - 1);
+                            sidebar.rebuild(&app_state.borrow(), filt);
+                            // Re-select the moved row
+                            if let Some(new_row) = listbox.row_at_index((idx - 1) as i32) {
+                                listbox.select_row(Some(&new_row));
+                            }
+                            sidebar.notify_change();
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk4::Key::Down if alt => {
+                    let idx = selected.index() as usize;
+                    if let Some((ref app_state, ref filt)) = *sidebar.state.borrow() {
+                        let count = app_state.borrow().filtered_windows(filt).count();
+                        if idx < count - 1 {
+                            app_state.borrow_mut().reorder(idx, idx + 1);
+                            sidebar.rebuild(&app_state.borrow(), filt);
+                            if let Some(new_row) = listbox.row_at_index((idx + 1) as i32) {
+                                listbox.select_row(Some(&new_row));
+                            }
+                            sidebar.notify_change();
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        self.listbox.add_controller(key_controller);
+    }
+
+    /// Connect drag-and-drop reorder on the ListBox.
+    pub fn connect_dnd(&self) {
+        let drop_target = gtk::DropTarget::new(glib::Type::STRING, gdk4::DragAction::MOVE);
+        let listbox = self.listbox.clone();
+        let sidebar = self.clone();
+
+        // Visual feedback: highlight the row under the cursor during drag
+        let listbox_for_motion = self.listbox.clone();
+        drop_target.connect_motion(move |_target, _x, y| {
+            let mut idx = 0;
+            while let Some(row_widget) = listbox_for_motion.row_at_index(idx) {
+                let row_y = row_widget.allocation().y();
+                let row_h = row_widget.allocation().height();
+                if y >= row_y as f64 && y < (row_y + row_h) as f64 {
+                    listbox_for_motion.drag_highlight_row(&row_widget);
+                    break;
+                }
+                idx += 1;
+            }
+            gdk4::DragAction::MOVE
+        });
+
+        let listbox_for_leave = self.listbox.clone();
+        drop_target.connect_leave(move |_target| {
+            listbox_for_leave.drag_unhighlight_row();
+        });
+
+        drop_target.connect_drop(move |_target, value, _x, y| {
+            let Ok(wid_str) = value.get::<String>() else {
+                return false;
+            };
+            let Ok(source_wid) = wid_str.parse::<u32>() else {
+                return false;
+            };
+
+            // Find source index by wid
+            let mut source_idx = None;
+            let mut target_idx = None;
+            let mut idx = 0;
+            while let Some(row_widget) = listbox.row_at_index(idx) {
+                let name = row_widget.widget_name();
+                if let Some(rwid) = row::parse_wid_from_name(&name) {
+                    if rwid == source_wid {
+                        source_idx = Some(idx as usize);
+                    }
+                }
+
+                let row_y = row_widget.allocation().y();
+                let row_h = row_widget.allocation().height();
+                if y >= row_y as f64 && y < (row_y + row_h) as f64 {
+                    target_idx = Some(idx as usize);
+                }
+                idx += 1;
+            }
+
+            // If dropped past all rows, target is last position
+            if target_idx.is_none() && idx > 0 {
+                target_idx = Some((idx - 1) as usize);
+            }
+
+            if let (Some(from), Some(to)) = (source_idx, target_idx) {
+                if from != to {
+                    if let Some((ref app_state, ref filt)) = *sidebar.state.borrow() {
+                        app_state.borrow_mut().reorder(from, to);
+                        sidebar.rebuild(&app_state.borrow(), filt);
+                        // Select the moved row
+                        if let Some(new_row) = listbox.row_at_index(to as i32) {
+                            listbox.select_row(Some(&new_row));
+                        }
+                        sidebar.notify_change();
+                    }
+                }
+            }
+
+            listbox.drag_unhighlight_row();
+            true
+        });
+
+        self.listbox.add_controller(drop_target);
+    }
+
+    /// Store state+filter references so keyboard/DnD reorder can trigger rebuilds.
     pub fn set_reorder_state(&self, state: Rc<RefCell<AppState>>, filter: Filter) {
         *self.state.borrow_mut() = Some((state, filter));
     }
@@ -147,9 +427,10 @@ impl Sidebar {
 
         let active = state.active_window();
         let entries: Vec<_> = state.filtered_windows(filter).collect();
-        let count = entries.len();
 
-        for (idx, entry) in entries.into_iter().enumerate() {
+        let mut icon_cache = self.icon_cache.borrow_mut();
+
+        for entry in entries.into_iter() {
             let display = state.display_name(entry.id);
             let display_text = if display.is_empty() {
                 format!("{} (0x{:08x})", entry.wm_class, entry.id)
@@ -159,86 +440,126 @@ impl Sidebar {
                 format!("{}: {}", entry.wm_class, display)
             };
 
-            let label = Label::new(Some(&display_text));
-            label.set_halign(gtk::Align::Start);
-            label.set_margin_start(8);
-            label.set_hexpand(true);
-            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            label.set_tooltip_text(Some(&entry.title));
+            let icon = icon_cache.icon_image(&entry.wm_class);
 
-            let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            hbox.append(&label);
+            let row_widget = row::build_row(
+                &display_text,
+                &entry.title,
+                entry.id,
+                Some(entry.id) == active,
+                icon,
+            );
 
-            // Up button (disabled for first row)
-            let up_btn = Button::with_label("\u{25B2}");
-            up_btn.add_css_class("ptm-reorder-btn");
-            up_btn.set_sensitive(idx > 0);
-            let sidebar_state = Rc::clone(&self.state);
-            let sidebar = self.clone();
-            let from_idx = idx;
-            up_btn.connect_clicked(move |_| {
-                if let Some((ref app_state, ref filt)) = *sidebar_state.borrow() {
-                    app_state.borrow_mut().reorder(from_idx, from_idx - 1);
-                    sidebar.rebuild(&app_state.borrow(), filt);
-                    sidebar.notify_change();
-                }
-            });
-            hbox.append(&up_btn);
-
-            // Down button (disabled for last row)
-            let down_btn = Button::with_label("\u{25BC}");
-            down_btn.add_css_class("ptm-reorder-btn");
-            down_btn.set_sensitive(idx < count - 1);
-            let sidebar_state = Rc::clone(&self.state);
-            let sidebar = self.clone();
-            let from_idx = idx;
-            down_btn.connect_clicked(move |_| {
-                if let Some((ref app_state, ref filt)) = *sidebar_state.borrow() {
-                    app_state.borrow_mut().reorder(from_idx, from_idx + 1);
-                    sidebar.rebuild(&app_state.borrow(), filt);
-                    sidebar.notify_change();
-                }
-            });
-            hbox.append(&down_btn);
-
-            let row = ListBoxRow::new();
-            row.set_child(Some(&hbox));
-            row.set_widget_name(&format!("wid-{}", entry.id));
-
-            if Some(entry.id) == active {
-                row.add_css_class("ptm-active");
+            if entry.is_minimized {
+                row_widget.add_css_class("ptm-minimized");
+            }
+            if entry.is_urgent {
+                row_widget.add_css_class("ptm-urgent");
             }
 
-            self.listbox.append(&row);
+            self.listbox.append(&row_widget);
         }
     }
 
     pub fn set_active(&self, wid: u32) {
         let target_name = format!("wid-{}", wid);
         let mut idx = 0;
-        while let Some(row) = self.listbox.row_at_index(idx) {
-            if row.widget_name() == target_name {
-                row.add_css_class("ptm-active");
-                self.listbox.select_row(Some(&row));
+        while let Some(row_widget) = self.listbox.row_at_index(idx) {
+            if row_widget.widget_name() == target_name {
+                row_widget.add_css_class("ptm-active");
+                self.listbox.select_row(Some(&row_widget));
             } else {
-                row.remove_css_class("ptm-active");
+                row_widget.remove_css_class("ptm-active");
             }
             idx += 1;
         }
     }
 
+    pub fn update_state(&self, wid: u32, is_minimized: bool, is_urgent: bool) {
+        let target_name = format!("wid-{}", wid);
+        let mut idx = 0;
+        while let Some(row_widget) = self.listbox.row_at_index(idx) {
+            if row_widget.widget_name() == target_name {
+                if is_minimized {
+                    row_widget.add_css_class("ptm-minimized");
+                } else {
+                    row_widget.remove_css_class("ptm-minimized");
+                }
+                if is_urgent {
+                    row_widget.add_css_class("ptm-urgent");
+                } else {
+                    row_widget.remove_css_class("ptm-urgent");
+                }
+                return;
+            }
+            idx += 1;
+        }
+    }
+
+    /// When PTM gains focus from a background click, activate the row under the cursor.
+    /// The WM consumes the button press when raising a background window, so neither
+    /// row_activated nor GestureClick fire. This workaround uses the hover-tracked WID
+    /// (from EventControllerMotion) and the window's is-active notification.
+    pub fn connect_focus_passthrough(
+        &self,
+        conn: Rc<RustConnection>,
+        atoms: Rc<AtomCache>,
+        root: u32,
+        window: &gtk::ApplicationWindow,
+        state: Rc<RefCell<AppState>>,
+        app_window: gtk::ApplicationWindow,
+        ptm_wid: Rc<RefCell<Option<u32>>>,
+    ) {
+        let hover_wid = Rc::clone(&self.hover_wid);
+
+        window.connect_notify_local(Some("is-active"), move |win, _| {
+            if !win.is_active() {
+                return;
+            }
+
+            // Check if the cursor was hovering over a row when focus was gained
+            let wid = match *hover_wid.borrow() {
+                Some(wid) => wid,
+                None => return,
+            };
+
+            log::debug!("Focus pass-through: activating 0x{:08x}", wid);
+
+            // Cross-workspace detection
+            let target_desktop = state.borrow().window_desktop(wid);
+            let current_desktop = x11conn::get_current_desktop(&conn, root, &atoms)
+                .ok()
+                .flatten();
+            let cross_workspace = match (target_desktop, current_desktop) {
+                (Some(td), Some(cd)) => td != cd,
+                _ => false,
+            };
+
+            if cross_workspace {
+                if let Some(td) = target_desktop {
+                    let _ = actions::switch_desktop(&conn, root, td, &atoms);
+                }
+            }
+
+            if let Err(e) = actions::activate_window(&conn, root, wid, &atoms) {
+                log::error!("Focus pass-through failed for 0x{:08x}: {}", wid, e);
+                return;
+            }
+
+            // Snap
+            if !cross_workspace {
+                let pos = compute_snap_position(&conn, &atoms, root, &ptm_wid, wid, &app_window);
+                let _ = actions::move_window(&conn, wid, pos.x, pos.y);
+            }
+        });
+    }
+
     pub fn update_title(&self, wid: u32, title: &str) {
         let target_name = format!("wid-{}", wid);
         let mut idx = 0;
-        while let Some(row) = self.listbox.row_at_index(idx) {
-            if row.widget_name() == target_name {
-                // Label is inside an HBox inside the row
-                let label = row
-                    .child()
-                    .and_then(|c| c.downcast::<gtk::Box>().ok())
-                    .and_then(|b| b.first_child())
-                    .and_then(|c| c.downcast::<Label>().ok());
-                if let Some(label) = label {
+        while let Some(row_widget) = self.listbox.row_at_index(idx) {
+            if row_widget.widget_name() == target_name {
+                if let Some(label) = row::get_row_label(&row_widget) {
                     let current = label.text();
                     if let Some(colon_pos) = current.find(": ") {
                         let class_prefix = &current[..colon_pos];
@@ -255,97 +576,78 @@ impl Sidebar {
     }
 }
 
-fn parse_wid_from_name(name: &str) -> Option<u32> {
-    name.strip_prefix("wid-")?.parse().ok()
+/// Find the WID of the ListBox row at the given y coordinate (relative to the ListBox).
+fn find_row_wid_at_y(listbox: &ListBox, y: f64) -> Option<u32> {
+    let mut idx = 0;
+    while let Some(row_widget) = listbox.row_at_index(idx) {
+        let alloc = row_widget.allocation();
+        if y >= alloc.y() as f64 && y < (alloc.y() + alloc.height()) as f64 {
+            return row::parse_wid_from_name(&row_widget.widget_name());
+        }
+        idx += 1;
+    }
+    None
 }
 
-type OnChangeCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Compute the snap position using real X11 geometry when available,
+/// falling back to GTK monitor geometry estimate.
+fn compute_snap_position(
+    conn: &RustConnection,
+    atoms: &AtomCache,
+    root: u32,
+    ptm_wid: &Rc<RefCell<Option<u32>>>,
+    target_wid: u32,
+    window: &gtk::ApplicationWindow,
+) -> geometry::SnapPosition {
+    let ptm_wid_val = *ptm_wid.borrow();
 
-/// Replace the label in a row with an Entry for inline editing.
-fn start_inline_rename(
-    row: &ListBoxRow,
-    wid: u32,
-    state: &Rc<RefCell<AppState>>,
-    on_change: &OnChangeCb,
-) {
-    let current_text = row
-        .child()
-        .and_then(|c| c.downcast::<gtk::Box>().ok())
-        .and_then(|b| b.first_child())
-        .and_then(|c| c.downcast::<Label>().ok())
-        .map(|l| l.text().to_string())
-        .unwrap_or_default();
+    if let Some(pw) = ptm_wid_val {
+        // Try real X11 geometry
+        if let Ok((px, py)) = x11conn::get_window_position(conn, pw, root) {
+            let sidebar_rect = geometry::Rect {
+                x: px,
+                y: py,
+                width: window.width() as u32,
+                height: window.height() as u32,
+            };
 
-    let entry = Entry::new();
-    entry.set_text(&current_text);
-    entry.set_has_frame(false);
-    entry.set_margin_start(8);
-    entry.set_margin_end(8);
-    row.set_child(Some(&entry));
-    entry.grab_focus();
-    entry.select_region(0, -1); // Select all text
+            let (sl, sr, st, sb) = x11conn::get_frame_extents(conn, pw, atoms)
+                .unwrap_or((0, 0, 0, 0));
+            let sidebar_frame = FrameExtents { left: sl, right: sr, top: st, bottom: sb };
 
-    let state_for_activate = Rc::clone(state);
-    let row_for_activate = row.clone();
-    let on_change_activate = Rc::clone(on_change);
-    entry.connect_activate(move |entry| {
-        let new_name = entry.text().to_string();
-        commit_rename(&row_for_activate, wid, &new_name, &state_for_activate, &on_change_activate);
-    });
+            let (tl, tr, tt, tb) = x11conn::get_frame_extents(conn, target_wid, atoms)
+                .unwrap_or((0, 0, 0, 0));
+            let target_frame = FrameExtents { left: tl, right: tr, top: tt, bottom: tb };
 
-    // Also commit on focus-out
-    let state_for_focus = Rc::clone(state);
-    let row_for_focus = row.clone();
-    let entry_clone = entry.clone();
-    let on_change_focus = Rc::clone(on_change);
-    let focus_controller = gtk::EventControllerFocus::new();
-    focus_controller.connect_leave(move |_| {
-        let new_name = entry_clone.text().to_string();
-        commit_rename(&row_for_focus, wid, &new_name, &state_for_focus, &on_change_focus);
-    });
-    entry.add_controller(focus_controller);
-}
+            // Try real workarea from _NET_WORKAREA
+            let desktop = x11conn::get_current_desktop(conn, root, atoms)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let workarea = x11conn::get_workarea(conn, root, atoms, desktop)
+                .ok()
+                .flatten()
+                .map(|(x, y, w, h)| geometry::Rect { x, y, width: w, height: h })
+                .unwrap_or_else(|| get_workarea_estimate(window));
 
-/// Commit the rename and swap the Entry back to a Label (inside an HBox).
-fn commit_rename(
-    row: &ListBoxRow,
-    wid: u32,
-    new_name: &str,
-    state: &Rc<RefCell<AppState>>,
-    on_change: &OnChangeCb,
-) {
-    // Already committed (might fire twice from activate + focus-out)
-    if row.child().and_then(|c| c.downcast::<Entry>().ok()).is_none() {
-        return;
+            return geometry::snap_position_with_frames(
+                &sidebar_rect,
+                &sidebar_frame,
+                &target_frame,
+                &workarea,
+            );
+        }
     }
 
-    let trimmed = new_name.trim();
-    if !trimmed.is_empty() {
-        state.borrow_mut().rename_window(wid, trimmed);
-    }
-
-    // Get display text
-    let state_ref = state.borrow();
-    let display = state_ref.display_name(wid);
-    let native = state_ref.native_title(wid);
-
-    let label = Label::new(Some(display));
-    label.set_halign(gtk::Align::Start);
-    label.set_margin_start(8);
-    label.set_hexpand(true);
-    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    label.set_tooltip_text(Some(native));
-
-    // Restore HBox with label (buttons will be re-added on next rebuild)
-    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    hbox.append(&label);
-
-    row.set_child(Some(&hbox));
-
-    // Notify that state changed (triggers debounced save)
-    if let Some(ref f) = *on_change.borrow() {
-        f();
-    }
+    // Fallback: use GTK-based estimate (original behavior)
+    let sidebar_rect = geometry::Rect {
+        x: 0,
+        y: 0,
+        width: window.width() as u32,
+        height: window.height() as u32,
+    };
+    let workarea = get_workarea_estimate(window);
+    geometry::snap_position(&sidebar_rect, &workarea)
 }
 
 fn get_workarea_estimate(window: &gtk::ApplicationWindow) -> geometry::Rect {

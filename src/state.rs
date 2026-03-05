@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,9 @@ pub struct WindowEntry {
     pub wm_instance: String,
     pub title: String,
     pub desktop: Option<u32>,
+    pub pid: Option<u32>,
+    pub is_minimized: bool,
+    pub is_urgent: bool,
 }
 
 /// Application state — the list of tracked windows and which is active.
@@ -22,6 +25,8 @@ pub struct AppState {
     active: Option<u32>,
     /// User-assigned names, keyed by window ID.
     renames: HashMap<u32, String>,
+    /// Windows hidden by the user for this session (not persisted).
+    hidden: HashSet<u32>,
 }
 
 impl AppState {
@@ -30,6 +35,7 @@ impl AppState {
             windows: Vec::new(),
             active: None,
             renames: HashMap::new(),
+            hidden: HashSet::new(),
         }
     }
 
@@ -68,16 +74,24 @@ impl AppState {
             }
         }
 
-        // Clean up renames for windows that no longer exist
-        let live_ids: std::collections::HashSet<u32> =
-            self.windows.iter().map(|w| w.id).collect();
+        // Clean up renames and hidden set for windows that no longer exist
+        let live_ids: HashSet<u32> = self.windows.iter().map(|w| w.id).collect();
         self.renames.retain(|id, _| live_ids.contains(id));
+        self.hidden.clear();
     }
 
     /// Update a single window's native title without a full refresh.
     pub fn update_title(&mut self, wid: u32, title: &str) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
             w.title = title.to_string();
+        }
+    }
+
+    /// Update a window's minimized/urgent state without a full refresh.
+    pub fn update_state(&mut self, wid: u32, is_minimized: bool, is_urgent: bool) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
+            w.is_minimized = is_minimized;
+            w.is_urgent = is_urgent;
         }
     }
 
@@ -118,8 +132,18 @@ impl AppState {
             .unwrap_or("")
     }
 
+    /// Hide a window from the sidebar for this session (not persisted).
+    pub fn hide_window(&mut self, wid: u32) {
+        self.hidden.insert(wid);
+    }
+
     pub fn filtered_windows<'a>(&'a self, filter: &'a Filter) -> impl Iterator<Item = &'a WindowEntry> {
-        self.windows.iter().filter(move |w| filter.matches(&w.wm_class))
+        self.windows.iter().filter(move |w| filter.matches(&w.wm_class) && !self.hidden.contains(&w.id))
+    }
+
+    /// Get the desktop number for a window.
+    pub fn window_desktop(&self, wid: u32) -> Option<u32> {
+        self.windows.iter().find(|w| w.id == wid).and_then(|w| w.desktop)
     }
 
     /// Check if a window has a user-assigned rename.
@@ -150,6 +174,8 @@ impl AppState {
             window_order,
             window_ids,
             renames: self.renames.clone(),
+            window_x: None,
+            window_y: None,
         }
     }
 
@@ -212,6 +238,12 @@ pub struct SavedState {
     pub window_ids: Vec<u32>,
     /// User-assigned renames, keyed by window ID at save time.
     pub renames: HashMap<u32, String>,
+    /// Saved PTM window X position (None = use WM default placement).
+    #[serde(default)]
+    pub window_x: Option<i32>,
+    /// Saved PTM window Y position (None = use WM default placement).
+    #[serde(default)]
+    pub window_y: Option<i32>,
 }
 
 impl SavedState {

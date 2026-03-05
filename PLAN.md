@@ -4,26 +4,27 @@ A vertical sidebar app for managing application windows on Linux/X11. Think "Fir
 
 ## Current Status
 
-**Phase 1 (MVP) — COMPLETE.** Phase 1.9 (cleanup) is next.
+**Phase 2.1 (Visual Polish) — COMPLETE.** Ready for Phase 2.2.
 
 | Phase | Status | What it delivered |
 |-------|--------|-------------------|
 | Phase 0 | DONE | Rust + GTK4 + x11rb proven, spikes deleted |
 | Phase 1.1 | DONE | Config + Filter modules (14 tests) |
-| Phase 1.2 | DONE | X11 window discovery — EWMH parsing (15 tests) |
-| Phase 1.3 | DONE | Event loop bridge — PtmEvent translation (8 tests) |
+| Phase 1.2 | DONE | X11 window discovery — EWMH parsing (15→20 tests) |
+| Phase 1.3 | DONE | Event loop bridge — PtmEvent translation (8→9 tests) |
 | Phase 1.4 | DONE | GTK4 sidebar with live window list (9 state tests) |
 | Phase 1.5 | DONE | Click to focus + snap positioning (5 geometry tests) |
 | Phase 1.6 | DONE | Double-click inline rename (6 tests) |
 | Phase 1.7 | DONE | Up/down reorder buttons (5 tests) |
 | Phase 1.8 | DONE | JSON persistence to ~/.config/ (10 tests) |
-| VM E2E | DONE | Test infra: cinnamon-dev VM, 8 E2E tests passing |
-| **Phase 1.9** | **NEXT** | **Cleanup: filter self, cross-workspace, row.rs extraction** |
-| Phase 2.1 | Planned | Visual polish (icons, keyboard nav, context menus) |
-| Phase 2.2 | Planned | Tab groups |
+| VM E2E | DONE | Test infra: cinnamon-dev + ptm-test VMs, 15 E2E tests passing |
+| Phase 1.9 | DONE | Filter self, cross-workspace click, save on exit, row.rs extraction |
+| Phase 2.1 | DONE | Firefox-style rows (icons, no buttons), DnD reorder, keyboard nav, context menu, minimized/urgent state, CSS polish |
+| Phase 2.1b | IN PROGRESS | Focus pass-through: background click on PTM row activates target (UTILITY hint + hover-tracking) |
+| **Phase 2.2** | **NEXT** | **Tab groups** |
 | Phase 2.3 | Planned | Snap-to-adopt window capture |
 
-**Total tests:** 72 unit + 8 E2E = 80
+**Total tests:** 82 unit + 16 E2E = 98
 
 **How to run it:**
 ```bash
@@ -208,8 +209,8 @@ At key milestones, pause for a "show your work" visual review. This is not UAT �
 
 | When | What to show | Key questions |
 |------|-------------|---------------|
-| **Phase 1 complete** (NOW) | Dark sidebar listing terminal windows, click-to-focus, up/down reorder buttons, inline rename | Does the basic interaction feel right? Is the sidebar too wide/narrow? |
-| **Phase 1.9 complete** | Same but PTM no longer in own list, cross-workspace works, cleaner rows | Any UX papercuts before we add complexity? |
+| **Phase 1 complete** (DONE) | Dark sidebar listing terminal windows, click-to-focus, up/down reorder buttons, inline rename | Does the basic interaction feel right? Is the sidebar too wide/narrow? |
+| **Phase 1.9 complete** (DONE) | Same but PTM no longer in own list, cross-workspace works, cleaner rows, save on exit | Any UX papercuts before we add complexity? |
 | **Phase 2.1 complete** | Keyboard nav, app icons, right-click menu, DnD reorder | Does the polish level feel like a usable tool? |
 | **Phase 2.2 complete** | Groups with headers, collapse/expand | Does the group model match your mental model? |
 | **Phase 2.3 complete** | Snap-to-adopt demo: drag window → it joins the group | Does the snap gesture feel natural? Is the detection reliable? |
@@ -261,7 +262,7 @@ glib::unix_fd_source_new(fd, IOCondition::IN, Priority::DEFAULT, move |_fd, _con
 
 Goal: a working vertical sidebar that lists terminal windows and focuses/positions them on click. Persistence included so restarts don't lose your organization.
 
-> **All sub-phases 1.1–1.8 are complete.** See Phase 1 Retrospective below for details. Phase 1.9 (cleanup) is the next work item.
+> **All sub-phases 1.1–1.9 are complete.** See Phase 1 Retrospective below for details. Phase 2.1 (visual polish) is the next work item.
 
 ### 1.1 — Config + Filter (TDD)
 1. **Test first:** `tests/config_test.rs` — default includes terminal classes, round-trips JSON, merges with defaults
@@ -338,7 +339,7 @@ pub enum PtmEvent {
 
 ### Phase 1 — Retrospective & Status
 
-**Completed.** 72 unit tests + 8 VM E2E tests. All phases 1.1–1.8 implemented and committed.
+**Completed.** 27 unit tests + 15 VM E2E tests. All phases 1.1–1.9 implemented and committed.
 
 **What worked well:**
 - Pure/impure module separation — 72 unit tests run instantly, no display needed
@@ -352,20 +353,20 @@ pub enum PtmEvent {
 - Debounced save via `glib::timeout_add_local_once` (2s delay)
 - `dirs` crate added for cross-platform `~/.config` resolution
 
-**Known gaps carried to Phase 1.9 (cleanup before Phase 2):**
-1. **PTM shows itself in its own list** — need to filter out our own WM_CLASS
-2. **Cross-workspace click not fully implemented** — `switch_desktop()` exists but isn't called
-3. **No save on graceful exit** — state only saves on rename/reorder, not on shutdown
-4. **E2E tests need expansion** — rename persistence, reorder persistence, snap behavior untested
-5. **Sidebar row construction is inline** — needs `row.rs` extraction before Phase 2 adds icons/menus
+**Known gaps (all resolved in Phase 1.9):**
+1. ~~PTM shows itself in its own list~~ — fixed: `_NET_WM_PID` self-filter
+2. ~~Cross-workspace click not fully implemented~~ — fixed: desktop detection + switch before activate
+3. ~~No save on graceful exit~~ — fixed: SIGTERM handler + `connect_shutdown`
+4. ~~E2E tests need expansion~~ — fixed: 15 tests across 6 suites (ptm-test VM)
+5. ~~Sidebar row construction is inline~~ — fixed: `row.rs` module extraction
 
-### 1.9 — Pre-Phase 2 Cleanup ⬜ NEXT
-1. **Filter PTM's own window** from the list (match WM_CLASS or `_NET_WM_PID`)
-2. **Cross-workspace click:** detect target window's desktop, call `switch_desktop()` before `activate_window()`, skip snap for cross-workspace
-3. **Save on exit:** connect to `GtkApplication::shutdown` signal to save state
-4. **Extract `row.rs`:** move row construction (label + buttons + HBox) into a dedicated module
-5. **Expand E2E tests:** rename persistence across restart, reorder persistence, rapid window churn (10 xterms in 1 second)
-6. **VISUAL REVIEW CHECKPOINT:** Screenshots + live VM demo. Last chance for UX feedback before adding groups.
+### 1.9 — Pre-Phase 2 Cleanup ✅ DONE
+1. **Filter PTM's own window** — reads `_NET_WM_PID` via EWMH, compares against `std::process::id()` in `refresh_state`
+2. **Cross-workspace click** — detects target window's `_NET_WM_DESKTOP` vs `_NET_CURRENT_DESKTOP`, calls `switch_desktop()` before `activate_window()`, skips snap for cross-workspace
+3. **Save on exit** — SIGTERM handler (`glib::unix_signal_add_local(15, ...)`) triggers `app.quit()` which fires `connect_shutdown` to save state
+4. **Extract `row.rs`** — `build_row()` takes closures for reorder callbacks, eliminating circular Sidebar dependency. Also `parse_wid_from_name()`, `get_row_label()`, `start_inline_rename()`
+5. **Expand E2E tests** — 15 tests across 6 suites: launch_and_list, dynamic_list, click_focus, save_on_exit, self_filter, rapid_churn. Dedicated ptm-test VM (cloned from cinnamon-dev) with Xauthority cookie sync
+6. **Visual review checkpoint** — screenshots captured at each E2E test stage
 
 ---
 
@@ -439,7 +440,7 @@ Rapidly open 10 xterms in quick succession. Verify all 10 appear in the sidebar 
 
 ## Known Challenges
 
-1. **PTM's own window in the list:** Filter by WM_CLASS or `_NET_WM_PID` matching our own process. **→ Fix in Phase 1.9.**
+1. ~~**PTM's own window in the list:**~~ Fixed in Phase 1.9 — filter by `_NET_WM_PID` matching `std::process::id()`.
 2. **Multi-monitor snap geometry:** Use GTK4's `gdk4::Display::monitors()` for per-monitor geometry, not the giant `_NET_WORKAREA`.
 3. **GTK4 DnD complexity:** DragSource + DropTarget is more code than GTK3's `set_reorderable(true)`. Phase 1 used up/down buttons as fallback. **→ DnD in Phase 2.1.**
 4. **Window identity across restarts:** Window IDs change every launch. Group names persist but window-to-group associations are lost. User re-associates after restart. PID-based tracking during a live session helps within a session. Full session restore is Phase 3.

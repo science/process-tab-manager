@@ -7,6 +7,9 @@ fn make_entry(id: u32, class: &str, title: &str) -> WindowEntry {
         wm_instance: class.to_lowercase(),
         title: title.to_string(),
         desktop: Some(0),
+        pid: None,
+        is_minimized: false,
+        is_urgent: false,
     }
 }
 
@@ -179,6 +182,27 @@ fn rename_persists_across_window_list_updates() {
     assert_eq!(state.display_name(1), "my terminal");
 }
 
+// -- Desktop lookup (Phase 1.9) --
+
+#[test]
+fn window_desktop_returns_desktop_number() {
+    let mut state = AppState::new();
+    state.update_windows(vec![
+        WindowEntry {
+            id: 1,
+            wm_class: "Gnome-terminal".to_string(),
+            wm_instance: "gnome-terminal".to_string(),
+            title: "t1".to_string(),
+            desktop: Some(2),
+            pid: None,
+            is_minimized: false,
+            is_urgent: false,
+        },
+    ]);
+    assert_eq!(state.window_desktop(1), Some(2));
+    assert_eq!(state.window_desktop(999), None);
+}
+
 // -- Reorder tests (Phase 1.7) --
 
 #[test]
@@ -331,6 +355,55 @@ fn load_state_from_nonexistent_file_returns_none() {
     assert!(result.is_none());
 }
 
+// -- Hide window tests (Phase 2.1.1) --
+
+#[test]
+fn hide_window_excludes_from_filtered() {
+    use process_tab_manager::filter::Filter;
+
+    let mut state = AppState::new();
+    state.update_windows(vec![
+        make_entry(1, "XTerm", "t1"),
+        make_entry(2, "XTerm", "t2"),
+        make_entry(3, "XTerm", "t3"),
+    ]);
+
+    let filter = Filter::new(vec!["XTerm".to_string()]);
+    assert_eq!(state.filtered_windows(&filter).count(), 3);
+
+    state.hide_window(2);
+    assert_eq!(state.filtered_windows(&filter).count(), 2);
+    assert!(state.filtered_windows(&filter).all(|w| w.id != 2));
+}
+
+#[test]
+fn hide_window_cleared_on_window_list_update() {
+    use process_tab_manager::filter::Filter;
+
+    let mut state = AppState::new();
+    state.update_windows(vec![
+        make_entry(1, "XTerm", "t1"),
+        make_entry(2, "XTerm", "t2"),
+    ]);
+    state.hide_window(2);
+
+    let filter = Filter::new(vec!["XTerm".to_string()]);
+    assert_eq!(state.filtered_windows(&filter).count(), 1);
+
+    // Full refresh brings window back (user can re-hide if they want)
+    state.update_windows(vec![
+        make_entry(1, "XTerm", "t1"),
+        make_entry(2, "XTerm", "t2"),
+    ]);
+    assert_eq!(state.filtered_windows(&filter).count(), 2);
+}
+
+#[test]
+fn hide_unknown_window_is_noop() {
+    let mut state = AppState::new();
+    state.hide_window(999); // should not panic
+}
+
 #[test]
 fn restore_order_from_saved_state() {
     let mut state = AppState::new();
@@ -356,4 +429,29 @@ fn restore_order_from_saved_state() {
     let ids: Vec<u32> = new_state.windows().iter().map(|w| w.id).collect();
     // kitty should be first (matching saved order), then Gnome-terminals
     assert_eq!(ids[0], 20, "kitty window should be first");
+}
+
+// -- Position persistence tests (Phase 2.2) --
+
+#[test]
+fn saved_state_with_position() {
+    let mut state = AppState::new();
+    state.update_windows(vec![make_entry(1, "XTerm", "t1")]);
+    let mut saved = state.to_saved();
+    saved.window_x = Some(100);
+    saved.window_y = Some(200);
+
+    let json = serde_json::to_string_pretty(&saved).unwrap();
+    let loaded: SavedState = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.window_x, Some(100));
+    assert_eq!(loaded.window_y, Some(200));
+}
+
+#[test]
+fn saved_state_backward_compatible_no_position() {
+    // Old state.json without window_x/window_y fields should deserialize fine
+    let json = r#"{"window_order":["XTerm:xterm"],"window_ids":[1],"renames":{}}"#;
+    let loaded: SavedState = serde_json::from_str(json).unwrap();
+    assert_eq!(loaded.window_x, None);
+    assert_eq!(loaded.window_y, None);
 }

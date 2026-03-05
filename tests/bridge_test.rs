@@ -11,6 +11,7 @@ fn test_atoms() -> AtomIds {
         net_active_window: 101,
         net_wm_name: 102,
         net_current_desktop: 103,
+        net_wm_state: 104,
     }
 }
 
@@ -119,6 +120,22 @@ fn unrelated_property_on_window_returns_none() {
     });
     let result = translate_event(&event, &atoms, ROOT);
     assert_eq!(result, None);
+}
+
+#[test]
+fn wm_state_changed_on_window() {
+    let atoms = test_atoms();
+    let wid = 0x02600017;
+    let event = Event::PropertyNotify(PropertyNotifyEvent {
+        response_type: PROPERTY_NOTIFY_EVENT,
+        sequence: 0,
+        window: wid,
+        atom: atoms.net_wm_state,
+        time: 0,
+        state: x11rb_protocol::protocol::xproto::Property::NEW_VALUE,
+    });
+    let result = translate_event(&event, &atoms, ROOT);
+    assert_eq!(result, Some(PtmEvent::WindowStateChanged(wid)));
 }
 
 #[test]

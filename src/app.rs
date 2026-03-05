@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::filter::Filter;
 use crate::sidebar::Sidebar;
 use crate::state::{AppState, SavedState};
+use crate::x11::actions;
 use crate::x11::connection::{self as x11conn, AtomCache};
 use crate::x11::monitor;
 
@@ -99,8 +100,14 @@ fn activate(app: &Application) {
     // Connect double-click rename handler
     sidebar.connect_rename(Rc::clone(&state));
 
-    // Store state+filter for reorder buttons
+    // Connect keyboard handler (F2, Delete, Alt+Up/Down)
+    sidebar.connect_keyboard(Rc::clone(&state));
+
+    // Store state+filter for keyboard/DnD reorder
     sidebar.set_reorder_state(Rc::clone(&state), filter.clone());
+
+    // Connect drag-and-drop reorder
+    sidebar.connect_dnd();
 
     // Set up save-on-change callback
     let state_for_save = Rc::clone(&state);
@@ -113,7 +120,11 @@ fn activate(app: &Application) {
     refresh_state(&conn, root, &atoms, &filter, &state, &sidebar);
 
     // Restore saved state (renames and ordering)
+    let saved_position: Rc<RefCell<Option<(i32, i32)>>> = Rc::new(RefCell::new(None));
     if let Some(saved) = SavedState::load_from_file(&state_path()) {
+        if let (Some(x), Some(y)) = (saved.window_x, saved.window_y) {
+            *saved_position.borrow_mut() = Some((x, y));
+        }
         state.borrow_mut().restore_from(&saved);
         sidebar.rebuild(&state.borrow(), &filter);
     }
@@ -124,6 +135,7 @@ fn activate(app: &Application) {
         net_active_window: atoms.net_active_window,
         net_wm_name: atoms.net_wm_name,
         net_current_desktop: atoms.net_current_desktop,
+        net_wm_state: atoms.net_wm_state,
     };
 
     // Register x11rb FD with GLib main loop
@@ -167,6 +179,16 @@ fn activate(app: &Application) {
                         {
                             state_for_fd.borrow_mut().update_title(wid, &info.title);
                             sidebar_for_fd.update_title(wid, &info.title);
+                        }
+                    }
+                    PtmEvent::WindowStateChanged(wid) => {
+                        if let Ok(info) =
+                            x11conn::get_window_info(&conn_for_fd, wid, &atoms_for_fd)
+                        {
+                            state_for_fd
+                                .borrow_mut()
+                                .update_state(wid, info.is_minimized, info.is_urgent);
+                            sidebar_for_fd.update_state(wid, info.is_minimized, info.is_urgent);
                         }
                     }
                     PtmEvent::DesktopChanged => {
@@ -226,10 +248,117 @@ fn activate(app: &Application) {
         .child(&vbox)
         .build();
 
-    // Connect click handler for focus + snap
-    sidebar.connect_click(Rc::clone(&conn), Rc::clone(&atoms), root, window.clone());
+    // Prevent PTM from stealing focus when the user clicks a row —
+    // click events still reach child widgets, but the window won't grab_focus()
+    window.set_focus_on_click(false);
+
+    // Shared cell for PTM's own X11 window ID (discovered after window is mapped)
+    let ptm_wid: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+    // Connect click handler for focus + snap (with cross-workspace support)
+    sidebar.connect_click(Rc::clone(&conn), Rc::clone(&atoms), root, window.clone(), Rc::clone(&state), Rc::clone(&ptm_wid));
+
+    // Connect focus pass-through: when PTM gains focus from a background click,
+    // activate the row under the cursor (the WM eats the click on raise)
+    sidebar.connect_focus_passthrough(
+        Rc::clone(&conn), Rc::clone(&atoms), root, &window, Rc::clone(&state), window.clone(), Rc::clone(&ptm_wid),
+    );
+
+    // Connect right-click context menu
+    sidebar.connect_context_menu(Rc::clone(&conn), Rc::clone(&atoms), root, Rc::clone(&state));
+
+    // Shared cell to store PTM position captured before quit (window still alive).
+    // connect_shutdown fires after windows are destroyed, so we can't query X11 there.
+    let last_position: Rc<RefCell<Option<(i32, i32)>>> = Rc::new(RefCell::new(None));
+
+    // Handle SIGTERM gracefully — capture position while window still exists, then quit
+    let app_for_signal = app.downgrade();
+    let conn_for_signal = Rc::clone(&conn);
+    let ptm_wid_for_signal = Rc::clone(&ptm_wid);
+    let last_pos_for_signal = Rc::clone(&last_position);
+    glib::unix_signal_add_local(15 /* SIGTERM */, move || {
+        // Capture client area position before app.quit() destroys the window.
+        if let Some(pw) = *ptm_wid_for_signal.borrow() {
+            if let Ok((x, y)) = x11conn::get_window_position(&conn_for_signal, pw, root) {
+                *last_pos_for_signal.borrow_mut() = Some((x, y));
+                log::debug!("Captured PTM position ({}, {}) before shutdown", x, y);
+            }
+        }
+        if let Some(app) = app_for_signal.upgrade() {
+            app.quit();
+        }
+        glib::ControlFlow::Break
+    });
+
+    // Save state on shutdown (uses position captured by SIGTERM handler)
+    let state_for_shutdown = Rc::clone(&state);
+    let last_pos_for_shutdown = Rc::clone(&last_position);
+    app.connect_shutdown(move |_| {
+        let s = state_for_shutdown.borrow();
+        let mut saved = s.to_saved();
+
+        if let Some((x, y)) = *last_pos_for_shutdown.borrow() {
+            saved.window_x = Some(x);
+            saved.window_y = Some(y);
+        }
+
+        if let Err(e) = saved.save_to_file(&state_path()) {
+            log::error!("Failed to save state on shutdown: {}", e);
+        } else {
+            log::debug!("State saved on shutdown");
+        }
+    });
 
     window.present();
+
+    // Discover PTM's own X11 window by PID. Uses find_window_by_pid which searches
+    // root's children via query_tree (PTM may not be in _NET_CLIENT_LIST if the WM
+    // doesn't fully manage it). Retries every 500ms until found.
+    let conn_for_type = Rc::clone(&conn);
+    let atoms_for_type = Rc::clone(&atoms);
+    let ptm_wid_for_type = Rc::clone(&ptm_wid);
+    let conn_for_restore = Rc::clone(&conn);
+    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        if ptm_wid_for_type.borrow().is_some() {
+            return glib::ControlFlow::Break;
+        }
+
+        let own_pid = std::process::id();
+        match x11conn::find_window_by_pid(&conn_for_type, root, &atoms_for_type, own_pid) {
+            Ok(Some(wid)) => {
+                log::debug!("Discovered PTM window 0x{:08x} (pid={})", wid, own_pid);
+                *ptm_wid_for_type.borrow_mut() = Some(wid);
+
+                if let Err(e) = actions::set_window_type_utility(&conn_for_type, wid, &atoms_for_type) {
+                    log::error!("Failed to set window type: {}", e);
+                }
+
+                // Restore position after a delay to let WM process the type change
+                let saved_pos = *saved_position.borrow();
+                let conn_r = Rc::clone(&conn_for_restore);
+                if let Some((x, y)) = saved_pos {
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            log::debug!("Restoring PTM position to ({}, {})", x, y);
+                            if let Err(e) = actions::move_window(&conn_r, wid, x, y) {
+                                log::error!("Failed to restore position: {}", e);
+                            }
+                        },
+                    );
+                }
+
+                return glib::ControlFlow::Break;
+            }
+            Ok(None) => {
+                log::debug!("PTM WID discovery: not found yet (pid={})", own_pid);
+            }
+            Err(e) => {
+                log::warn!("PTM WID discovery error: {}", e);
+            }
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 fn refresh_state(
@@ -261,6 +390,9 @@ fn refresh_state(
                     wm_instance: info.wm_instance,
                     title: info.title,
                     desktop: info.desktop,
+                    pid: info.pid,
+                    is_minimized: info.is_minimized,
+                    is_urgent: info.is_urgent,
                 });
             }
             Err(e) => {
@@ -268,6 +400,10 @@ fn refresh_state(
             }
         }
     }
+
+    // Filter out PTM's own window
+    let own_pid = std::process::id();
+    entries.retain(|e| e.pid != Some(own_pid));
 
     // Update state
     let mut s = state.borrow_mut();

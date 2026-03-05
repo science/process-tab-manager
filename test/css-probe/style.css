@@ -1,0 +1,83 @@
+/* Process Tab Manager — Sublime Text-inspired dark theme */
+
+window.background {
+    background-color: #272822;
+    color: #d4d4d4;
+}
+
+scrolledwindow, viewport {
+    background-color: transparent;
+}
+
+listbox {
+    background-color: #272822;
+}
+
+listbox row {
+    padding: 4px 4px;
+    margin: 0;
+    border-radius: 0;
+    color: #d4d4d4;
+    border-bottom: 1px solid #3a3a3a;
+    transition: background-color 150ms ease;
+}
+
+listbox row:hover {
+    background-color: #3e3d32;
+}
+
+listbox row:selected {
+    background-color: #49483e;
+    color: #ffffff;
+}
+
+/* Active window: left accent border (blue indicator) */
+.ptm-active {
+    border-left: 3px solid #0a84ff;
+    background-color: #3e3d32;
+    color: #ffffff;
+}
+
+/* Minimized windows: italic + dimmed */
+.ptm-minimized label {
+    font-style: italic;
+    opacity: 0.5;
+}
+
+/* Urgent windows: amber glow */
+.ptm-urgent {
+    background-color: #4a3800;
+    color: #ffbd4f;
+    border-left: 3px solid #ffbd4f;
+}
+
+/* Row labels */
+label {
+    font-family: "Cantarell", "Inter", "Noto Sans", sans-serif;
+    font-size: 14px;
+}
+
+/* DnD drop target highlight */
+listbox row:drop(active) {
+    background-color: #2a3a4a;
+    border-top: 2px solid #0a84ff;
+}
+
+/* Context menu styling */
+popover contents {
+    background-color: #333333;
+    color: #d4d4d4;
+    border: 1px solid #4a4a4f;
+    border-radius: 6px;
+    padding: 4px 0;
+}
+
+modelbutton {
+    padding: 4px 12px;
+    color: #d4d4d4;
+}
+
+modelbutton:hover {
+    background-color: #0a84ff;
+    color: #ffffff;
+}

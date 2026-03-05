@@ -65,13 +65,28 @@ pub fn run() -> glib::ExitCode {
 }
 
 fn activate(app: &Application) {
-    // Load CSS
+    // Enable dark theme before loading CSS — Adwaita's light theme overrides
+    // custom background colors at PRIORITY_APPLICATION regardless of selectors.
+    let display = gdk4::Display::default().expect("Could not get default display");
+    let settings = gtk::Settings::for_display(&display);
+    settings.set_gtk_application_prefer_dark_theme(true);
+
+    // Load CSS at PRIORITY_USER (800) to override Adwaita-dark defaults
     let css_provider = CssProvider::new();
+    css_provider.connect_parsing_error(|_provider, section, error| {
+        let loc = section.start_location();
+        log::warn!(
+            "CSS parse error at line {}:{} — {}",
+            loc.lines() + 1,
+            loc.chars(),
+            error
+        );
+    });
     css_provider.load_from_data(include_str!("../style.css"));
     gtk::style_context_add_provider_for_display(
-        &gdk4::Display::default().expect("Could not get default display"),
+        &display,
         &css_provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_USER,
     );
 
     // Connect to X11

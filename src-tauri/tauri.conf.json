@@ -1,0 +1,31 @@
+{
+  "productName": "process-tab-manager",
+  "identifier": "com.github.science.ptm",
+  "version": "0.1.0",
+  "build": {
+    "frontendDist": "../frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["/usr/share/**", "/usr/local/share/**"]
+      }
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Process Tab Manager",
+        "width": 250,
+        "height": 600,
+        "x": 50,
+        "y": 50,
+        "alwaysOnTop": true,
+        "decorations": true,
+        "resizable": true,
+        "transparent": false
+      }
+    ]
+  }
+}

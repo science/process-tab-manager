@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Process Tab Manager
+Comment=Vertical sidebar for managing application windows
+Exec=process-tab-manager
+Icon=process-tab-manager
+Categories=Utility;System;
+Keywords=window;manager;sidebar;tabs;
+StartupWMClass=com.github.science.ptm
+Terminal=false

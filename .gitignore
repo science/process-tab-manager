@@ -1,4 +1,11 @@
 /target
+/ptm-core/target
 /test/css-probe/target
+/test/tauri-prototype/src-tauri/target
 /test/screenshots/
+/test/e2e/node_modules/
+/test/wdio-prototype/node_modules/
+/run/node_modules/
 /vm
+claude-max-key.txt
+claude-install.sh

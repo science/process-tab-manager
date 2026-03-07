@@ -1,0 +1,212 @@
+/* Process Tab Manager — Dark theme (ported from GTK4 style.css) */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    background-color: #272822;
+    color: #d4d4d4;
+    font-family: "Cantarell", "Inter", "Noto Sans", sans-serif;
+    font-size: 14px;
+    width: 100%;
+    height: 100vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    user-select: none;
+    cursor: default;
+}
+
+/* ─── Sidebar list ─────────────────────────────────────────────── */
+
+#sidebar {
+    list-style: none;
+    padding: 0;
+}
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 4px;
+    border-bottom: 1px solid #3a3a3a;
+    border-left: 3px solid transparent;
+    transition: background-color 150ms ease;
+    cursor: default;
+}
+
+.row:hover {
+    background-color: #3e3d32;
+}
+
+.row.selected {
+    background-color: #49483e;
+    color: #ffffff;
+}
+
+/* Active window: blue left border */
+.row.active {
+    border-left-color: #0a84ff;
+    background-color: #3e3d32;
+    color: #ffffff;
+}
+
+/* Minimized: italic + dimmed */
+.row.minimized .title {
+    font-style: italic;
+    opacity: 0.5;
+}
+
+/* Urgent: amber glow */
+.row.urgent {
+    background-color: #4a3800;
+    color: #ffbd4f;
+    border-left-color: #ffbd4f;
+}
+
+/* Renamed: subtle indicator */
+.row.renamed .title {
+    text-decoration: underline dotted;
+}
+
+/* Dragging state */
+.row.dragging {
+    opacity: 0.4;
+}
+
+/* DnD drop indicator */
+.drop-indicator {
+    height: 2px;
+    background: #0a84ff;
+    pointer-events: none;
+}
+
+/* ─── Icons ────────────────────────────────────────────────────── */
+
+.icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+}
+
+.title {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ─── Group headers ────────────────────────────────────────────── */
+
+.group-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 4px;
+    font-weight: bold;
+    background-color: #2d2d2d;
+    border-bottom: 1px solid #4a4a4a;
+    cursor: default;
+    border-left: 3px solid transparent;
+}
+
+.group-header:hover {
+    background-color: #383838;
+}
+
+.group-header.selected {
+    background-color: #49483e;
+}
+
+.group-arrow {
+    font-size: 10px;
+    width: 16px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.group-name {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.group-count {
+    font-size: 11px;
+    color: #888;
+    font-weight: normal;
+}
+
+/* Grouped windows: indented */
+.row.grouped {
+    padding-left: 24px;
+}
+
+/* ─── Inline rename ────────────────────────────────────────────── */
+
+.rename-input {
+    background: #1c1b22;
+    color: #ffffff;
+    border: 1px solid #0a84ff;
+    padding: 1px 4px;
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+    flex: 1;
+}
+
+/* ─── Context menu ─────────────────────────────────────────────── */
+
+#context-menu {
+    display: none;
+    position: fixed;
+    background: #333333;
+    border: 1px solid #4a4a4f;
+    border-radius: 6px;
+    padding: 4px 0;
+    min-width: 180px;
+    max-height: calc(100vh - 8px);
+    overflow-y: auto;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+
+#context-menu.visible {
+    display: block;
+}
+
+#context-menu .menu-item {
+    padding: 4px 12px;
+    color: #d4d4d4;
+    cursor: default;
+    font-size: 13px;
+}
+
+#context-menu .menu-item:hover {
+    background-color: #0a84ff;
+    color: #ffffff;
+}
+
+#context-menu .menu-separator {
+    height: 1px;
+    background: #4a4a4f;
+    margin: 4px 0;
+}
+
+/* ─── Scrollbar ────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #777;
+}

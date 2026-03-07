@@ -1,0 +1,24 @@
+{
+  "productName": "tauri-prototype",
+  "identifier": "com.ptm.prototype",
+  "version": "0.1.0",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "PTM Prototype",
+        "width": 300,
+        "height": 700,
+        "x": 50,
+        "y": 50,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "resizable": true
+      }
+    ]
+  }
+}

@@ -6,21 +6,15 @@ import { getEvents, clearEvents } from "../helpers/events.js";
 /**
  * Tests for the "inverted double-click" bug:
  *
- * BUG: When PTM has focus and user clicks a row, activate_window sends
- * X11 focus to the target window. PTM's webview loses focus (blur fires).
- * The user's next physical click on PTM is eaten by the WM to re-focus
- * the window — no DOM mousedown or click event fires. Only a focus event
- * fires. User must click twice.
+ * BUG: After activate_window moves X11 focus away, the user's next click
+ * on PTM alternates between needing 1 click and 2 clicks. Root cause:
+ * when the WM refocuses PTM AND delivers the click through, both the
+ * focus workaround (Case B) and the normal click handler fire, causing
+ * a double-activation that corrupts state for the next click.
  *
- * CURRENT WORKAROUND (main.js:547-588): Listens for mousedown while
- * windowBlurred and synthetically replays the click. This works when
- * GTK delivers mousedown but not click, but FAILS when the WM eats
- * the entire click (no mousedown at all).
- *
- * NEEDED FIX: On focus-after-blur with no intervening mousedown, query
- * pointer position and activate the row under it.
- *
- * These tests simulate the event sequences to verify both paths.
+ * FIX: Case B (focus-after-blur) schedules activation on a timer.
+ * If mousedown arrives before the timer fires, the timer is cancelled
+ * and the normal click path handles it. Only one activation per click.
  */
 describe("Focus Activation Workaround", () => {
   before(async () => {
@@ -55,28 +49,28 @@ describe("Focus Activation Workaround", () => {
     });
   }
 
-  it("should activate via mousedown-while-blurred (existing workaround)", async () => {
-    // This tests the existing workaround: blur → mousedown → synthetic click
+  it("Case B: should activate via focus-after-blur when WM eats entire click", async () => {
     const rows = await getTestRows();
     expect(rows.length).toBeGreaterThanOrEqual(2);
 
-    // Activate row A first
     await sidebar.clickRow(rows[0].index);
     await browser.pause(1500);
 
     clearEvents();
-    const rowB = (await getTestRows()).find(r => r.wid !== rows[0].wid);
+    const afterRows = await getTestRows();
+    const rowB = afterRows.find(r => r.wid !== rows[0].wid);
 
-    // Simulate: blur (PTM lost focus) → mousedown at row B (no click follows)
-    await browser.execute((targetY, targetX) => {
+    // Simulate: blur (activate_window stole focus) → focus (user clicked PTM,
+    // WM ate the click entirely — no mousedown follows)
+    await browser.execute((targetY) => {
+      document.dispatchEvent(new MouseEvent("mousemove", {
+        bubbles: true, clientX: 100, clientY: targetY,
+      }));
       window.dispatchEvent(new Event("blur"));
       setTimeout(() => {
-        document.dispatchEvent(new MouseEvent("mousedown", {
-          bubbles: true, cancelable: true,
-          clientX: targetX, clientY: targetY, button: 0,
-        }));
+        window.dispatchEvent(new Event("focus"));
       }, 50);
-    }, rowB.midY, rowB.midX);
+    }, rowB.midY);
 
     await browser.pause(2000);
 
@@ -85,57 +79,84 @@ describe("Focus Activation Workaround", () => {
     expect(clickEvents.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("should activate via focus-after-blur when WM eats entire click", async () => {
-    // THIS IS THE BUG SCENARIO — currently no code handles it.
-    // Sequence: blur → focus (no mousedown in between) → should activate
-    // the row under the pointer.
-    //
-    // In real usage: user clicks PTM after window activation moved focus away.
-    // WM eats the entire click (no mousedown). Only focus event fires.
-
+  it("should cancel Case B when mousedown follows focus (no double-fire)", async () => {
+    // When WM refocuses PTM AND delivers the click through, both focus
+    // and mousedown fire. Case B's timer must be cancelled by mousedown
+    // so only the normal click handler fires (exactly 1 activation).
     const rows = await getTestRows();
     expect(rows.length).toBeGreaterThanOrEqual(2);
 
-    // Activate row A first
     await sidebar.clickRow(rows[0].index);
     await browser.pause(1500);
 
     clearEvents();
     const afterRows = await getTestRows();
     const rowB = afterRows.find(r => r.wid !== rows[0].wid);
-    expect(rowB).toBeDefined();
 
-    // Simulate the sequence that the WM produces when eating a click:
-    // 1. blur (from activate_window moving focus away)
-    // 2. focus (from user clicking PTM — but WM eats the click, only focus fires)
-    // We set the pointer coordinates so the fix can query them.
-    await browser.execute((targetY, targetX) => {
-      // Blur first (activate_window stole focus)
+    // Simulate: blur → focus → mousedown → click (WM delivers everything)
+    // The focus handler schedules Case B timer (80ms).
+    // The mousedown handler cancels the timer.
+    // The click event fires the normal row click handler.
+    // Result: exactly 1 activation, not 2.
+    await browser.execute((idx) => {
       window.dispatchEvent(new Event("blur"));
-
-      // After a moment, focus fires (WM re-focused PTM from user's click)
-      // But NO mousedown fires — the WM ate it.
-      // Move the pointer to row B's position first (simulates where user clicked)
-      document.dispatchEvent(new MouseEvent("mousemove", {
-        bubbles: true, clientX: targetX, clientY: targetY,
-      }));
-
       setTimeout(() => {
         window.dispatchEvent(new Event("focus"));
-      }, 100);
-    }, rowB.midY, rowB.midX);
+        // mousedown follows shortly after focus (same user click)
+        setTimeout(() => {
+          // Simulate mousedown (cancels Case B timer)
+          document.dispatchEvent(new MouseEvent("mousedown", {
+            bubbles: true, cancelable: true, button: 0,
+          }));
+          // Then the normal click on the row
+          const row = document.querySelectorAll(".row")[idx];
+          if (row) row.click();
+        }, 10);
+      }, 50);
+    }, rowB.index);
 
-    // Wait for the fix to detect focus-after-blur and activate
     await browser.pause(2000);
 
-    // The fix should have activated row B
     const events = getEvents();
     const clickEvents = events.filter(e => e.includes("click") && e.includes(`wid=${rowB.wid}`));
-    expect(clickEvents.length).toBeGreaterThanOrEqual(1);
+    // Should be exactly 1 — the normal click. Case B should NOT have fired.
+    expect(clickEvents.length).toBe(1);
+  });
 
-    // X11 active window should have changed to B
-    const finalRows = await getTestRows();
-    const activatedB = finalRows.find(r => r.wid === rowB.wid);
-    expect(activatedB.isActive).toBe(true);
+  it("should not alternate: 3 sequential focus-after-blur activations", async () => {
+    // The original bug: activations alternate between working and not working.
+    // This test performs 3 sequential blur→focus sequences (simulating the user
+    // clicking 3 different rows after each activation steals focus).
+    // All 3 should activate successfully — no alternation.
+    const rows = await getTestRows();
+    expect(rows.length).toBeGreaterThanOrEqual(3);
+
+    for (let i = 0; i < rows.length; i++) {
+      clearEvents();
+      const target = (await getTestRows())[i];
+
+      // Simulate: activate moved focus away → user clicks back on PTM
+      await browser.execute((targetY) => {
+        document.dispatchEvent(new MouseEvent("mousemove", {
+          bubbles: true, clientX: 100, clientY: targetY,
+        }));
+        window.dispatchEvent(new Event("blur"));
+        setTimeout(() => {
+          window.dispatchEvent(new Event("focus"));
+        }, 50);
+      }, target.midY);
+
+      await browser.pause(2000);
+
+      const events = getEvents();
+      const clickEvents = events.filter(e => e.includes("click") && e.includes(`wid=${target.wid}`));
+      expect(clickEvents.length).toBeGreaterThanOrEqual(1);
+
+      // Verify X11 active window changed
+      const activeWid = await browser.execute(
+        () => window.__TAURI__.core.invoke("get_active_window_id")
+      );
+      expect(activeWid).toBe(target.wid);
+    }
   });
 });

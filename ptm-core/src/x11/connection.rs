@@ -6,6 +6,7 @@ use super::ewmh;
 
 /// Cached atom IDs to avoid repeated intern_atom round-trips.
 pub struct AtomCache {
+    pub net_client_list_stacking: u32,
     pub net_client_list: u32,
     pub net_active_window: u32,
     pub net_wm_name: u32,
@@ -40,6 +41,7 @@ pub struct WindowInfo {
 impl AtomCache {
     pub fn new(conn: &RustConnection) -> Result<Self> {
         // Pipeline all intern_atom requests before calling reply
+        let c0 = conn.intern_atom(false, b"_NET_CLIENT_LIST_STACKING")?;
         let c1 = conn.intern_atom(false, b"_NET_CLIENT_LIST")?;
         let c2 = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?;
         let c3 = conn.intern_atom(false, b"_NET_WM_NAME")?;
@@ -58,6 +60,7 @@ impl AtomCache {
         let c16 = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_DOCK")?;
 
         Ok(Self {
+            net_client_list_stacking: c0.reply()?.atom,
             net_client_list: c1.reply()?.atom,
             net_active_window: c2.reply()?.atom,
             net_wm_name: c3.reply()?.atom,
@@ -82,6 +85,14 @@ impl AtomCache {
 pub fn get_client_list(conn: &RustConnection, root: u32, atoms: &AtomCache) -> Result<Vec<u32>> {
     let reply = conn
         .get_property(false, root, atoms.net_client_list, AtomEnum::WINDOW, 0, 4096)?
+        .reply()?;
+    Ok(ewmh::parse_window_ids(&reply.value))
+}
+
+/// Get the stacking order (z-order) of managed windows, bottom to top.
+pub fn get_client_list_stacking(conn: &RustConnection, root: u32, atoms: &AtomCache) -> Result<Vec<u32>> {
+    let reply = conn
+        .get_property(false, root, atoms.net_client_list_stacking, AtomEnum::WINDOW, 0, 4096)?
         .reply()?;
     Ok(ewmh::parse_window_ids(&reply.value))
 }

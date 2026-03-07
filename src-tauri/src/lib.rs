@@ -337,6 +337,28 @@ fn get_ptm_window_geometry(ptm: tauri::State<'_, PtmState>) -> Result<WindowGeom
     get_window_geometry_inner(&ptm.conn, ptm_wid, ptm.root)
 }
 
+/// Get the X11 active window ID (_NET_ACTIVE_WINDOW).
+#[tauri::command]
+fn get_active_window_id(ptm: tauri::State<'_, PtmState>) -> Result<u32, String> {
+    x11conn::get_active_window(&ptm.conn, ptm.root, &ptm.atoms)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No active window".to_string())
+}
+
+/// Get the window stacking order (z-order), bottom to top.
+#[tauri::command]
+fn get_window_stack(ptm: tauri::State<'_, PtmState>) -> Result<Vec<u32>, String> {
+    x11conn::get_client_list_stacking(&ptm.conn, ptm.root, &ptm.atoms)
+        .map_err(|e| e.to_string())
+}
+
+/// Get PTM's own window ID.
+#[tauri::command]
+fn get_ptm_window_id(ptm: tauri::State<'_, PtmState>) -> Result<u32, String> {
+    find_ptm_wid(&ptm.conn, ptm.root, &ptm.atoms)
+        .ok_or_else(|| "PTM window not found".to_string())
+}
+
 /// E2E test helper: write event log line to /tmp/ptm-events.log
 #[tauri::command]
 fn log_event(line: String) {
@@ -548,6 +570,9 @@ pub fn run() {
             reorder_in_group,
             get_window_geometry,
             get_ptm_window_geometry,
+            get_active_window_id,
+            get_window_stack,
+            get_ptm_window_id,
             log_event,
             write_test_state,
         ])

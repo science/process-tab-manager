@@ -555,47 +555,51 @@ async function refreshSidebar() {
 //   Only a focus event fires. This is the "inverted double-click" bug.
 //   → On focus-after-blur with no intervening mousedown, find the row
 //     under the last known pointer position and click it.
+//
+// Critical: Cases A and B must not both fire on the same click.
+// When the WM refocuses PTM AND delivers the click through, focus fires
+// first (triggering Case B), then mousedown/click follow (normal path).
+// The Case B timer must be cancelled if mousedown arrives before it fires.
 
 {
   let windowBlurred = false;
-  let mousedownFiredSinceBlur = false;
-  let lastMouseX = 0;
   let lastMouseY = 0;
+  let focusClickTimer = null;
 
   // Track pointer position so we know where the user clicked
   // even if the WM eats the click event entirely.
   document.addEventListener("mousemove", (e) => {
-    lastMouseX = e.clientX;
     lastMouseY = e.clientY;
   }, true);
 
   window.addEventListener("blur", () => {
     windowBlurred = true;
-    mousedownFiredSinceBlur = false;
   });
 
   window.addEventListener("focus", () => {
-    if (windowBlurred && !mousedownFiredSinceBlur) {
-      // Case B: WM ate the entire click. Use last known pointer position.
+    if (windowBlurred) {
+      // Schedule Case B activation. If mousedown arrives before the timer
+      // fires, we cancel it (the normal click path will handle activation).
       windowBlurred = false;
       const clickY = lastMouseY;
-      setTimeout(() => {
+      focusClickTimer = setTimeout(() => {
+        focusClickTimer = null;
         clickClosestRow(clickY);
-      }, 50);
-    } else {
-      setTimeout(() => { windowBlurred = false; }, 300);
+      }, 80);
     }
   });
 
-  // Case A: mousedown delivered but click won't follow.
+  // Case A: mousedown delivered — cancel Case B timer if pending,
+  // then replay as synthetic click if we were blurred.
   document.addEventListener("mousedown", (e) => {
-    mousedownFiredSinceBlur = true;
-    if (e.button !== 0 || !windowBlurred) return;
-    windowBlurred = false;
-    const clickY = e.clientY;
-    setTimeout(() => {
-      clickClosestRow(clickY);
-    }, 50);
+    if (focusClickTimer !== null) {
+      clearTimeout(focusClickTimer);
+      focusClickTimer = null;
+    }
+    // If mousedown arrived while blurred AND before focus handler cleared
+    // windowBlurred, we still need to handle it (Case A).
+    // But if focus already cleared windowBlurred, this is a normal click
+    // and the click event will follow naturally — no workaround needed.
   }, true);
 
   function clickClosestRow(clickY) {

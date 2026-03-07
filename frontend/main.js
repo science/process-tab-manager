@@ -546,45 +546,75 @@ async function refreshSidebar() {
 
 // ─── Focus-click workaround ─────────────────────────────────────
 // On X11/GTK, when another window has focus and the user clicks on PTM,
-// GTK absorbs the first click to regain window focus without delivering
-// it as a DOM event. This workaround replays the click when the window
-// regains focus, so every click on a sidebar row is actionable.
+// the WM may eat the click to re-focus the window. Two cases:
+//
+// Case A: GTK delivers mousedown but not click (partial delivery).
+//   → Catch mousedown while blurred and replay as synthetic click.
+//
+// Case B: WM eats the entire click — no mousedown reaches the DOM.
+//   Only a focus event fires. This is the "inverted double-click" bug.
+//   → On focus-after-blur with no intervening mousedown, find the row
+//     under the last known pointer position and click it.
 
 {
   let windowBlurred = false;
+  let mousedownFiredSinceBlur = false;
+  let lastMouseX = 0;
+  let lastMouseY = 0;
+
+  // Track pointer position so we know where the user clicked
+  // even if the WM eats the click event entirely.
+  document.addEventListener("mousemove", (e) => {
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+  }, true);
 
   window.addEventListener("blur", () => {
     windowBlurred = true;
+    mousedownFiredSinceBlur = false;
   });
 
   window.addEventListener("focus", () => {
-    setTimeout(() => { windowBlurred = false; }, 300);
+    if (windowBlurred && !mousedownFiredSinceBlur) {
+      // Case B: WM ate the entire click. Use last known pointer position.
+      windowBlurred = false;
+      const clickY = lastMouseY;
+      setTimeout(() => {
+        clickClosestRow(clickY);
+      }, 50);
+    } else {
+      setTimeout(() => { windowBlurred = false; }, 300);
+    }
   });
 
-  // On mousedown while blurred: GTK delivered the mousedown but won't follow
-  // through with a click event. Find the row at the click position and click it.
+  // Case A: mousedown delivered but click won't follow.
   document.addEventListener("mousedown", (e) => {
+    mousedownFiredSinceBlur = true;
     if (e.button !== 0 || !windowBlurred) return;
     windowBlurred = false;
     const clickY = e.clientY;
     setTimeout(() => {
-      const rows = document.querySelectorAll(".row, .group-header");
-      let closest = null;
-      let closestDist = Infinity;
-      rows.forEach(row => {
-        const rect = row.getBoundingClientRect();
-        const rowMidY = rect.top + rect.height / 2;
-        const dist = Math.abs(clickY - rowMidY);
-        if (dist < closestDist) {
-          closestDist = dist;
-          closest = row;
-        }
-      });
-      if (closest) {
-        closest.click();
-      }
+      clickClosestRow(clickY);
     }, 50);
   }, true);
+
+  function clickClosestRow(clickY) {
+    const rows = document.querySelectorAll(".row, .group-header");
+    let closest = null;
+    let closestDist = Infinity;
+    rows.forEach(row => {
+      const rect = row.getBoundingClientRect();
+      const rowMidY = rect.top + rect.height / 2;
+      const dist = Math.abs(clickY - rowMidY);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = row;
+      }
+    });
+    if (closest) {
+      closest.click();
+    }
+  }
 }
 
 // ─── Initialization ─────────────────────────────────────────────

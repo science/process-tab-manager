@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use tauri::{AppHandle, Emitter};
 use x11rb::connection::Connection;
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 use ptm_core::bridge::{self, AtomIds, PtmEvent};
@@ -10,6 +11,54 @@ use ptm_core::state::AppState;
 use ptm_core::x11::connection::{self as x11conn, AtomCache};
 
 use crate::{build_sidebar_items, refresh_state};
+
+#[derive(Clone, serde::Serialize)]
+struct ClickEvent {
+    x: f64,
+    y: f64,
+    button: u32,
+    root_x: f64,
+    root_y: f64,
+    event_wid: u32,
+    registered_wid: u32,
+}
+
+/// Find PTM's own window ID by matching PID against _NET_CLIENT_LIST.
+/// Retries with delay since the Tauri window may not exist yet at startup.
+fn find_ptm_window(conn: &RustConnection, root: u32, atoms: &AtomCache) -> Option<u32> {
+    let own_pid = std::process::id();
+    for _ in 0..20 {
+        if let Ok(Some(wid)) = x11conn::find_window_by_pid(conn, root, atoms, own_pid) {
+            return Some(wid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    log::warn!("Could not find PTM window after retries");
+    None
+}
+
+/// Subscribe to XI2 ButtonPress events on the given window.
+/// XI2 allows multiple clients to listen simultaneously, so this doesn't
+/// conflict with GTK's own event handling.
+fn subscribe_xi2_clicks(conn: &RustConnection, wid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use x11rb::protocol::xinput::{self, ConnectionExt as _};
+
+    // Negotiate XI2 version
+    let ver = conn.xinput_xi_query_version(2, 0)?.reply()?;
+    log::info!("XI2 version {}.{}", ver.major_version, ver.minor_version);
+
+    // Build event mask: ButtonPress on all master devices
+    let event_mask = xinput::EventMask {
+        deviceid: 1, // XIAllMasterDevices
+        mask: vec![xinput::XIEventMask::BUTTON_PRESS],
+    };
+
+    // Subscribe — .check() is mandatory to catch BadAccess errors
+    conn.xinput_xi_select_events(wid, &[event_mask])?.check()?;
+
+    log::info!("Subscribed to XI2 ButtonPress on PTM window 0x{:08x}", wid);
+    Ok(())
+}
 
 /// Start the background X11 event monitor thread.
 ///
@@ -25,6 +74,16 @@ pub fn start(
     app: AppHandle,
 ) {
     std::thread::spawn(move || {
+        // Find and subscribe to XI2 click events on PTM's own window
+        let ptm_wid = find_ptm_window(&conn, root, &atoms);
+        if let Some(wid) = ptm_wid {
+            if let Err(e) = subscribe_xi2_clicks(&conn, wid) {
+                log::error!("Failed to subscribe XI2 clicks on PTM window: {}", e);
+            }
+        }
+
+        let registered_wid = ptm_wid.unwrap_or(0);
+
         // Safety timer: track last known window count
         let mut last_count = 0usize;
         let mut last_check = std::time::Instant::now();
@@ -33,6 +92,23 @@ pub fn start(
             // Use poll with timeout for safety timer behavior
             match conn.poll_for_event() {
                 Ok(Some(event)) => {
+                    // Check for XI2 ButtonPress on PTM window
+                    if let Event::XinputButtonPress(bp) = &event {
+                        let click = ClickEvent {
+                            x: (bp.event_x as f64 / 65536.0).round(),
+                            y: (bp.event_y as f64 / 65536.0).round(),
+                            button: bp.detail,
+                            root_x: (bp.root_x as f64 / 65536.0).round(),
+                            root_y: (bp.root_y as f64 / 65536.0).round(),
+                            event_wid: bp.event.into(),
+                            registered_wid,
+                        };
+                        log::debug!("XI2 ButtonPress: event=({},{}) root=({},{}) event_wid=0x{:08x} registered=0x{:08x} btn={}",
+                            click.x, click.y, click.root_x, click.root_y,
+                            click.event_wid, click.registered_wid, click.button);
+                        let _ = app.emit("x11-click", click);
+                    }
+
                     if let Some(ev) = bridge::translate_event(&event, &bridge_atoms, root) {
                         log::debug!("PtmEvent: {:?}", ev);
                         handle_event(&ev, &conn, root, &atoms, &filter, &state, &save_tx, &app);
@@ -40,6 +116,19 @@ pub fn start(
 
                     // Drain remaining queued events
                     while let Ok(Some(event)) = conn.poll_for_event() {
+                        if let Event::XinputButtonPress(bp) = &event {
+                            let click = ClickEvent {
+                                x: (bp.event_x as f64 / 65536.0).round(),
+                                y: (bp.event_y as f64 / 65536.0).round(),
+                                button: bp.detail,
+                                root_x: (bp.root_x as f64 / 65536.0).round(),
+                                root_y: (bp.root_y as f64 / 65536.0).round(),
+                                event_wid: bp.event.into(),
+                                registered_wid,
+                            };
+                            let _ = app.emit("x11-click", click);
+                        }
+
                         if let Some(ev) = bridge::translate_event(&event, &bridge_atoms, root) {
                             handle_event(&ev, &conn, root, &atoms, &filter, &state, &save_tx, &app);
                         }

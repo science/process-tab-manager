@@ -43,6 +43,28 @@ async function writeTestState() {
   invoke("write_test_state", { json: JSON.stringify(state, null, 2) });
 }
 
+// ─── XI2 click bridge ────────────────────────────────────────────
+
+window.__ptm_xi2_click = function(viewportX, viewportY, button) {
+  const el = document.elementFromPoint(viewportX, viewportY);
+  if (!el) return;
+
+  const target = el.closest(".row") || el.closest(".group-header");
+  if (!target) return;
+
+  if (button === 1) {
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true, cancelable: true,
+      clientX: viewportX, clientY: viewportY, button: 0,
+    }));
+  } else if (button === 3) {
+    target.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, cancelable: true,
+      clientX: viewportX, clientY: viewportY, button: 2,
+    }));
+  }
+};
+
 // ─── Render ─────────────────────────────────────────────────────
 
 function render() {
@@ -544,83 +566,6 @@ async function refreshSidebar() {
   }
 }
 
-// ─── Focus-click workaround ─────────────────────────────────────
-// On X11/GTK, when another window has focus and the user clicks on PTM,
-// the WM may eat the click to re-focus the window. Two cases:
-//
-// Case A: GTK delivers mousedown but not click (partial delivery).
-//   → Catch mousedown while blurred and replay as synthetic click.
-//
-// Case B: WM eats the entire click — no mousedown reaches the DOM.
-//   Only a focus event fires. This is the "inverted double-click" bug.
-//   → On focus-after-blur with no intervening mousedown, find the row
-//     under the last known pointer position and click it.
-//
-// Critical: Cases A and B must not both fire on the same click.
-// When the WM refocuses PTM AND delivers the click through, focus fires
-// first (triggering Case B), then mousedown/click follow (normal path).
-// The Case B timer must be cancelled if mousedown arrives before it fires.
-
-{
-  let windowBlurred = false;
-  let lastMouseY = 0;
-  let focusClickTimer = null;
-
-  // Track pointer position so we know where the user clicked
-  // even if the WM eats the click event entirely.
-  document.addEventListener("mousemove", (e) => {
-    lastMouseY = e.clientY;
-  }, true);
-
-  window.addEventListener("blur", () => {
-    windowBlurred = true;
-  });
-
-  window.addEventListener("focus", () => {
-    if (windowBlurred) {
-      // Schedule Case B activation. If mousedown arrives before the timer
-      // fires, we cancel it (the normal click path will handle activation).
-      windowBlurred = false;
-      const clickY = lastMouseY;
-      focusClickTimer = setTimeout(() => {
-        focusClickTimer = null;
-        clickClosestRow(clickY);
-      }, 80);
-    }
-  });
-
-  // Case A: mousedown delivered — cancel Case B timer if pending,
-  // then replay as synthetic click if we were blurred.
-  document.addEventListener("mousedown", (e) => {
-    if (focusClickTimer !== null) {
-      clearTimeout(focusClickTimer);
-      focusClickTimer = null;
-    }
-    // If mousedown arrived while blurred AND before focus handler cleared
-    // windowBlurred, we still need to handle it (Case A).
-    // But if focus already cleared windowBlurred, this is a normal click
-    // and the click event will follow naturally — no workaround needed.
-  }, true);
-
-  function clickClosestRow(clickY) {
-    const rows = document.querySelectorAll(".row, .group-header");
-    let closest = null;
-    let closestDist = Infinity;
-    rows.forEach(row => {
-      const rect = row.getBoundingClientRect();
-      const rowMidY = rect.top + rect.height / 2;
-      const dist = Math.abs(clickY - rowMidY);
-      if (dist < closestDist) {
-        closestDist = dist;
-        closest = row;
-      }
-    });
-    if (closest) {
-      closest.click();
-    }
-  }
-}
-
 // ─── Initialization ─────────────────────────────────────────────
 
 async function init() {
@@ -629,6 +574,17 @@ async function init() {
     items = event.payload;
     render();
     writeTestState();
+  });
+
+  // Listen for XI2 click events from Rust backend
+  await listen("x11-click", (event) => {
+    const { x, y, button, root_x, root_y, event_wid, registered_wid } = event.payload;
+    logEvent("x11-click", `x=${x} y=${y} root=(${root_x},${root_y}) event_wid=0x${event_wid.toString(16)} registered=0x${registered_wid.toString(16)} btn=${button}`);
+    // XI2 event_x/event_y are relative to the event window (= client window),
+    // which is already viewport-relative — no frame_top offset needed.
+    // Note: when PTM has focus, both native GTK and XI2 fire — the duplicate
+    // activate_window call is harmless (activating an active window is a no-op).
+    window.__ptm_xi2_click(x, y, button);
   });
 
   // Initial load

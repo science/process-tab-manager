@@ -46,24 +46,61 @@ async function writeTestState() {
 }
 
 // ─── XI2 click bridge ────────────────────────────────────────────
+// XI2 is the sole mouse input source for sidebar rows.
+// No native DOM mouse/pointer/click handlers on rows — the webview
+// is a pure rendering surface for mouse interactions.
 
 window.__ptm_xi2_click = function(viewportX, viewportY, button) {
   const el = document.elementFromPoint(viewportX, viewportY);
-  if (!el) return;
 
-  const target = el.closest(".row") || el.closest(".group-header");
-  if (!target) return;
+  // Dismiss context menu on any left-click outside the menu
+  if (button === 1 && contextMenu.classList.contains("visible")) {
+    if (!el || !contextMenu.contains(el)) {
+      contextMenu.classList.remove("visible");
+    }
+  }
+
+  if (!el) return;
+  if (el.closest(".rename-input")) return; // Don't interfere with rename
+
+  const row = el.closest(".row");
+  const header = el.closest(".group-header");
+  if (!row && !header) return;
 
   if (button === 1) {
-    target.dispatchEvent(new MouseEvent("click", {
-      bubbles: true, cancelable: true,
-      clientX: viewportX, clientY: viewportY, button: 0,
-    }));
+    if (row) {
+      const wid = parseInt(row.dataset.wid);
+      selectedWid = wid;
+      selectedGid = null;
+      logEvent("click", `wid=${wid}`);
+      highlightSelected();
+      writeTestState();
+      invoke("activate_window", { wid });
+    } else if (header) {
+      const gid = header.dataset.gid;
+      selectedGid = gid;
+      selectedWid = null;
+      logEvent("click-group", `gid=${gid}`);
+      invoke("toggle_group", { gid });
+      refreshSidebar();
+      writeTestState();
+    }
   } else if (button === 3) {
-    target.dispatchEvent(new MouseEvent("contextmenu", {
-      bubbles: true, cancelable: true,
-      clientX: viewportX, clientY: viewportY, button: 2,
-    }));
+    const index = parseInt((row || header).dataset.index);
+    const item = items[index];
+    if (!item) return;
+    if (row) {
+      selectedWid = item.wid;
+      selectedGid = item.gid || null;
+      logEvent("contextmenu", `wid=${item.wid}`);
+    } else {
+      selectedGid = item.gid;
+      selectedWid = null;
+      logEvent("contextmenu-group", `gid=${item.gid}`);
+    }
+    showContextMenu(viewportX, viewportY, item);
+    highlightSelected();
+    writeTestState();
   }
 };
 
@@ -127,35 +164,6 @@ function renderWindowRow(item, index, preservedRenameValue) {
     row.appendChild(title);
   }
 
-  // Click: select + activate
-  row.addEventListener("click", (e) => {
-    if (e.button !== 0) return;
-    selectedWid = item.wid;
-    selectedGid = null;
-    logEvent("click", `wid=${item.wid} isTrusted=${e.isTrusted}`);
-    highlightSelected();
-    writeTestState();
-    invoke("activate_window", { wid: item.wid });
-  });
-
-  // Right-click: context menu
-  row.addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    selectedWid = item.wid;
-    selectedGid = item.gid || null;
-    logEvent("contextmenu", `wid=${item.wid} isTrusted=${e.isTrusted}`);
-    showContextMenu(e.clientX, e.clientY, item);
-    highlightSelected();
-    writeTestState();
-  });
-
-  // Pointer-based drag initiation
-  row.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    if (dragState?.isXi2) return; // Don't overwrite XI2 drag tracking
-    dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
-  });
-
   return row;
 }
 
@@ -197,34 +205,6 @@ function renderGroupHeader(item, index, preservedRenameValue) {
   count.className = "group-count";
   count.textContent = `(${item.member_count})`;
   header.appendChild(count);
-
-  // Click: toggle collapse
-  header.addEventListener("click", (e) => {
-    selectedGid = item.gid;
-    selectedWid = null;
-    logEvent("click-group", `gid=${item.gid} isTrusted=${e.isTrusted}`);
-    invoke("toggle_group", { gid: item.gid });
-    refreshSidebar();
-    writeTestState();
-  });
-
-  // Right-click: context menu
-  header.addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    selectedGid = item.gid;
-    selectedWid = null;
-    logEvent("contextmenu-group", `gid=${item.gid} isTrusted=${e.isTrusted}`);
-    showContextMenu(e.clientX, e.clientY, item);
-    highlightSelected();
-    writeTestState();
-  });
-
-  // Pointer-based drag initiation
-  header.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    if (dragState?.isXi2) return; // Don't overwrite XI2 drag tracking
-    dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
-  });
 
   return header;
 }
@@ -365,9 +345,9 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// ─── Drag and drop (pointer events) ─────────────────────────────
+// ─── Drag and drop (XI2 only) ────────────────────────────────────
 
-let dragState = null; // { sourceIndex, startY, started, pointerId, isXi2 }
+let dragState = null; // { sourceIndex, startY, started }
 const DRAG_THRESHOLD = 5;
 
 function findDropTarget(x, y) {
@@ -433,33 +413,58 @@ async function completeDrop(x, y) {
   dragState = null;
 }
 
-sidebar.addEventListener("pointermove", (e) => {
-  if (!dragState || dragState.isXi2) return;
+// ─── XI2 handler functions ───────────────────────────────────────
+
+function handleXi2Press(x, y, button) {
+  if (button === 1) {
+    const target = document.elementFromPoint(x, y);
+    const row = target?.closest(".row, .group-header");
+    if (row) {
+      dragState = { sourceIndex: parseInt(row.dataset.index), startY: y, started: false };
+    }
+  } else if (button === 3) {
+    window.__ptm_xi2_click(x, y, button);
+  }
+}
+
+function handleXi2Move(x, y) {
+  if (!dragState) return;
   if (!dragState.started) {
-    if (Math.abs(e.clientY - dragState.startY) < DRAG_THRESHOLD) return;
+    if (Math.abs(y - dragState.startY) < DRAG_THRESHOLD) return;
     dragState.started = true;
     isDragging = true;
-    if (e.isTrusted) sidebar.setPointerCapture(dragState.pointerId);
     const rows = sidebar.querySelectorAll(".row, .group-header");
     if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.add("dragging");
-    logEvent("drag-start", `index=${dragState.sourceIndex}`);
+    logEvent("xi2-drag-start", `index=${dragState.sourceIndex}`);
   }
-  updateDragVisual(e.clientX, e.clientY);
-});
+  updateDragVisual(x, y);
+}
 
-sidebar.addEventListener("pointerup", async (e) => {
-  if (!dragState || dragState.isXi2) return;
-  if (!dragState.started) { dragState = null; return; }
-  await completeDrop(e.clientX, e.clientY);
-});
+async function handleXi2Release(x, y) {
+  if (!dragState) return;
+  if (!dragState.started) {
+    dragState = null;
+    window.__ptm_xi2_click(x, y, 1);
+    return;
+  }
+  await completeDrop(x, y);
+}
 
-sidebar.addEventListener("pointercancel", () => {
-  if (dragState?.started && !dragState.isXi2) {
+function handleXi2Cancel() {
+  if (dragState?.started) {
     clearDropHighlight();
+    const rows = sidebar.querySelectorAll(".row, .group-header");
+    if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.remove("dragging");
     isDragging = false;
   }
-  if (!dragState?.isXi2) dragState = null;
-});
+  dragState = null;
+}
+
+// Test bridges
+window.__ptm_xi2_press = handleXi2Press;
+window.__ptm_xi2_move = handleXi2Move;
+window.__ptm_xi2_release = handleXi2Release;
+window.__ptm_xi2_cancel = handleXi2Cancel;
 
 // ─── Keyboard shortcuts ─────────────────────────────────────────
 
@@ -582,50 +587,17 @@ async function init() {
   await listen("x11-click", (event) => {
     const { x, y, button, root_x, root_y, event_wid, registered_wid } = event.payload;
     logEvent("x11-click", `x=${x} y=${y} root=(${root_x},${root_y}) event_wid=0x${event_wid.toString(16)} registered=0x${registered_wid.toString(16)} btn=${button}`);
-    if (button === 1) {
-      // Don't activate on press — defer to release (x11-drag-end) so drag
-      // has a chance to start before focus is stolen. Only set XI2 dragState
-      // if native pointerdown didn't already claim it.
-      if (!dragState) {
-        const target = document.elementFromPoint(x, y);
-        const row = target?.closest(".row, .group-header");
-        if (row) {
-          dragState = { sourceIndex: parseInt(row.dataset.index), startY: y, started: false, isXi2: true };
-        }
-      }
-    } else if (button === 3) {
-      // Right-click: dispatch immediately (no drag concern)
-      window.__ptm_xi2_click(x, y, button);
-    }
+    handleXi2Press(x, y, button);
   });
 
   // Listen for XI2 drag motion events
   await listen("x11-drag-move", (event) => {
-    const { x, y } = event.payload;
-    if (!dragState) return;
-    if (!dragState.started) {
-      if (Math.abs(y - dragState.startY) < DRAG_THRESHOLD) return;
-      dragState.started = true;
-      isDragging = true;
-      const rows = sidebar.querySelectorAll(".row, .group-header");
-      if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.add("dragging");
-      logEvent("xi2-drag-start", `index=${dragState.sourceIndex}`);
-    }
-    updateDragVisual(x, y);
+    handleXi2Move(event.payload.x, event.payload.y);
   });
 
   // Listen for XI2 drag end events (ButtonRelease)
   await listen("x11-drag-end", async (event) => {
-    const { x, y } = event.payload;
-    if (!dragState) return;
-    if (!dragState.started) {
-      // No drag occurred — treat as click (activate window / toggle group)
-      const wasXi2 = dragState.isXi2;
-      dragState = null;
-      if (wasXi2) window.__ptm_xi2_click(x, y, 1);
-      return;
-    }
-    await completeDrop(x, y);
+    await handleXi2Release(event.payload.x, event.payload.y);
   });
 
   // Initial load

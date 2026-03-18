@@ -47,10 +47,12 @@ class SidebarPage {
   // ── Action methods ─────────────────────────────────────────────
 
   async clickRow(index) {
-    // Use browser.execute() to click — $$() refs go stale on sidebar re-render
+    // Route through XI2 bridge — sole mouse input path
     await browser.execute((i) => {
       const row = document.querySelectorAll(".row")[i];
-      if (row) row.click();
+      if (!row) return;
+      const rect = row.getBoundingClientRect();
+      window.__ptm_xi2_click(rect.left + rect.width / 2, rect.top + rect.height / 2, 1);
     }, index);
     await browser.pause(300);
   }
@@ -64,27 +66,21 @@ class SidebarPage {
 
   async clickGroup(index) {
     await browser.execute((i) => {
-      const group = document.querySelectorAll(".group-header")[i];
-      if (group) group.click();
+      const header = document.querySelectorAll(".group-header")[i];
+      if (!header) return;
+      const rect = header.getBoundingClientRect();
+      window.__ptm_xi2_click(rect.left + rect.width / 2, rect.top + rect.height / 2, 1);
     }, index);
     await browser.pause(300);
   }
 
   async rightClickRow(index) {
-    // WebDriver right-click may not fire contextmenu in wry/WebKitGTK,
-    // so dispatch the event programmatically
+    // Route through XI2 bridge — sole mouse input path
     await browser.execute((i) => {
       const row = document.querySelectorAll(".row")[i];
       if (!row) return;
       const rect = row.getBoundingClientRect();
-      const event = new MouseEvent("contextmenu", {
-        bubbles: true,
-        cancelable: true,
-        clientX: rect.left + rect.width / 2,
-        clientY: rect.top + rect.height / 2,
-        button: 2,
-      });
-      row.dispatchEvent(event);
+      window.__ptm_xi2_click(rect.left + rect.width / 2, rect.top + rect.height / 2, 3);
     }, index);
     await browser.pause(300);
   }

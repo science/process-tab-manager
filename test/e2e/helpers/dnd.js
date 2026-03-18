@@ -1,9 +1,9 @@
-// DnD simulation helper — dispatches synthetic PointerEvents via browser.execute()
-// These go through the REAL pointer-based drag handler in main.js.
+// DnD simulation helper — uses XI2 bridge functions (__ptm_xi2_press/move/release).
+// XI2 is the sole mouse input path; no native pointer event handlers on rows.
 
 /**
  * Simulate a drag-and-drop from one sidebar item index to another.
- * Goes through the full pointer event path (pointerdown → pointermove → pointerup).
+ * Goes through the XI2 handler path (press → move past threshold → move to target → release).
  * @param {number} fromIndex - Source item index (0-based in .row/.group-header list)
  * @param {number} toIndex - Target drop position (0-based)
  */
@@ -28,34 +28,34 @@ export async function dragAndDrop(fromIndex, toIndex) {
       targetY = lastRect.bottom + 5;
     }
 
-    // 1. pointerdown on source
-    source.dispatchEvent(new PointerEvent("pointerdown", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: startY, button: 0, pointerId: 1,
-    }));
+    // 1. Press on source
+    window.__ptm_xi2_press(startX, startY, 1);
 
-    // 2. pointermove past threshold (on sidebar to trigger the listener)
-    const sidebar = document.getElementById("sidebar");
-    const midY = startY + (targetY > startY ? 10 : -10); // past 5px threshold
-    sidebar.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: midY, button: 0, pointerId: 1,
-    }));
+    // 2. Move past threshold
+    const midY = startY + (targetY > startY ? 10 : -10);
+    window.__ptm_xi2_move(startX, midY);
 
-    // 3. pointermove to target position
-    sidebar.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: targetY, button: 0, pointerId: 1,
-    }));
-
-    // 4. pointerup at target position
-    sidebar.dispatchEvent(new PointerEvent("pointerup", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: targetY, button: 0, pointerId: 1,
-    }));
+    // 3. Move to target position
+    window.__ptm_xi2_move(startX, targetY);
   }, fromIndex, toIndex);
 
-  // Wait for the async drop handler (await invoke + await refreshSidebar)
+  // Release must be awaited (completeDrop is async)
+  await browser.execute(async (from, to) => {
+    const rows = document.querySelectorAll(".row, .group-header");
+    let targetY;
+    if (to < rows.length) {
+      const rect = rows[to].getBoundingClientRect();
+      targetY = rect.top + rect.height / 2;
+    } else {
+      const lastRect = rows[rows.length - 1].getBoundingClientRect();
+      targetY = lastRect.bottom + 5;
+    }
+    const source = rows[from];
+    const startX = source ? source.getBoundingClientRect().left + source.getBoundingClientRect().width / 2 : 100;
+    await window.__ptm_xi2_release(startX, targetY);
+  }, fromIndex, toIndex);
+
+  // Wait for the async drop handler (invoke + refreshSidebar)
   await browser.pause(1500);
 }
 
@@ -83,7 +83,7 @@ export async function getDropHighlight() {
 }
 
 /**
- * Simulate pointerdown + pointermove (without pointerup) to verify visual highlights.
+ * Simulate press + move (without release) to verify visual highlights.
  * @param {number} fromIndex - Source item index
  * @param {number} overIndex - Item index to hover over
  */
@@ -102,36 +102,23 @@ export async function dragOver(fromIndex, overIndex) {
     const targetRect = target.getBoundingClientRect();
     const targetY = targetRect.top + targetRect.height / 2;
 
-    // 1. pointerdown
-    source.dispatchEvent(new PointerEvent("pointerdown", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: startY, button: 0, pointerId: 1,
-    }));
+    // 1. Press
+    window.__ptm_xi2_press(startX, startY, 1);
 
-    // 2. pointermove past threshold
-    const sidebar = document.getElementById("sidebar");
+    // 2. Move past threshold
     const midY = startY + (targetY > startY ? 10 : -10);
-    sidebar.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: midY, button: 0, pointerId: 1,
-    }));
+    window.__ptm_xi2_move(startX, midY);
 
-    // 3. pointermove to target
-    sidebar.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true, cancelable: true,
-      clientX: startX, clientY: targetY, button: 0, pointerId: 1,
-    }));
+    // 3. Move to target
+    window.__ptm_xi2_move(startX, targetY);
   }, fromIndex, overIndex);
 }
 
 /**
- * Cancel an in-progress drag by dispatching pointercancel.
+ * Cancel an in-progress drag.
  */
 export async function cancelDrag() {
   await browser.execute(() => {
-    const sidebar = document.getElementById("sidebar");
-    sidebar.dispatchEvent(new PointerEvent("pointercancel", {
-      bubbles: true, cancelable: true, pointerId: 1,
-    }));
+    window.__ptm_xi2_cancel();
   });
 }

@@ -72,11 +72,11 @@ body {
     opacity: 0.4;
 }
 
-/* DnD drop indicator */
-.drop-indicator {
-    height: 2px;
-    background: #0a84ff;
-    pointer-events: none;
+/* DnD drop highlight — whole-row highlight */
+.row.drop-target, .group-header.drop-target {
+    background-color: rgba(10, 132, 255, 0.25);
+    outline: 2px solid #0a84ff;
+    outline-offset: -2px;
 }
 
 /* ─── Icons ────────────────────────────────────────────────────── */

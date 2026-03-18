@@ -9,6 +9,8 @@ let items = [];
 let selectedWid = null;
 let selectedGid = null;
 let renameTarget = null; // { type: "window", wid } or { type: "group", gid }
+let isDragging = false;
+let pendingItems = null;
 
 // ─── Tauri IPC ──────────────────────────────────────────────────
 
@@ -88,8 +90,6 @@ function renderWindowRow(item, index, preservedRenameValue) {
   row.className = "row";
   row.dataset.wid = item.wid;
   row.dataset.index = index;
-  row.draggable = true;
-
   if (item.is_active) row.classList.add("active");
   if (item.is_minimized) row.classList.add("minimized");
   if (item.is_urgent) row.classList.add("urgent");
@@ -129,6 +129,7 @@ function renderWindowRow(item, index, preservedRenameValue) {
 
   // Click: select + activate
   row.addEventListener("click", (e) => {
+    if (suppressNextClick) { suppressNextClick = false; return; }
     if (e.button !== 0) return;
     selectedWid = item.wid;
     selectedGid = null;
@@ -149,17 +150,10 @@ function renderWindowRow(item, index, preservedRenameValue) {
     writeTestState();
   });
 
-  // DnD
-  row.addEventListener("dragstart", (e) => {
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", JSON.stringify({ type: "window", wid: item.wid, index }));
-    row.classList.add("dragging");
-    logEvent("dragstart", `wid=${item.wid}`);
-  });
-
-  row.addEventListener("dragend", () => {
-    row.classList.remove("dragging");
-    logEvent("dragend", `wid=${item.wid}`);
+  // Pointer-based drag initiation
+  row.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
   });
 
   return row;
@@ -170,7 +164,6 @@ function renderGroupHeader(item, index, preservedRenameValue) {
   header.className = "group-header";
   header.dataset.gid = item.gid;
   header.dataset.index = index;
-  header.draggable = true;
 
   if (item.gid === selectedGid) header.classList.add("selected");
 
@@ -207,6 +200,7 @@ function renderGroupHeader(item, index, preservedRenameValue) {
 
   // Click: toggle collapse
   header.addEventListener("click", (e) => {
+    if (suppressNextClick) { suppressNextClick = false; return; }
     selectedGid = item.gid;
     selectedWid = null;
     logEvent("click-group", `gid=${item.gid} isTrusted=${e.isTrusted}`);
@@ -226,17 +220,10 @@ function renderGroupHeader(item, index, preservedRenameValue) {
     writeTestState();
   });
 
-  // DnD
-  header.addEventListener("dragstart", (e) => {
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", JSON.stringify({ type: "group", gid: item.gid, index }));
-    header.classList.add("dragging");
-    logEvent("dragstart-group", `gid=${item.gid}`);
-  });
-
-  header.addEventListener("dragend", () => {
-    header.classList.remove("dragging");
-    logEvent("dragend-group", `gid=${item.gid}`);
+  // Pointer-based drag initiation
+  header.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
   });
 
   return header;
@@ -378,89 +365,97 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// ─── Drag and drop ──────────────────────────────────────────────
+// ─── Drag and drop (pointer events) ─────────────────────────────
 
-let dropIndicator = null;
+let dragState = null; // { sourceIndex, startY, started, pointerId, isXi2 }
+const DRAG_THRESHOLD = 5;
+let suppressNextClick = false;
 
-function getDropTargetIndex(clientY) {
+function findDropTarget(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const row = el?.closest(".row, .group-header");
+  if (row) return row;
+  // If pointer is below all rows, target the last row
   const rows = sidebar.querySelectorAll(".row, .group-header");
-  for (let i = 0; i < rows.length; i++) {
-    const rect = rows[i].getBoundingClientRect();
-    const midpoint = rect.top + rect.height / 2;
-    if (clientY < midpoint) return i;
+  if (rows.length > 0) {
+    const lastRow = rows[rows.length - 1];
+    const lastRect = lastRow.getBoundingClientRect();
+    if (y > lastRect.bottom) return lastRow;
   }
-  return rows.length;
+  return null;
 }
 
-function showDropIndicator(index) {
-  removeDropIndicator();
-  dropIndicator = document.createElement("div");
-  dropIndicator.className = "drop-indicator";
-  const rows = sidebar.querySelectorAll(".row, .group-header");
-  if (index < rows.length) {
-    sidebar.insertBefore(dropIndicator, rows[index]);
-  } else {
-    sidebar.appendChild(dropIndicator);
+function clearDropHighlight() {
+  sidebar.querySelectorAll(".drop-target").forEach(el =>
+    el.classList.remove("drop-target"));
+}
+
+function updateDragVisual(x, y) {
+  if (!dragState?.started) return;
+  clearDropHighlight();
+  const row = findDropTarget(x, y);
+  if (row) {
+    const idx = parseInt(row.dataset.index);
+    if (idx !== dragState.sourceIndex) row.classList.add("drop-target");
   }
 }
 
-function removeDropIndicator() {
-  if (dropIndicator && dropIndicator.parentNode) {
-    dropIndicator.parentNode.removeChild(dropIndicator);
-  }
-  dropIndicator = null;
-}
+async function completeDrop(x, y) {
+  clearDropHighlight();
+  // Remove .dragging from source
+  const allRows = sidebar.querySelectorAll(".row, .group-header");
+  const srcRow = allRows[dragState.sourceIndex];
+  if (srcRow) srcRow.classList.remove("dragging");
 
-sidebar.addEventListener("dragover", (e) => {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-  const targetIndex = getDropTargetIndex(e.clientY);
-  showDropIndicator(targetIndex);
-});
-
-sidebar.addEventListener("dragleave", (e) => {
-  // Only remove if leaving the sidebar entirely
-  if (!sidebar.contains(e.relatedTarget)) {
-    removeDropIndicator();
-  }
-});
-
-sidebar.addEventListener("drop", (e) => {
-  e.preventDefault();
-  removeDropIndicator();
-
-  let source;
-  try {
-    source = JSON.parse(e.dataTransfer.getData("text/plain"));
-  } catch { return; }
-
-  const targetIndex = getDropTargetIndex(e.clientY);
-
-  // Check if dropping onto a group header
-  const rows = sidebar.querySelectorAll(".row, .group-header");
-  let targetItem = null;
-  if (targetIndex < rows.length) {
-    const targetRow = rows[targetIndex];
-    if (targetRow.classList.contains("group-header") && targetRow.dataset.gid) {
-      targetItem = items[parseInt(targetRow.dataset.index)];
+  const row = findDropTarget(x, y);
+  if (row) {
+    const targetIndex = parseInt(row.dataset.index);
+    if (targetIndex !== dragState.sourceIndex) {
+      // Group header drop: add to group
+      if (row.classList.contains("group-header") && row.dataset.gid
+          && srcRow?.classList.contains("row") && srcRow.dataset.wid) {
+        await invoke("add_to_group", {
+          wid: parseInt(srcRow.dataset.wid), gid: row.dataset.gid });
+        logEvent("add-to-group", `wid=${srcRow.dataset.wid} gid=${row.dataset.gid}`);
+      } else {
+        await invoke("reorder", { from: dragState.sourceIndex, to: targetIndex });
+        logEvent("reorder", `from=${dragState.sourceIndex} to=${targetIndex}`);
+      }
+      pendingItems = null;
+      await refreshSidebar();
     }
   }
+  isDragging = false;
+  dragState = null;
+  suppressNextClick = true;
+}
 
-  logEvent("drop", `source=${JSON.stringify(source)} targetIndex=${targetIndex}`);
-
-  if (source.type === "window" && targetItem && targetItem.kind === "GroupHeader") {
-    invoke("add_to_group", { wid: source.wid, gid: targetItem.gid });
-    logEvent("add-to-group", `wid=${source.wid} gid=${targetItem.gid}`);
-  } else {
-    invoke("reorder", { from: source.index, to: targetIndex });
-    logEvent("reorder", `from=${source.index} to=${targetIndex}`);
+sidebar.addEventListener("pointermove", (e) => {
+  if (!dragState || dragState.isXi2) return;
+  if (!dragState.started) {
+    if (Math.abs(e.clientY - dragState.startY) < DRAG_THRESHOLD) return;
+    dragState.started = true;
+    isDragging = true;
+    if (e.isTrusted) sidebar.setPointerCapture(dragState.pointerId);
+    const rows = sidebar.querySelectorAll(".row, .group-header");
+    if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.add("dragging");
+    logEvent("drag-start", `index=${dragState.sourceIndex}`);
   }
-
-  refreshSidebar();
+  updateDragVisual(e.clientX, e.clientY);
 });
 
-document.addEventListener("dragend", () => {
-  removeDropIndicator();
+sidebar.addEventListener("pointerup", async (e) => {
+  if (!dragState || dragState.isXi2) return;
+  if (!dragState.started) { dragState = null; return; }
+  await completeDrop(e.clientX, e.clientY);
+});
+
+sidebar.addEventListener("pointercancel", () => {
+  if (dragState?.started && !dragState.isXi2) {
+    clearDropHighlight();
+    isDragging = false;
+  }
+  if (!dragState?.isXi2) dragState = null;
 });
 
 // ─── Keyboard shortcuts ─────────────────────────────────────────
@@ -571,6 +566,10 @@ async function refreshSidebar() {
 async function init() {
   // Listen for backend updates (X11 window changes) — must await to ensure registration
   await listen("sidebar-update", (event) => {
+    if (isDragging) {
+      pendingItems = event.payload;
+      return;
+    }
     items = event.payload;
     render();
     writeTestState();
@@ -580,11 +579,41 @@ async function init() {
   await listen("x11-click", (event) => {
     const { x, y, button, root_x, root_y, event_wid, registered_wid } = event.payload;
     logEvent("x11-click", `x=${x} y=${y} root=(${root_x},${root_y}) event_wid=0x${event_wid.toString(16)} registered=0x${registered_wid.toString(16)} btn=${button}`);
+    // Start XI2 drag tracking on left-button press
+    if (button === 1) {
+      const target = document.elementFromPoint(x, y);
+      const row = target?.closest(".row, .group-header");
+      if (row) {
+        dragState = { sourceIndex: parseInt(row.dataset.index), startY: y, started: false, isXi2: true };
+      }
+    }
     // XI2 event_x/event_y are relative to the event window (= client window),
     // which is already viewport-relative — no frame_top offset needed.
     // Note: when PTM has focus, both native GTK and XI2 fire — the duplicate
     // activate_window call is harmless (activating an active window is a no-op).
     window.__ptm_xi2_click(x, y, button);
+  });
+
+  // Listen for XI2 drag motion events
+  await listen("x11-drag-move", (event) => {
+    const { x, y } = event.payload;
+    if (!dragState) return;
+    if (!dragState.started) {
+      if (Math.abs(y - dragState.startY) < DRAG_THRESHOLD) return;
+      dragState.started = true;
+      isDragging = true;
+      const rows = sidebar.querySelectorAll(".row, .group-header");
+      if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.add("dragging");
+      logEvent("xi2-drag-start", `index=${dragState.sourceIndex}`);
+    }
+    updateDragVisual(x, y);
+  });
+
+  // Listen for XI2 drag end events
+  await listen("x11-drag-end", async (event) => {
+    const { x, y } = event.payload;
+    if (!dragState || !dragState.started) { dragState = null; return; }
+    await completeDrop(x, y);
   });
 
   // Initial load

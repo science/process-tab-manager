@@ -46,9 +46,13 @@ async function writeTestState() {
 }
 
 // ─── XI2 click bridge ────────────────────────────────────────────
-// XI2 is the sole mouse input source for sidebar rows.
-// No native DOM mouse/pointer/click handlers on rows — the webview
-// is a pure rendering surface for mouse interactions.
+// XI2 is the primary mouse input source for sidebar rows.
+// Native click/pointermove/pointerup on sidebar serve as fallbacks
+// for when WebKitGTK grabs the pointer (PTM focused) and XI2
+// ButtonRelease/Motion events don't arrive.
+
+let lastClickAction = 0; // Dedup timestamp: prevents double-fire from XI2 + native
+let recentDragEnd = 0;   // Prevents click-after-drag from native click event
 
 window.__ptm_xi2_click = function(viewportX, viewportY, button) {
   const el = document.elementFromPoint(viewportX, viewportY);
@@ -68,6 +72,12 @@ window.__ptm_xi2_click = function(viewportX, viewportY, button) {
   if (!row && !header) return;
 
   if (button === 1) {
+    // Deduplicate: XI2 release and native click can both call this
+    const now = Date.now();
+    if (now - recentDragEnd < 300) return; // Skip click right after drag
+    if (now - lastClickAction < 300) return; // Skip duplicate click
+    lastClickAction = now;
+
     if (row) {
       const wid = parseInt(row.dataset.wid);
       selectedWid = wid;
@@ -345,7 +355,22 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// ─── Drag and drop (XI2 only) ────────────────────────────────────
+// Suppress native browser context menu (XI2 handles right-click)
+document.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+});
+
+// Native click fallback — handles clicks when PTM has focus and
+// XI2 ButtonRelease doesn't arrive (WebKitGTK grabs the pointer).
+// Dedup in __ptm_xi2_click prevents double-fire when XI2 also works.
+sidebar.addEventListener("click", (e) => {
+  const row = e.target.closest(".row");
+  const header = e.target.closest(".group-header");
+  if (!row && !header) return;
+  window.__ptm_xi2_click(e.clientX, e.clientY, 1);
+});
+
+// ─── Drag and drop (XI2 primary, native fallback) ────────────────
 
 let dragState = null; // { sourceIndex, startY, started }
 const DRAG_THRESHOLD = 5;
@@ -411,6 +436,7 @@ async function completeDrop(x, y) {
   }
   isDragging = false;
   dragState = null;
+  recentDragEnd = Date.now();
 }
 
 // ─── XI2 handler functions ───────────────────────────────────────
@@ -465,6 +491,32 @@ window.__ptm_xi2_press = handleXi2Press;
 window.__ptm_xi2_move = handleXi2Move;
 window.__ptm_xi2_release = handleXi2Release;
 window.__ptm_xi2_cancel = handleXi2Cancel;
+
+// Native pointer event fallbacks for drag — handles the case where
+// WebKitGTK grabs the pointer and XI2 Motion/ButtonRelease don't arrive.
+// XI2 press already set dragState; these track motion and completion.
+sidebar.addEventListener("pointermove", (e) => {
+  if (!dragState) return;
+  if (!dragState.started) {
+    if (Math.abs(e.clientY - dragState.startY) < DRAG_THRESHOLD) return;
+    dragState.started = true;
+    isDragging = true;
+    const rows = sidebar.querySelectorAll(".row, .group-header");
+    if (rows[dragState.sourceIndex]) rows[dragState.sourceIndex].classList.add("dragging");
+    logEvent("drag-start", `index=${dragState.sourceIndex}`);
+  }
+  updateDragVisual(e.clientX, e.clientY);
+});
+
+sidebar.addEventListener("pointerup", async (e) => {
+  if (!dragState) return;
+  if (!dragState.started) { dragState = null; return; }
+  await completeDrop(e.clientX, e.clientY);
+});
+
+sidebar.addEventListener("pointercancel", () => {
+  handleXi2Cancel();
+});
 
 // ─── Keyboard shortcuts ─────────────────────────────────────────
 

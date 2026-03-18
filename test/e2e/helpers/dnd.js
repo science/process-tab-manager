@@ -60,12 +60,14 @@ export async function dragAndDrop(fromIndex, toIndex) {
 }
 
 /**
- * Check if any row currently has a drop highlight class.
- * Returns { element: "row"|"group-header", index } or null.
+ * Check if any row currently has a drop indicator line.
+ * Returns { element: "row"|"group-header", position: "before"|"after", index } or null.
  */
 export async function getDropHighlight() {
   return browser.execute(() => {
-    const el = document.querySelector(".drop-target");
+    const before = document.querySelector(".drop-before");
+    const after = document.querySelector(".drop-after");
+    const el = before || after;
     if (!el) return null;
     const rows = document.querySelectorAll(".row, .group-header");
     let index = -1;
@@ -74,6 +76,7 @@ export async function getDropHighlight() {
     }
     return {
       element: el.classList.contains("group-header") ? "group-header" : "row",
+      position: before ? "before" : "after",
       index,
     };
   });

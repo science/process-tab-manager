@@ -129,7 +129,6 @@ function renderWindowRow(item, index, preservedRenameValue) {
 
   // Click: select + activate
   row.addEventListener("click", (e) => {
-    if (suppressNextClick) { suppressNextClick = false; return; }
     if (e.button !== 0) return;
     selectedWid = item.wid;
     selectedGid = null;
@@ -153,6 +152,7 @@ function renderWindowRow(item, index, preservedRenameValue) {
   // Pointer-based drag initiation
   row.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
+    if (dragState?.isXi2) return; // Don't overwrite XI2 drag tracking
     dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
   });
 
@@ -200,7 +200,6 @@ function renderGroupHeader(item, index, preservedRenameValue) {
 
   // Click: toggle collapse
   header.addEventListener("click", (e) => {
-    if (suppressNextClick) { suppressNextClick = false; return; }
     selectedGid = item.gid;
     selectedWid = null;
     logEvent("click-group", `gid=${item.gid} isTrusted=${e.isTrusted}`);
@@ -223,6 +222,7 @@ function renderGroupHeader(item, index, preservedRenameValue) {
   // Pointer-based drag initiation
   header.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
+    if (dragState?.isXi2) return; // Don't overwrite XI2 drag tracking
     dragState = { sourceIndex: index, startY: e.clientY, started: false, pointerId: e.pointerId };
   });
 
@@ -369,7 +369,6 @@ document.addEventListener("click", (e) => {
 
 let dragState = null; // { sourceIndex, startY, started, pointerId, isXi2 }
 const DRAG_THRESHOLD = 5;
-let suppressNextClick = false;
 
 function findDropTarget(x, y) {
   const el = document.elementFromPoint(x, y);
@@ -386,8 +385,8 @@ function findDropTarget(x, y) {
 }
 
 function clearDropHighlight() {
-  sidebar.querySelectorAll(".drop-target").forEach(el =>
-    el.classList.remove("drop-target"));
+  sidebar.querySelectorAll(".drop-before, .drop-after").forEach(el =>
+    el.classList.remove("drop-before", "drop-after"));
 }
 
 function updateDragVisual(x, y) {
@@ -396,7 +395,12 @@ function updateDragVisual(x, y) {
   const row = findDropTarget(x, y);
   if (row) {
     const idx = parseInt(row.dataset.index);
-    if (idx !== dragState.sourceIndex) row.classList.add("drop-target");
+    if (idx !== dragState.sourceIndex) {
+      // Show insertion line based on pointer position relative to row midpoint
+      const rect = row.getBoundingClientRect();
+      const inTopHalf = y < rect.top + rect.height / 2;
+      row.classList.add(inTopHalf ? "drop-before" : "drop-after");
+    }
   }
 }
 
@@ -427,7 +431,6 @@ async function completeDrop(x, y) {
   }
   isDragging = false;
   dragState = null;
-  suppressNextClick = true;
 }
 
 sidebar.addEventListener("pointermove", (e) => {

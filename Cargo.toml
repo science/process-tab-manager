@@ -1,4 +1,3 @@
 [workspace]
 members = ["ptm-core", "src-tauri"]
-exclude = ["spike/click-intercept"]
 resolver = "2"

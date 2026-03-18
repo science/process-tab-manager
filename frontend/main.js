@@ -579,19 +579,21 @@ async function init() {
   await listen("x11-click", (event) => {
     const { x, y, button, root_x, root_y, event_wid, registered_wid } = event.payload;
     logEvent("x11-click", `x=${x} y=${y} root=(${root_x},${root_y}) event_wid=0x${event_wid.toString(16)} registered=0x${registered_wid.toString(16)} btn=${button}`);
-    // Start XI2 drag tracking on left-button press
     if (button === 1) {
-      const target = document.elementFromPoint(x, y);
-      const row = target?.closest(".row, .group-header");
-      if (row) {
-        dragState = { sourceIndex: parseInt(row.dataset.index), startY: y, started: false, isXi2: true };
+      // Don't activate on press — defer to release (x11-drag-end) so drag
+      // has a chance to start before focus is stolen. Only set XI2 dragState
+      // if native pointerdown didn't already claim it.
+      if (!dragState) {
+        const target = document.elementFromPoint(x, y);
+        const row = target?.closest(".row, .group-header");
+        if (row) {
+          dragState = { sourceIndex: parseInt(row.dataset.index), startY: y, started: false, isXi2: true };
+        }
       }
+    } else if (button === 3) {
+      // Right-click: dispatch immediately (no drag concern)
+      window.__ptm_xi2_click(x, y, button);
     }
-    // XI2 event_x/event_y are relative to the event window (= client window),
-    // which is already viewport-relative — no frame_top offset needed.
-    // Note: when PTM has focus, both native GTK and XI2 fire — the duplicate
-    // activate_window call is harmless (activating an active window is a no-op).
-    window.__ptm_xi2_click(x, y, button);
   });
 
   // Listen for XI2 drag motion events
@@ -609,10 +611,17 @@ async function init() {
     updateDragVisual(x, y);
   });
 
-  // Listen for XI2 drag end events
+  // Listen for XI2 drag end events (ButtonRelease)
   await listen("x11-drag-end", async (event) => {
     const { x, y } = event.payload;
-    if (!dragState || !dragState.started) { dragState = null; return; }
+    if (!dragState) return;
+    if (!dragState.started) {
+      // No drag occurred — treat as click (activate window / toggle group)
+      const wasXi2 = dragState.isXi2;
+      dragState = null;
+      if (wasXi2) window.__ptm_xi2_click(x, y, 1);
+      return;
+    }
     await completeDrop(x, y);
   });
 

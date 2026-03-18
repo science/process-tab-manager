@@ -1,10 +1,9 @@
 use anyhow::Result;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt as _, EventMask, PropMode,
+    ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt as _, EventMask,
 };
-use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 use super::connection::AtomCache;
@@ -66,33 +65,6 @@ pub fn close_window(conn: &RustConnection, root: u32, wid: u32, atoms: &AtomCach
         root,
         EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
         event,
-    )?;
-    conn.flush()?;
-    Ok(())
-}
-
-/// Set _NET_WM_WINDOW_TYPE to UTILITY so the WM doesn't auto-focus on click.
-pub fn set_window_type_utility(conn: &RustConnection, wid: u32, atoms: &AtomCache) -> Result<()> {
-    conn.change_property32(
-        PropMode::REPLACE,
-        wid,
-        atoms.net_wm_window_type,
-        AtomEnum::ATOM,
-        &[atoms.net_wm_window_type_utility],
-    )?;
-    conn.flush()?;
-    Ok(())
-}
-
-/// Set _NET_WM_WINDOW_TYPE to DOCK so the WM treats this as a panel/sidebar.
-/// Dock windows don't eat focus clicks and stay visible across desktops.
-pub fn set_window_type_dock(conn: &RustConnection, wid: u32, atoms: &AtomCache) -> Result<()> {
-    conn.change_property32(
-        PropMode::REPLACE,
-        wid,
-        atoms.net_wm_window_type,
-        AtomEnum::ATOM,
-        &[atoms.net_wm_window_type_dock],
     )?;
     conn.flush()?;
     Ok(())

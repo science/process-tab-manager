@@ -18,9 +18,10 @@ describe("Window List", () => {
     expect(count).toBeGreaterThanOrEqual(3);
   });
 
-  // PTM_NO_DOCK=1 in E2E mode means PTM is a normal window and appears in its
-  // own list. In production (DOCK type), it's excluded from _NET_CLIENT_LIST.
-  it.skip("should not list PTM itself (requires DOCK type)", async () => {
+  // PTM self-filters by PID (lib.rs filters out its own windows from the list).
+  // This test is skipped because PTM's webview window still appears briefly
+  // before the first filter pass completes.
+  it.skip("should not list PTM itself", async () => {
     await sidebar.waitForRows(1);
     const titles = await sidebar.getRowTitles();
     const hasPtm = titles.some(t => t.includes("process-tab-manager") || t.includes("Process Tab Manager"));

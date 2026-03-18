@@ -1,4 +1,5 @@
 import sidebar from "../pageobjects/sidebar.page.js";
+import { xi2ClickRow } from "../helpers/xi2.js";
 import { openXterms, closeAllXterms } from "../helpers/xterm.js";
 import { readTestState } from "../helpers/state.js";
 
@@ -13,7 +14,7 @@ describe("Focus Click", () => {
     closeAllXterms();
   });
 
-  it("should activate different window on WebDriver row click", async () => {
+  it("should activate different window on XI2 click", async () => {
     const xtermRows = await browser.execute(() => {
       const rows = document.querySelectorAll(".row");
       const results = [];
@@ -28,7 +29,7 @@ describe("Focus Click", () => {
     expect(xtermRows.length).toBeGreaterThanOrEqual(2);
 
     // Click first xterm
-    await sidebar.clickRow(xtermRows[0].index);
+    await xi2ClickRow(xtermRows[0].index);
     await browser.pause(500);
     const state1 = readTestState();
 
@@ -48,7 +49,7 @@ describe("Focus Click", () => {
     expect(otherXterm).toBeDefined();
 
     // Click second xterm
-    await sidebar.clickRow(otherXterm.index);
+    await xi2ClickRow(otherXterm.index);
     await browser.pause(500);
     const state2 = readTestState();
 
@@ -56,7 +57,7 @@ describe("Focus Click", () => {
     expect(state1.selectedWid).not.toBe(state2.selectedWid);
   });
 
-  it("should mark activated window as active in DOM", async () => {
+  it("should mark activated window as active in DOM via XI2 click", async () => {
     const xtermRows = await browser.execute(() => {
       const rows = document.querySelectorAll(".row");
       const results = [];
@@ -69,7 +70,7 @@ describe("Focus Click", () => {
       return results;
     });
 
-    await sidebar.clickRow(xtermRows[0].index);
+    await xi2ClickRow(xtermRows[0].index);
     await browser.pause(500);
 
     // The clicked row should be selected

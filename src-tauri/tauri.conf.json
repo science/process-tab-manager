@@ -21,10 +21,11 @@
         "height": 600,
         "x": 50,
         "y": 50,
-        "alwaysOnTop": true,
+        "alwaysOnTop": false,
         "decorations": true,
         "resizable": true,
-        "transparent": false
+        "transparent": false,
+        "focusable": true
       }
     ]
   }

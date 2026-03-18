@@ -70,7 +70,7 @@ pkill -f 'release/process-tab-manager' 2>/dev/null || true
 pkill xterm 2>/dev/null || true
 sleep 0.5
 
-DISPLAY=:0 RUST_LOG=info PTM_NO_DOCK=1 nohup "$BINARY" > /tmp/ptm.log 2>&1 &
+DISPLAY=:0 RUST_LOG=info nohup "$BINARY" > /tmp/ptm.log 2>&1 &
 sleep 2
 
 if pgrep -f 'release/process-tab-manager' >/dev/null 2>&1; then

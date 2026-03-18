@@ -1,4 +1,5 @@
 import sidebar from "../pageobjects/sidebar.page.js";
+import { xi2ClickRow } from "../helpers/xi2.js";
 import { openXterms, closeAllXterms } from "../helpers/xterm.js";
 import { hasEvent, waitForEvent, clearEvents } from "../helpers/events.js";
 
@@ -13,8 +14,8 @@ describe("Selection & Navigation", () => {
     closeAllXterms();
   });
 
-  it("should select row on click", async () => {
-    await sidebar.clickRow(0);
+  it("should select row on XI2 click", async () => {
+    await xi2ClickRow(0);
     const selected = await sidebar.getSelectedRow();
     expect(selected).not.toBeNull();
 

@@ -579,27 +579,6 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
-            // Set window type to DOCK so clicks pass through without focus-stealing.
-            // Dock windows don't eat the first click and stay visible across desktops.
-            // NOTE: Rapid create/destroy of DOCK windows triggers a Muffin bug that
-            // corrupts _NET_CLIENT_LIST. Skip during E2E tests (PTM_NO_DOCK=1).
-            if std::env::var("PTM_NO_DOCK").is_err() {
-                let conn2 = Arc::clone(&conn);
-                let atoms2 = Arc::clone(&atoms);
-                let root2 = root;
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    if let Some(ptm_wid) = find_ptm_wid(&conn2, root2, &atoms2) {
-                        log::info!("Setting PTM window 0x{:08x} to DOCK type", ptm_wid);
-                        let _ = actions::set_window_type_dock(&conn2, ptm_wid, &atoms2);
-                    } else {
-                        log::warn!("Could not find PTM window to set DOCK type");
-                    }
-                });
-            } else {
-                log::info!("PTM_NO_DOCK set, skipping DOCK window type");
-            }
-
             // Start X11 monitor thread
             x11_monitor::start(
                 Arc::clone(&conn),

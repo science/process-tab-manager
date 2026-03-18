@@ -76,14 +76,12 @@ export const config = {
   },
 
   onPrepare: function () {
-    // PTM_NO_DOCK prevents setting DOCK window type, which triggers a Muffin bug
-    // when rapidly creating/destroying windows (as E2E tests do).
     tauriDriver = spawn(
       path.join(process.env.HOME, ".cargo/bin/tauri-driver"),
       [],
       {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, DISPLAY: ":0", PTM_NO_DOCK: "1" },
+        env: { ...process.env, DISPLAY: ":0" },
       }
     );
 

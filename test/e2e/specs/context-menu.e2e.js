@@ -1,5 +1,6 @@
 import sidebar from "../pageobjects/sidebar.page.js";
 import contextMenu from "../pageobjects/context-menu.page.js";
+import { xi2RightClickRow } from "../helpers/xi2.js";
 import { openXterms, closeAllXterms } from "../helpers/xterm.js";
 import { waitForEvent } from "../helpers/events.js";
 
@@ -14,8 +15,8 @@ describe("Context Menu", () => {
     closeAllXterms();
   });
 
-  it("should show context menu on right-click", async () => {
-    await sidebar.rightClickRow(0);
+  it("should show context menu on XI2 right-click", async () => {
+    await xi2RightClickRow(0);
     await contextMenu.waitForVisible();
 
     const items = await contextMenu.getItems();

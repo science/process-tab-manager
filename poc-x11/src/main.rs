@@ -1,5 +1,4 @@
-use std::collections::{HashSet, VecDeque};
-use std::time::SystemTime;
+use std::collections::HashSet;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
@@ -9,35 +8,34 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 // Layout constants
 const WIN_W: u16 = 250;
 const WIN_H: u16 = 600;
-const ITEM_X: i16 = 10;
-const ITEM_W: u16 = 230;
-const ITEM_H: u16 = 30;
-const ITEM_SPACING: i16 = 4;
-const ITEM_Y_START: i16 = 10;
-const SEPARATOR_Y_OFFSET: i16 = 10;
-const LOG_LINE_H: i16 = 16;
+const ITEM_X: i16 = 8;
+const ITEM_W: u16 = 234;
+const ITEM_H: u16 = 28;
+const ITEM_SPACING: i16 = 2;
+const ITEM_Y_START: i16 = 8;
 const DRAG_THRESHOLD: i16 = 5;
-const MAX_LOG: usize = 100;
 const GROUP_INDENT: i16 = 16;
-const MENU_ITEM_H: u16 = 22;
+const MENU_ITEM_H: u16 = 24;
 const MENU_PADDING: i16 = 4;
 const MENU_MIN_W: u16 = 180;
+const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 
-// Colors (RGB)
-const BG_COLOR: u32 = 0x1c1b22;
-const SEPARATOR_COLOR: u32 = 0x444444;
-const TEXT_COLOR: u32 = 0xd4d4d4;
-const LOG_TEXT_COLOR: u32 = 0x999999;
-const INDICATOR_COLOR: u32 = 0xffffff;
-const GHOST_COLOR: u32 = 0x666666;
-const ITEM_COLOR: u32 = 0x2d2d3d;
-const ITEM_ACTIVE_COLOR: u32 = 0x3d3d5c;
-const MENU_BG_COLOR: u32 = 0x2d2d3d;
-const MENU_BORDER_COLOR: u32 = 0x555555;
-const MENU_HOVER_COLOR: u32 = 0x3d3d5c;
-const GROUP_HEADER_COLOR: u32 = 0x252535;
+// Colors — OneDark-inspired palette
+const BG_COLOR: u32 = 0x282c34;
+const TEXT_COLOR: u32 = 0xabb2bf;
+const TEXT_DIM_COLOR: u32 = 0x5c6370;
+const INDICATOR_COLOR: u32 = 0x61afef;
+const GHOST_COLOR: u32 = 0x3e4451;
+const ITEM_COLOR: u32 = 0x2c313a;
+const ITEM_HOVER_COLOR: u32 = 0x333842;
+const ITEM_ACTIVE_COLOR: u32 = 0x2d3340;
+const ACTIVE_STRIPE_COLOR: u32 = 0x61afef;
+const MENU_BG_COLOR: u32 = 0x21252b;
+const MENU_BORDER_COLOR: u32 = 0x3e4451;
+const MENU_HOVER_COLOR: u32 = 0x2c313a;
+const GROUP_HEADER_COLOR: u32 = 0x21252b;
 
-// Cycle of accent colors for left-edge stripe
+// Accent colors for left-edge stripe (OneDark)
 const ACCENT_COLORS: &[u32] = &[0xe06c75, 0x98c379, 0x61afef, 0xc678dd, 0xe5c07b, 0x56b6c2];
 const GROUP_COLORS: &[u32] = &[0x61afef, 0xe06c75, 0x98c379, 0xc678dd, 0xe5c07b, 0x56b6c2];
 
@@ -153,8 +151,8 @@ struct App {
     display_rows: Vec<DisplayRow>,
     next_group_id: u32,
     context_menu: Option<ContextMenu>,
-    log: VecDeque<String>,
-    log_scroll: i16,
+    active_wid: Option<u32>,
+    hover_row: Option<usize>,
     drag: Option<DragState>,
     width: u16,
     height: u16,
@@ -170,8 +168,8 @@ impl App {
             display_rows: Vec::new(),
             next_group_id: 0,
             context_menu: None,
-            log: VecDeque::new(),
-            log_scroll: 0,
+            active_wid: None,
+            hover_row: None,
             drag: None,
             width: WIN_W,
             height: WIN_H,
@@ -206,20 +204,6 @@ impl App {
         }
     }
 
-    fn separator_y(&self) -> i16 {
-        ITEM_Y_START
-            + (self.display_rows.len() as i16) * (ITEM_H as i16 + ITEM_SPACING)
-            + SEPARATOR_Y_OFFSET
-    }
-
-    fn log_area_top(&self) -> i16 {
-        self.separator_y() + 10
-    }
-
-    fn max_visible_log_lines(&self) -> i16 {
-        ((self.height as i16 - self.log_area_top()) / LOG_LINE_H).max(0)
-    }
-
     fn row_y(&self, index: usize) -> i16 {
         ITEM_Y_START + (index as i16) * (ITEM_H as i16 + ITEM_SPACING)
     }
@@ -248,26 +232,6 @@ impl App {
         self.items.iter().find(|i| i.wid == wid)
     }
 
-    #[allow(dead_code)]
-    fn row_group_id(&self, idx: usize) -> Option<u32> {
-        match &self.display_rows[idx] {
-            DisplayRow::GroupHeader { group_id } => Some(*group_id),
-            DisplayRow::Window { group_id, .. } => *group_id,
-        }
-    }
-
-    fn add_log(&mut self, msg: String) {
-        self.log.push_back(msg);
-        if self.log.len() > MAX_LOG {
-            self.log.pop_front();
-        }
-        let total = self.log.len() as i16;
-        let visible = self.max_visible_log_lines();
-        if total > visible {
-            self.log_scroll = total - visible;
-        }
-    }
-
     // ── Group operations ──
 
     fn create_group(&mut self, wid: u32) {
@@ -280,7 +244,6 @@ impl App {
             collapsed: false,
             member_wids: vec![wid],
         });
-        // Replace Window(wid) slot with Group(gid) in display_order
         for slot in &mut self.display_order {
             if matches!(slot, DisplaySlot::Window(w) if *w == wid) {
                 *slot = DisplaySlot::Group(gid);
@@ -291,14 +254,11 @@ impl App {
     }
 
     fn add_to_group(&mut self, gid: u32, wid: u32) {
-        // Remove from display_order (if ungrouped)
         self.display_order
             .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
-        // Remove from any other group
         for group in &mut self.groups {
             group.member_wids.retain(|w| *w != wid);
         }
-        // Add to target group
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
             group.member_wids.push(wid);
         }
@@ -380,7 +340,6 @@ impl App {
         let Some(hr) = header_row else {
             return false;
         };
-        // Find last member row after header
         let mut last_member = hr;
         for (i, row) in self.display_rows.iter().enumerate().skip(hr + 1) {
             if matches!(row, DisplayRow::Window { group_id: Some(g), .. } if *g == gid) {
@@ -403,7 +362,7 @@ impl App {
                     row_count += 1;
                 }
                 DisplaySlot::Group(gid) => {
-                    row_count += 1; // header
+                    row_count += 1;
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
                         if !group.collapsed {
                             row_count += group.member_wids.len();
@@ -465,7 +424,6 @@ impl App {
         }
         let source = self.display_rows[source_row].clone();
 
-        // Check if cursor is directly on a group header
         let on_header_gid = self.hit_test_row(current_y).and_then(|r| {
             if let DisplayRow::GroupHeader { group_id } = &self.display_rows[r] {
                 Some(*group_id)
@@ -480,19 +438,20 @@ impl App {
             DisplayRow::GroupHeader { group_id } => {
                 self.move_slot_to(&DisplaySlot::Group(group_id), drop_gap);
             }
-            DisplayRow::Window { wid, group_id: src_gid } => {
+            DisplayRow::Window {
+                wid,
+                group_id: src_gid,
+            } => {
                 if let Some(target_gid) = on_header_gid {
                     if src_gid == Some(target_gid) {
-                        return; // already in this group
+                        return;
                     }
-                    // Remove from current location
                     if let Some(gid) = src_gid {
                         self.remove_wid_from_group(gid, wid);
                     } else {
                         self.display_order
                             .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
                     }
-                    // Add to target group
                     if let Some(g) = self.groups.iter_mut().find(|g| g.id == target_gid) {
                         g.member_wids.push(wid);
                     }
@@ -500,7 +459,6 @@ impl App {
                     if self.is_gap_in_group(drop_gap, src_gid) {
                         self.reorder_within_group(src_gid, wid, drop_gap);
                     } else {
-                        // Ungroup: remove from group, insert at top level
                         self.remove_wid_from_group(src_gid, wid);
                         let slot_pos = self.display_row_to_slot_position(drop_gap);
                         self.display_order
@@ -538,6 +496,38 @@ fn get_client_list(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+fn get_active_window(
+    conn: &impl Connection,
+    root: Window,
+    atoms: &Atoms,
+) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    let reply = conn
+        .get_property(
+            false,
+            root,
+            atoms.net_active_window,
+            AtomEnum::WINDOW,
+            0,
+            1,
+        )?
+        .reply()?;
+    if reply.value.len() >= 4 {
+        let wid = u32::from_le_bytes([
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
+        ]);
+        if wid == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(wid))
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn get_window_title(
@@ -678,7 +668,14 @@ fn get_workarea(
     desktop: u32,
 ) -> Result<(i32, i32, u32, u32), Box<dyn std::error::Error>> {
     let reply = conn
-        .get_property(false, root, atoms.net_workarea, AtomEnum::CARDINAL, 0, 1024)?
+        .get_property(
+            false,
+            root,
+            atoms.net_workarea,
+            AtomEnum::CARDINAL,
+            0,
+            1024,
+        )?
         .reply()?;
     let offset = (desktop as usize) * 16;
     if reply.value.len() >= offset + 16 {
@@ -850,24 +847,15 @@ fn refresh_items(
         }
     }
 
+    // Update active window
+    app.active_wid = get_active_window(conn, root, atoms).unwrap_or(None);
+
     app.items = new_items;
     app.build_display_rows();
     Ok(())
 }
 
 // ── Helpers ──
-
-fn timestamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    let total_secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let secs = total_secs % 60;
-    let mins = (total_secs / 60) % 60;
-    let hours = (total_secs / 3600) % 24;
-    format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, millis)
-}
 
 fn alloc_color(
     conn: &impl Connection,
@@ -891,14 +879,14 @@ struct Renderer {
     #[allow(dead_code)]
     colormap: Colormap,
     bg_pixel: u32,
-    sep_pixel: u32,
     text_pixel: u32,
-    log_text_pixel: u32,
+    text_dim_pixel: u32,
     indicator_pixel: u32,
     ghost_pixel: u32,
     item_pixel: u32,
-    #[allow(dead_code)]
+    item_hover_pixel: u32,
     item_active_pixel: u32,
+    active_stripe_pixel: u32,
     menu_bg_pixel: u32,
     menu_border_pixel: u32,
     menu_hover_pixel: u32,
@@ -916,13 +904,14 @@ impl Renderer {
         let depth = screen.root_depth;
 
         let bg_pixel = alloc_color(conn, colormap, BG_COLOR)?;
-        let sep_pixel = alloc_color(conn, colormap, SEPARATOR_COLOR)?;
         let text_pixel = alloc_color(conn, colormap, TEXT_COLOR)?;
-        let log_text_pixel = alloc_color(conn, colormap, LOG_TEXT_COLOR)?;
+        let text_dim_pixel = alloc_color(conn, colormap, TEXT_DIM_COLOR)?;
         let indicator_pixel = alloc_color(conn, colormap, INDICATOR_COLOR)?;
         let ghost_pixel = alloc_color(conn, colormap, GHOST_COLOR)?;
         let item_pixel = alloc_color(conn, colormap, ITEM_COLOR)?;
+        let item_hover_pixel = alloc_color(conn, colormap, ITEM_HOVER_COLOR)?;
         let item_active_pixel = alloc_color(conn, colormap, ITEM_ACTIVE_COLOR)?;
+        let active_stripe_pixel = alloc_color(conn, colormap, ACTIVE_STRIPE_COLOR)?;
         let menu_bg_pixel = alloc_color(conn, colormap, MENU_BG_COLOR)?;
         let menu_border_pixel = alloc_color(conn, colormap, MENU_BORDER_COLOR)?;
         let menu_hover_pixel = alloc_color(conn, colormap, MENU_HOVER_COLOR)?;
@@ -933,8 +922,18 @@ impl Renderer {
             group_color_pixels.push(alloc_color(conn, colormap, c)?);
         }
 
+        // Try scalable Nimbus Mono L, fall back to fixed 13px
         let font = conn.generate_id()?;
-        conn.open_font(font, b"fixed")?;
+        let opened = conn.open_font(
+            font,
+            b"-urw-nimbus mono l-regular-r-normal--13-*-*-*-*-*-iso8859-1",
+        );
+        if opened.is_err() {
+            conn.open_font(
+                font,
+                b"-misc-fixed-medium-r-normal--13-120-75-75-c-70-iso8859-1",
+            )?;
+        }
 
         let gc = conn.generate_id()?;
         let gc_aux = CreateGCAux::new()
@@ -954,13 +953,14 @@ impl Renderer {
             depth,
             colormap,
             bg_pixel,
-            sep_pixel,
             text_pixel,
-            log_text_pixel,
+            text_dim_pixel,
             indicator_pixel,
             ghost_pixel,
             item_pixel,
+            item_hover_pixel,
             item_active_pixel,
+            active_stripe_pixel,
             menu_bg_pixel,
             menu_border_pixel,
             menu_hover_pixel,
@@ -1013,59 +1013,28 @@ impl Renderer {
                 continue;
             }
             let y = app.row_y(i);
+            let hovered = app.hover_row == Some(i);
             match row {
                 DisplayRow::GroupHeader { group_id } => {
-                    self.draw_group_header(conn, pix, app, *group_id, y)?;
+                    self.draw_group_header(conn, pix, app, *group_id, y, hovered)?;
                 }
                 DisplayRow::Window { wid, group_id } => {
                     if let Some(item) = app.find_item(*wid) {
+                        let is_active = app.active_wid == Some(*wid);
                         let (x, w) = if group_id.is_some() {
                             (ITEM_X + GROUP_INDENT, ITEM_W - GROUP_INDENT as u16)
                         } else {
                             (ITEM_X, ITEM_W)
                         };
-                        self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false)?;
+                        self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active)?;
                     }
                 }
-            }
-        }
-
-        // Draw separator
-        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.sep_pixel))?;
-        conn.poly_fill_rectangle(
-            pix,
-            self.gc,
-            &[Rectangle {
-                x: ITEM_X,
-                y: app.separator_y(),
-                width: ITEM_W,
-                height: 1,
-            }],
-        )?;
-
-        // Draw log
-        let log_top = app.log_area_top();
-        let max_lines = app.max_visible_log_lines();
-        conn.change_gc(
-            self.gc,
-            &ChangeGCAux::new().foreground(self.log_text_pixel),
-        )?;
-
-        let start = app.log_scroll.max(0) as usize;
-        for (i, line_idx) in (start..app.log.len()).enumerate() {
-            if i as i16 >= max_lines {
-                break;
-            }
-            let text_y = log_top + (i as i16) * LOG_LINE_H + 12;
-            if let Some(text) = app.log.get(line_idx) {
-                conn.image_text8(pix, self.gc, ITEM_X, text_y, text.as_bytes())?;
             }
         }
 
         // Draw drag visuals
         if let Some(drag) = &app.drag {
             if drag.started {
-                // Drop indicator line
                 let drop_idx = app.drop_index_from_y(drag.current_y);
                 let indicator_y = if drop_idx < app.display_rows.len() {
                     app.row_y(drop_idx) - (ITEM_SPACING / 2)
@@ -1104,14 +1073,7 @@ impl Renderer {
                                     (ITEM_X, ITEM_W)
                                 };
                                 self.draw_item(
-                                    conn,
-                                    pix,
-                                    x,
-                                    ghost_y,
-                                    w,
-                                    ITEM_H as u16,
-                                    item,
-                                    true,
+                                    conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false,
                                 )?;
                             }
                         }
@@ -1120,7 +1082,6 @@ impl Renderer {
             }
         }
 
-        // Copy to window
         conn.copy_area(pix, self.window, self.gc, 0, 0, 0, 0, app.width, app.height)?;
         conn.flush()?;
         Ok(())
@@ -1136,9 +1097,15 @@ impl Renderer {
         h: u16,
         item: &Item,
         ghost: bool,
+        hovered: bool,
+        is_active: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let bg = if ghost {
             self.ghost_pixel
+        } else if is_active {
+            self.item_active_pixel
+        } else if hovered {
+            self.item_hover_pixel
         } else {
             self.item_pixel
         };
@@ -1154,11 +1121,13 @@ impl Renderer {
             }],
         )?;
 
-        // Left accent stripe
-        conn.change_gc(
-            self.gc,
-            &ChangeGCAux::new().foreground(item.accent_pixel),
-        )?;
+        // Left accent stripe (3px) — blue override for active window
+        let stripe_color = if is_active {
+            self.active_stripe_pixel
+        } else {
+            item.accent_pixel
+        };
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(stripe_color))?;
         conn.poly_fill_rectangle(
             drawable,
             self.gc,
@@ -1174,7 +1143,7 @@ impl Renderer {
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = x + 8;
         let text_y = y + (h as i16 / 2) + 4;
-        let max_chars = ((w as i16 - 12) / 6).max(0) as usize;
+        let max_chars = ((w as i16 - 12) / CHAR_WIDTH).max(0) as usize;
         let display: String = item.label.chars().take(max_chars).collect();
         if !display.is_empty() {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
@@ -1189,6 +1158,7 @@ impl Renderer {
         app: &App,
         group_id: u32,
         y: i16,
+        hovered: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let group = match app.groups.iter().find(|g| g.id == group_id) {
             Some(g) => g,
@@ -1196,10 +1166,12 @@ impl Renderer {
         };
 
         // Background
-        conn.change_gc(
-            self.gc,
-            &ChangeGCAux::new().foreground(self.group_header_pixel),
-        )?;
+        let bg = if hovered {
+            self.item_hover_pixel
+        } else {
+            self.group_header_pixel
+        };
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(bg))?;
         conn.poly_fill_rectangle(
             drawable,
             self.gc,
@@ -1211,7 +1183,23 @@ impl Renderer {
             }],
         )?;
 
-        // Left accent stripe (color based on group id)
+        // Top edge line for visual separation
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(self.menu_border_pixel),
+        )?;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle {
+                x: ITEM_X,
+                y,
+                width: ITEM_W,
+                height: 1,
+            }],
+        )?;
+
+        // Left accent stripe
         let color_idx = group_id as usize % self.group_color_pixels.len();
         conn.change_gc(
             self.gc,
@@ -1228,19 +1216,34 @@ impl Renderer {
             }],
         )?;
 
-        // Text: arrow + name + count if collapsed
-        let arrow = if group.collapsed { ">" } else { "v" };
-        let text = if group.collapsed {
-            format!("{} {} ({})", arrow, group.name, group.member_wids.len())
-        } else {
-            format!("{} {}", arrow, group.name)
-        };
+        // Arrow + name
+        let arrow = if group.collapsed { "+" } else { "-" };
+        let name_text = format!("{} {}", arrow, group.name);
+
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = ITEM_X + 8;
         let text_y = y + (ITEM_H as i16 / 2) + 4;
-        let max_chars = ((ITEM_W as i16 - 12) / 6).max(0) as usize;
-        let display: String = text.chars().take(max_chars).collect();
+        let max_chars = ((ITEM_W as i16 - 12) / CHAR_WIDTH).max(0) as usize;
+        let display: String = name_text.chars().take(max_chars).collect();
         conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
+
+        // Member count (dimmed) when collapsed
+        if group.collapsed {
+            let count_text = format!("({})", group.member_wids.len());
+            let name_width = (display.len() as i16 + 1) * CHAR_WIDTH;
+            conn.change_gc(
+                self.gc,
+                &ChangeGCAux::new().foreground(self.text_dim_pixel),
+            )?;
+            conn.image_text8(
+                drawable,
+                self.gc,
+                text_x + name_width,
+                text_y,
+                count_text.as_bytes(),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1332,7 +1335,6 @@ fn open_context_menu(
     root_x: i16,
     root_y: i16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Close existing menu
     if app.context_menu.is_some() {
         close_context_menu(conn, app)?;
     }
@@ -1345,7 +1347,6 @@ fn open_context_menu(
     let height = (entries.len() as u16) * MENU_ITEM_H + (MENU_PADDING as u16 * 2);
     let width = MENU_MIN_W;
 
-    // Clamp to screen edges
     let x = root_x.min((screen.width_in_pixels as i16) - width as i16);
     let y = root_y.min((screen.height_in_pixels as i16) - height as i16);
 
@@ -1373,21 +1374,18 @@ fn open_context_menu(
 
     conn.map_window(win)?;
 
-    let grab_reply = conn
+    let _grab_reply = conn
         .grab_pointer(
             false,
             win,
             EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
             GrabMode::ASYNC,
             GrabMode::ASYNC,
-            0u32, // confine_to: none
-            0u32, // cursor: none
-            0u32, // time: current
+            0u32,
+            0u32,
+            0u32,
         )?
         .reply()?;
-    if grab_reply.status != GrabStatus::SUCCESS {
-        app.add_log(format!("grab failed: {:?}", grab_reply.status));
-    }
 
     conn.flush()?;
 
@@ -1480,47 +1478,27 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
     match action {
         MenuAction::CreateGroup => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
-                let wid = *wid;
-                let label = app
-                    .find_item(wid)
-                    .map(|i| i.label.clone())
-                    .unwrap_or_default();
-                app.create_group(wid);
-                app.add_log(format!("new group <- {} {}", label, timestamp()));
+                app.create_group(*wid);
             }
         }
         MenuAction::AddToGroup(gid) => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
-                let wid = *wid;
-                app.add_to_group(gid, wid);
-                app.add_log(format!("add to group {}", timestamp()));
+                app.add_to_group(gid, *wid);
             }
         }
         MenuAction::RemoveFromGroup => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
-                let wid = *wid;
-                app.remove_from_group(wid);
-                app.add_log(format!("ungrouped {}", timestamp()));
+                app.remove_from_group(*wid);
             }
         }
         MenuAction::RenameGroup => {
             if let DisplayRow::GroupHeader { group_id } = &app.display_rows[target_row] {
-                let gid = *group_id;
-                app.rename_group(gid);
-                let name = app
-                    .groups
-                    .iter()
-                    .find(|g| g.id == gid)
-                    .map(|g| g.name.clone())
-                    .unwrap_or_default();
-                app.add_log(format!("renamed -> {} {}", name, timestamp()));
+                app.rename_group(*group_id);
             }
         }
         MenuAction::DeleteGroup => {
             if let DisplayRow::GroupHeader { group_id } = &app.display_rows[target_row] {
-                let gid = *group_id;
-                app.delete_group(gid);
-                app.add_log(format!("deleted group {}", timestamp()));
+                app.delete_group(*group_id);
             }
         }
     }
@@ -1541,7 +1519,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         | EventMask::BUTTON_RELEASE
         | EventMask::POINTER_MOTION
         | EventMask::EXPOSURE
-        | EventMask::STRUCTURE_NOTIFY;
+        | EventMask::STRUCTURE_NOTIFY
+        | EventMask::LEAVE_WINDOW;
 
     conn.create_window(
         COPY_DEPTH_FROM_PARENT,
@@ -1574,11 +1553,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     conn.flush()?;
 
     refresh_items(&conn, root, &atoms, &mut app, colormap)?;
-    app.add_log(format!(
-        "Loaded {} windows {}",
-        app.items.len(),
-        timestamp()
-    ));
 
     let mut event_count: u32 = 0;
 
@@ -1588,15 +1562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Refresh periodically (skip during drag or menu)
         if event_count % 50 == 0 && app.drag.is_none() && app.context_menu.is_none() {
-            let old_count = app.items.len();
             refresh_items(&conn, root, &atoms, &mut app, colormap)?;
-            if app.items.len() != old_count {
-                app.add_log(format!(
-                    "Refresh: {} windows {}",
-                    app.items.len(),
-                    timestamp()
-                ));
-            }
         }
 
         // ── Context menu mode (pointer grab routes events here) ──
@@ -1674,34 +1640,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::ButtonPress(ev) if ev.event == window => {
-                let y = ev.event_y;
                 match ev.detail {
-                    4 => {
-                        if y >= app.log_area_top() {
-                            app.log_scroll = (app.log_scroll - 3).max(0);
-                        }
-                    }
-                    5 => {
-                        if y >= app.log_area_top() {
-                            let max_scroll =
-                                (app.log.len() as i16 - app.max_visible_log_lines()).max(0);
-                            app.log_scroll = (app.log_scroll + 3).min(max_scroll);
-                        }
-                    }
                     1 => {
-                        if let Some(row) = app.hit_test_row(y) {
+                        if let Some(row) = app.hit_test_row(ev.event_y) {
                             app.drag = Some(DragState {
                                 source_row: row,
-                                start_y: y,
-                                current_y: y,
+                                start_y: ev.event_y,
+                                current_y: ev.event_y,
                                 started: false,
                             });
                         }
                     }
                     3 => {
-                        // Right-click: open context menu
                         if app.drag.is_none() {
-                            if let Some(row) = app.hit_test_row(y) {
+                            if let Some(row) = app.hit_test_row(ev.event_y) {
                                 open_context_menu(
                                     &conn,
                                     screen,
@@ -1726,49 +1678,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && (drag.current_y - drag.start_y).abs() > DRAG_THRESHOLD
                     {
                         drag.started = true;
-                        let row = drag.source_row;
-                        if row < app.display_rows.len() {
-                            let label = match &app.display_rows[row] {
-                                DisplayRow::GroupHeader { group_id } => app
-                                    .groups
-                                    .iter()
-                                    .find(|g| g.id == *group_id)
-                                    .map(|g| g.name.clone())
-                                    .unwrap_or_default(),
-                                DisplayRow::Window { wid, .. } => app
-                                    .find_item(*wid)
-                                    .map(|i| i.label.clone())
-                                    .unwrap_or_default(),
-                            };
-                            app.add_log(format!("drag {} {}", label, timestamp()));
-                        }
                     }
                     needs_redraw = true;
-                }
-                // Drain queued motion events
-                while let Some(queued) = conn.poll_for_event()? {
-                    if let Event::MotionNotify(mn) = queued {
-                        if let Some(ref mut drag) = app.drag {
-                            drag.current_y = mn.event_y;
-                            needs_redraw = true;
+
+                    // Drain queued motion events during drag
+                    while let Some(queued) = conn.poll_for_event()? {
+                        if let Event::MotionNotify(mn) = queued {
+                            if let Some(ref mut drag) = app.drag {
+                                drag.current_y = mn.event_y;
+                            }
+                        } else {
+                            match queued {
+                                Event::ButtonRelease(br)
+                                    if br.detail == 1 && br.event == window =>
+                                {
+                                    handle_release(&conn, root, &atoms, &mut app);
+                                    needs_redraw = true;
+                                }
+                                Event::Expose(ex) if ex.count == 0 => {
+                                    needs_redraw = true;
+                                }
+                                _ => {}
+                            }
+                            break;
                         }
-                    } else {
-                        match queued {
-                            Event::ButtonRelease(br)
-                                if br.detail == 1 && br.event == window =>
-                            {
-                                handle_release(&conn, root, &atoms, &mut app);
+                    }
+                } else {
+                    // Hover tracking (no drag active)
+                    let new_hover = app.hit_test_row(ev.event_y);
+                    if new_hover != app.hover_row {
+                        app.hover_row = new_hover;
+                        needs_redraw = true;
+                    }
+                    // Drain queued motion for hover too
+                    while let Some(queued) = conn.poll_for_event()? {
+                        if let Event::MotionNotify(mn) = queued {
+                            let h = app.hit_test_row(mn.event_y);
+                            if h != app.hover_row {
+                                app.hover_row = h;
                                 needs_redraw = true;
                             }
-                            Event::Expose(ex) if ex.count == 0 => {
-                                needs_redraw = true;
+                        } else {
+                            // Non-motion event during hover drain — break and let main loop handle next
+                            // We can't easily re-queue, so just handle common cases
+                            match queued {
+                                Event::Expose(ex) if ex.count == 0 => {
+                                    needs_redraw = true;
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            break;
                         }
-                        break;
                     }
                 }
                 if needs_redraw {
+                    renderer.redraw(&conn, &app)?;
+                }
+            }
+            Event::LeaveNotify(_) => {
+                if app.hover_row.is_some() {
+                    app.hover_row = None;
                     renderer.redraw(&conn, &app)?;
                 }
             }
@@ -1784,9 +1753,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut App) {
     if let Some(drag) = app.drag.take() {
         if drag.started {
-            // Drag-reorder (group-aware)
             app.handle_drop(drag.source_row, drag.current_y);
-            app.add_log(format!("drop {}", timestamp()));
         } else {
             // Click (no drag)
             if drag.source_row < app.display_rows.len() {
@@ -1794,39 +1761,382 @@ fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut
                 match row {
                     DisplayRow::GroupHeader { group_id } => {
                         app.toggle_collapse(group_id);
-                        let collapsed = app
-                            .groups
-                            .iter()
-                            .find(|g| g.id == group_id)
-                            .map(|g| g.collapsed)
-                            .unwrap_or(false);
-                        app.add_log(format!(
-                            "{} {}",
-                            if collapsed { "collapsed" } else { "expanded" },
-                            timestamp()
-                        ));
                     }
                     DisplayRow::Window { wid, .. } => {
-                        let label = app
-                            .find_item(wid)
-                            .map(|i| i.label.clone())
-                            .unwrap_or_default();
-                        if let Err(e) = activate_window(conn, root, wid, atoms) {
-                            app.add_log(format!("activate err: {} {}", e, timestamp()));
-                        } else {
-                            app.add_log(format!("activate {} {}", label, timestamp()));
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            if let Err(e) =
-                                snap_to_sidebar(conn, root, app.our_wid, wid, atoms)
-                            {
-                                app.add_log(format!("snap err: {} {}", e, timestamp()));
-                            } else {
-                                app.add_log(format!("snapped {}", timestamp()));
-                            }
-                        }
+                        let _ = activate_window(conn, root, wid, atoms);
+                        app.active_wid = Some(wid);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
                     }
                 }
             }
         }
+    }
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_app() -> App {
+        App::new(999) // dummy wid for our sidebar window
+    }
+
+    fn add_item(app: &mut App, wid: u32, label: &str) {
+        app.items.push(Item {
+            wid,
+            label: label.to_string(),
+            wm_class: "test".to_string(),
+            accent_pixel: 0,
+        });
+        app.display_order.push(DisplaySlot::Window(wid));
+    }
+
+    // ── build_display_rows ──
+
+    #[test]
+    fn empty_state_produces_no_rows() {
+        let mut app = make_app();
+        app.build_display_rows();
+        assert_eq!(app.display_rows.len(), 0);
+    }
+
+    #[test]
+    fn ungrouped_windows_produce_flat_rows() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.build_display_rows();
+
+        assert_eq!(app.display_rows.len(), 3);
+        assert!(matches!(app.display_rows[0], DisplayRow::Window { wid: 1, group_id: None }));
+        assert!(matches!(app.display_rows[1], DisplayRow::Window { wid: 2, group_id: None }));
+        assert!(matches!(app.display_rows[2], DisplayRow::Window { wid: 3, group_id: None }));
+    }
+
+    #[test]
+    fn group_produces_header_plus_members() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1); // group containing window 1
+
+        assert!(matches!(app.display_rows[0], DisplayRow::GroupHeader { group_id: 0 }));
+        assert!(matches!(app.display_rows[1], DisplayRow::Window { wid: 1, group_id: Some(0) }));
+        assert!(matches!(app.display_rows[2], DisplayRow::Window { wid: 2, group_id: None }));
+    }
+
+    #[test]
+    fn collapsed_group_hides_members() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.toggle_collapse(0);
+
+        assert_eq!(app.display_rows.len(), 2); // header + window B
+        assert!(matches!(app.display_rows[0], DisplayRow::GroupHeader { group_id: 0 }));
+        assert!(matches!(app.display_rows[1], DisplayRow::Window { wid: 2, group_id: None }));
+    }
+
+    #[test]
+    fn expand_collapsed_group_shows_members() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        app.toggle_collapse(0); // collapse
+        assert_eq!(app.display_rows.len(), 1);
+        app.toggle_collapse(0); // expand
+        assert_eq!(app.display_rows.len(), 2);
+        assert!(matches!(app.display_rows[1], DisplayRow::Window { wid: 1, group_id: Some(0) }));
+    }
+
+    // ── Hit testing ──
+
+    #[test]
+    fn row_y_is_sequential() {
+        let app = make_app();
+        let y0 = app.row_y(0);
+        let y1 = app.row_y(1);
+        assert_eq!(y0, ITEM_Y_START);
+        assert_eq!(y1, ITEM_Y_START + ITEM_H as i16 + ITEM_SPACING);
+    }
+
+    #[test]
+    fn hit_test_returns_correct_row() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.build_display_rows();
+
+        let mid_row0 = app.row_y(0) + ITEM_H as i16 / 2;
+        assert_eq!(app.hit_test_row(mid_row0), Some(0));
+
+        let mid_row1 = app.row_y(1) + ITEM_H as i16 / 2;
+        assert_eq!(app.hit_test_row(mid_row1), Some(1));
+    }
+
+    #[test]
+    fn hit_test_returns_none_in_gap() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.build_display_rows();
+
+        // Below all items
+        let below = app.row_y(0) + ITEM_H as i16 + 100;
+        assert_eq!(app.hit_test_row(below), None);
+        // Above all items
+        assert_eq!(app.hit_test_row(0), None);
+    }
+
+    #[test]
+    fn drop_index_at_top_is_zero() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.build_display_rows();
+
+        assert_eq!(app.drop_index_from_y(0), 0);
+    }
+
+    #[test]
+    fn drop_index_past_end() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.build_display_rows();
+
+        assert_eq!(app.drop_index_from_y(9999), 1);
+    }
+
+    // ── Group operations ──
+
+    #[test]
+    fn create_group_replaces_window_slot() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].member_wids, vec![1]);
+        assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
+        assert!(matches!(app.display_order[1], DisplaySlot::Window(2)));
+    }
+
+    #[test]
+    fn add_to_group_moves_window() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+
+        assert_eq!(app.groups[0].member_wids, vec![1, 2]);
+        assert_eq!(app.display_order.len(), 1); // only the group slot remains
+    }
+
+    #[test]
+    fn remove_from_group_inserts_after_group() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        app.remove_from_group(1); // remove window 1
+
+        assert_eq!(app.groups[0].member_wids, vec![2]);
+        assert_eq!(app.display_order.len(), 2);
+        assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
+        assert!(matches!(app.display_order[1], DisplaySlot::Window(1)));
+    }
+
+    #[test]
+    fn delete_group_restores_members() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        app.delete_group(0);
+
+        assert_eq!(app.groups.len(), 0);
+        assert_eq!(app.display_order.len(), 3);
+        // Members inserted where group was, then remaining window
+        assert!(matches!(app.display_order[0], DisplaySlot::Window(1)));
+        assert!(matches!(app.display_order[1], DisplaySlot::Window(2)));
+        assert!(matches!(app.display_order[2], DisplaySlot::Window(3)));
+    }
+
+    #[test]
+    fn rename_group_cycles_presets() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+
+        // Initial name is "Group 1", not in presets
+        app.rename_group(0);
+        assert_eq!(app.groups[0].name, "Alpha");
+        app.rename_group(0);
+        assert_eq!(app.groups[0].name, "Beta");
+        app.rename_group(0);
+        assert_eq!(app.groups[0].name, "Gamma");
+    }
+
+    // ── Drag-and-drop ──
+
+    #[test]
+    fn is_gap_in_group_true_between_members() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // display_rows: [Header(0), Window(1,g0), Window(2,g0), Window(3,None)]
+
+        assert!(app.is_gap_in_group(1, 0)); // between header and first member
+        assert!(app.is_gap_in_group(2, 0)); // between two members
+        assert!(app.is_gap_in_group(3, 0)); // after last member
+        assert!(!app.is_gap_in_group(0, 0)); // before header
+    }
+
+    #[test]
+    fn reorder_ungrouped_windows() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.build_display_rows();
+
+        // Drag window at row 0 to gap 2 (between B and C)
+        let y_gap2 = app.row_y(2); // just above row 2's midpoint
+        app.handle_drop(0, y_gap2);
+
+        // A moved from position 0 to after B
+        assert!(matches!(app.display_order[0], DisplaySlot::Window(2)));
+        assert!(matches!(app.display_order[1], DisplaySlot::Window(1)));
+        assert!(matches!(app.display_order[2], DisplaySlot::Window(3)));
+    }
+
+    #[test]
+    fn drag_window_onto_group_header_adds_to_group() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        // display_rows: [Header(0), Window(1,g0), Window(2,None)]
+
+        // Drag window 2 (row 2) onto group header (row 0)
+        let header_y = app.row_y(0) + ITEM_H as i16 / 2;
+        app.handle_drop(2, header_y);
+
+        assert_eq!(app.groups[0].member_wids, vec![1, 2]);
+        assert_eq!(app.display_order.len(), 1); // only group remains
+    }
+
+    #[test]
+    fn drag_grouped_window_outside_ungroups() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // display_rows: [Header(0), Window(1,g0), Window(2,g0), Window(3,None)]
+
+        // Drag window 1 (row 1) past end of list (well below everything)
+        app.handle_drop(1, 9999);
+
+        assert_eq!(app.groups[0].member_wids, vec![2]); // only window 2 remains
+        // Window 1 should now be ungrouped in display_order
+        let ungrouped_wids: Vec<u32> = app
+            .display_order
+            .iter()
+            .filter_map(|s| if let DisplaySlot::Window(w) = s { Some(*w) } else { None })
+            .collect();
+        assert!(ungrouped_wids.contains(&1));
+    }
+
+    // ── Menu entries ──
+
+    #[test]
+    fn menu_for_ungrouped_window_has_new_group() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.build_display_rows();
+
+        let entries = build_menu_entries(&app, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "New Group");
+    }
+
+    #[test]
+    fn menu_for_ungrouped_shows_existing_groups() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        // display_rows: [Header(0), Window(1,g0), Window(2,None)]
+
+        let entries = build_menu_entries(&app, 2); // right-click on ungrouped window 2
+        assert_eq!(entries.len(), 2); // "New Group" + "Add to Group 1"
+        assert!(matches!(entries[1].action, MenuAction::AddToGroup(0)));
+    }
+
+    #[test]
+    fn menu_for_grouped_window_has_remove() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        // display_rows: [Header(0), Window(1,g0)]
+
+        let entries = build_menu_entries(&app, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "Remove from Group");
+    }
+
+    #[test]
+    fn menu_for_group_header_has_rename_and_delete() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+
+        let entries = build_menu_entries(&app, 0); // group header
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "Rename Group");
+        assert_eq!(entries[1].label, "Delete Group");
+    }
+
+    // ── find_item ──
+
+    #[test]
+    fn find_item_by_wid() {
+        let mut app = make_app();
+        add_item(&mut app, 42, "Test Window");
+        assert!(app.find_item(42).is_some());
+        assert_eq!(app.find_item(42).unwrap().label, "Test Window");
+        assert!(app.find_item(99).is_none());
+    }
+
+    // ── display_row_to_slot_position ──
+
+    #[test]
+    fn slot_position_maps_correctly() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // display_order: [Group(0), Window(3)]
+        // display_rows: [Header(0), Window(1,g0), Window(2,g0), Window(3,None)]
+
+        assert_eq!(app.display_row_to_slot_position(0), 0); // before header → slot 0
+        assert_eq!(app.display_row_to_slot_position(3), 1); // before Window(3) → slot 1
+        assert_eq!(app.display_row_to_slot_position(4), 2); // past end → slot 2
     }
 }

@@ -1,3 +1,3 @@
 [workspace]
-members = ["ptm-core", "src-tauri"]
+members = ["ptm-core", "src-tauri", "poc-x11"]
 resolver = "2"

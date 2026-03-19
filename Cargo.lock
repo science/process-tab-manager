@@ -2340,6 +2340,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc-x11"
+version = "0.1.0"
+dependencies = [
+ "x11rb",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

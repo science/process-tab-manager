@@ -1,3 +1,13 @@
-[workspace]
-members = ["ptm-core", "src-tauri", "poc-x11"]
-resolver = "2"
+[package]
+name = "process-tab-manager"
+version = "2.0.0"
+edition = "2021"
+description = "Vertical sidebar for managing application windows on Linux/X11"
+license = "MIT"
+
+[[bin]]
+name = "ptm"
+path = "src/main.rs"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["extra-traits"] }

@@ -8,8 +8,7 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 // Layout constants
 const WIN_W: u16 = 250;
 const WIN_H: u16 = 600;
-const ITEM_X: i16 = 8;
-const ITEM_W: u16 = 234;
+const ITEM_MARGIN: i16 = 8; // margin on each side
 const ITEM_H: u16 = 28;
 const ITEM_SPACING: i16 = 2;
 const ITEM_Y_START: i16 = 8;
@@ -39,8 +38,6 @@ const GROUP_HEADER_COLOR: u32 = 0x21252b;
 const ACCENT_COLORS: &[u32] = &[0xe06c75, 0x98c379, 0x61afef, 0xc678dd, 0xe5c07b, 0x56b6c2];
 const GROUP_COLORS: &[u32] = &[0x61afef, 0xe06c75, 0x98c379, 0xc678dd, 0xe5c07b, 0x56b6c2];
 
-// Preset names for group rename cycling
-const GROUP_PRESETS: &[&str] = &["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"];
 
 // ── Atoms ──
 
@@ -142,6 +139,12 @@ struct DragState {
     started: bool,
 }
 
+struct RenameState {
+    group_id: u32,
+    text: String,
+    cursor: usize, // byte position in text
+}
+
 // ── App ──
 
 struct App {
@@ -151,6 +154,7 @@ struct App {
     display_rows: Vec<DisplayRow>,
     next_group_id: u32,
     context_menu: Option<ContextMenu>,
+    rename: Option<RenameState>,
     active_wid: Option<u32>,
     hover_row: Option<usize>,
     drag: Option<DragState>,
@@ -168,6 +172,7 @@ impl App {
             display_rows: Vec::new(),
             next_group_id: 0,
             context_menu: None,
+            rename: None,
             active_wid: None,
             hover_row: None,
             drag: None,
@@ -202,6 +207,14 @@ impl App {
                 }
             }
         }
+    }
+
+    fn item_x(&self) -> i16 {
+        ITEM_MARGIN
+    }
+
+    fn item_w(&self) -> u16 {
+        (self.width as i16 - ITEM_MARGIN * 2).max(20) as u16
     }
 
     fn row_y(&self, index: usize) -> i16 {
@@ -306,15 +319,34 @@ impl App {
         self.build_display_rows();
     }
 
-    fn rename_group(&mut self, gid: u32) {
-        if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
-            let current = GROUP_PRESETS.iter().position(|n| *n == group.name);
-            let next = match current {
-                Some(i) => (i + 1) % GROUP_PRESETS.len(),
-                None => 0,
-            };
-            group.name = GROUP_PRESETS[next].to_string();
+    fn start_rename(&mut self, gid: u32) {
+        let text = self
+            .groups
+            .iter()
+            .find(|g| g.id == gid)
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let cursor = text.len();
+        self.rename = Some(RenameState {
+            group_id: gid,
+            text,
+            cursor,
+        });
+    }
+
+    fn commit_rename(&mut self) {
+        if let Some(rs) = self.rename.take() {
+            let name = rs.text.trim().to_string();
+            if !name.is_empty() {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == rs.group_id) {
+                    group.name = name;
+                }
+            }
         }
+    }
+
+    fn cancel_rename(&mut self) {
+        self.rename = None;
     }
 
     fn toggle_collapse(&mut self, gid: u32) {
@@ -1021,14 +1053,25 @@ impl Renderer {
                 DisplayRow::Window { wid, group_id } => {
                     if let Some(item) = app.find_item(*wid) {
                         let is_active = app.active_wid == Some(*wid);
+                        let ix = app.item_x();
+                        let iw = app.item_w();
                         let (x, w) = if group_id.is_some() {
-                            (ITEM_X + GROUP_INDENT, ITEM_W - GROUP_INDENT as u16)
+                            (ix + GROUP_INDENT, iw - GROUP_INDENT as u16)
                         } else {
-                            (ITEM_X, ITEM_W)
+                            (ix, iw)
                         };
                         self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active)?;
                     }
                 }
+            }
+        }
+
+        // Draw rename overlay (draws on top of the group header row)
+        if let Some(ref rs) = app.rename {
+            if let Some(row_idx) = app.display_rows.iter().position(
+                |r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == rs.group_id),
+            ) {
+                self.draw_rename_input(conn, pix, app, rs, app.row_y(row_idx))?;
             }
         }
 
@@ -1051,9 +1094,9 @@ impl Renderer {
                     pix,
                     self.gc,
                     &[Rectangle {
-                        x: ITEM_X,
+                        x: app.item_x(),
                         y: indicator_y,
-                        width: ITEM_W,
+                        width: app.item_w(),
                         height: 2,
                     }],
                 )?;
@@ -1067,10 +1110,12 @@ impl Renderer {
                         }
                         DisplayRow::Window { wid, group_id } => {
                             if let Some(item) = app.find_item(*wid) {
+                                let ix = app.item_x();
+                                let iw = app.item_w();
                                 let (x, w) = if group_id.is_some() {
-                                    (ITEM_X + GROUP_INDENT, ITEM_W - GROUP_INDENT as u16)
+                                    (ix + GROUP_INDENT, iw - GROUP_INDENT as u16)
                                 } else {
-                                    (ITEM_X, ITEM_W)
+                                    (ix, iw)
                                 };
                                 self.draw_item(
                                     conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false,
@@ -1165,6 +1210,9 @@ impl Renderer {
             None => return Ok(()),
         };
 
+        let ix = app.item_x();
+        let iw = app.item_w();
+
         // Background
         let bg = if hovered {
             self.item_hover_pixel
@@ -1176,9 +1224,9 @@ impl Renderer {
             drawable,
             self.gc,
             &[Rectangle {
-                x: ITEM_X,
+                x: ix,
                 y,
-                width: ITEM_W,
+                width: iw,
                 height: ITEM_H as u16,
             }],
         )?;
@@ -1192,9 +1240,9 @@ impl Renderer {
             drawable,
             self.gc,
             &[Rectangle {
-                x: ITEM_X,
+                x: ix,
                 y,
-                width: ITEM_W,
+                width: iw,
                 height: 1,
             }],
         )?;
@@ -1209,7 +1257,7 @@ impl Renderer {
             drawable,
             self.gc,
             &[Rectangle {
-                x: ITEM_X,
+                x: ix,
                 y,
                 width: 3,
                 height: ITEM_H as u16,
@@ -1221,9 +1269,9 @@ impl Renderer {
         let name_text = format!("{} {}", arrow, group.name);
 
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
-        let text_x = ITEM_X + 8;
+        let text_x = ix + 8;
         let text_y = y + (ITEM_H as i16 / 2) + 4;
-        let max_chars = ((ITEM_W as i16 - 12) / CHAR_WIDTH).max(0) as usize;
+        let max_chars = ((iw as i16 - 12) / CHAR_WIDTH).max(0) as usize;
         let display: String = name_text.chars().take(max_chars).collect();
         conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
 
@@ -1255,14 +1303,16 @@ impl Renderer {
         group_id: u32,
         y: i16,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let ix = app.item_x();
+        let iw = app.item_w();
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.ghost_pixel))?;
         conn.poly_fill_rectangle(
             drawable,
             self.gc,
             &[Rectangle {
-                x: ITEM_X,
+                x: ix,
                 y,
-                width: ITEM_W,
+                width: iw,
                 height: ITEM_H as u16,
             }],
         )?;
@@ -1272,11 +1322,72 @@ impl Renderer {
             conn.image_text8(
                 drawable,
                 self.gc,
-                ITEM_X + 8,
+                ix + 8,
                 y + (ITEM_H as i16 / 2) + 4,
                 text.as_bytes(),
             )?;
         }
+        Ok(())
+    }
+
+    fn draw_rename_input(
+        &self,
+        conn: &impl Connection,
+        drawable: Drawable,
+        app: &App,
+        rs: &RenameState,
+        y: i16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ix = app.item_x();
+        let iw = app.item_w();
+
+        // Dark background
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.bg_pixel))?;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle {
+                x: ix,
+                y,
+                width: iw,
+                height: ITEM_H as u16,
+            }],
+        )?;
+
+        // Border
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(self.indicator_pixel),
+        )?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix, y, width: iw, height: 1 }])?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix, y: y + ITEM_H as i16 - 1, width: iw, height: 1 }])?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix, y, width: 1, height: ITEM_H as u16 }])?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix + iw as i16 - 1, y, width: 1, height: ITEM_H as u16 }])?;
+
+        // Text
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
+        let text_x = ix + 8;
+        let text_y = y + (ITEM_H as i16 / 2) + 4;
+        let max_chars = ((iw as i16 - 16) / CHAR_WIDTH).max(0) as usize;
+        let display: String = rs.text.chars().take(max_chars).collect();
+        if !display.is_empty() {
+            conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
+        }
+
+        // Cursor bar
+        let cursor_chars = rs.text[..rs.cursor].chars().count().min(max_chars);
+        let cursor_x = text_x + (cursor_chars as i16) * CHAR_WIDTH;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle {
+                x: cursor_x,
+                y: y + 4,
+                width: 1,
+                height: ITEM_H as u16 - 8,
+            }],
+        )?;
+
         Ok(())
     }
 }
@@ -1493,7 +1604,7 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
         }
         MenuAction::RenameGroup => {
             if let DisplayRow::GroupHeader { group_id } = &app.display_rows[target_row] {
-                app.rename_group(*group_id);
+                app.start_rename(*group_id);
             }
         }
         MenuAction::DeleteGroup => {
@@ -1501,6 +1612,39 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
                 app.delete_group(*group_id);
             }
         }
+    }
+}
+
+// ── Keyboard helpers ──
+
+fn keysym_from_keycode(
+    conn: &impl Connection,
+    keycode: u8,
+    state: KeyButMask,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let setup = conn.setup();
+    let min_kc = setup.min_keycode;
+    let max_kc = setup.max_keycode;
+    let reply = conn
+        .get_keyboard_mapping(min_kc, max_kc - min_kc + 1)?
+        .reply()?;
+    let syms_per_kc = reply.keysyms_per_keycode as usize;
+    let offset = (keycode - min_kc) as usize * syms_per_kc;
+    if offset >= reply.keysyms.len() {
+        return Ok(0);
+    }
+    // Column 0 = unshifted, column 1 = shifted
+    let shifted = u16::from(state) & 1 != 0; // ShiftMask = bit 0
+    let col = if shifted && syms_per_kc > 1 { 1 } else { 0 };
+    Ok(reply.keysyms[offset + col])
+}
+
+fn printable_char_from_sym(sym: u32) -> Option<char> {
+    // Latin-1 range: keysym 0x20..0xff maps directly to Unicode
+    if (0x20..=0x7e).contains(&sym) || (0xa0..=0xff).contains(&sym) {
+        char::from_u32(sym)
+    } else {
+        None
     }
 }
 
@@ -1520,7 +1664,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         | EventMask::POINTER_MOTION
         | EventMask::EXPOSURE
         | EventMask::STRUCTURE_NOTIFY
-        | EventMask::LEAVE_WINDOW;
+        | EventMask::LEAVE_WINDOW
+        | EventMask::KEY_PRESS;
 
     conn.create_window(
         COPY_DEPTH_FROM_PARENT,
@@ -1543,7 +1688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window,
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
-        b"poc-x11",
+        b"ptm",
     )?;
 
     let mut app = App::new(window);
@@ -1561,7 +1706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_count = event_count.wrapping_add(1);
 
         // Refresh periodically (skip during drag or menu)
-        if event_count % 50 == 0 && app.drag.is_none() && app.context_menu.is_none() {
+        if event_count % 50 == 0 && app.drag.is_none() && app.context_menu.is_none() && app.rename.is_none() {
             refresh_items(&conn, root, &atoms, &mut app, colormap)?;
         }
 
@@ -1617,6 +1762,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         draw_context_menu(&conn, &renderer, &app)?;
                     }
                     if ev.window == window {
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // ── Rename mode (inline text editing) ──
+        if app.rename.is_some() {
+            match event {
+                Event::KeyPress(ev) => {
+                    let sym = keysym_from_keycode(&conn, ev.detail, ev.state)?;
+                    match sym {
+                        0xff0d | 0xff8d => {
+                            // Return / KP_Enter → commit
+                            app.commit_rename();
+                        }
+                        0xff1b => {
+                            // Escape → cancel
+                            app.cancel_rename();
+                        }
+                        0xff08 => {
+                            // Backspace
+                            if let Some(ref mut rs) = app.rename {
+                                if rs.cursor > 0 {
+                                    // Remove the char before cursor
+                                    let prev = rs.text[..rs.cursor]
+                                        .char_indices()
+                                        .next_back()
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(0);
+                                    rs.text.drain(prev..rs.cursor);
+                                    rs.cursor = prev;
+                                }
+                            }
+                        }
+                        0xffff => {
+                            // Delete
+                            if let Some(ref mut rs) = app.rename {
+                                if rs.cursor < rs.text.len() {
+                                    let next = rs.text[rs.cursor..]
+                                        .char_indices()
+                                        .nth(1)
+                                        .map(|(i, _)| rs.cursor + i)
+                                        .unwrap_or(rs.text.len());
+                                    rs.text.drain(rs.cursor..next);
+                                }
+                            }
+                        }
+                        0xff51 => {
+                            // Left arrow
+                            if let Some(ref mut rs) = app.rename {
+                                if rs.cursor > 0 {
+                                    rs.cursor = rs.text[..rs.cursor]
+                                        .char_indices()
+                                        .next_back()
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(0);
+                                }
+                            }
+                        }
+                        0xff53 => {
+                            // Right arrow
+                            if let Some(ref mut rs) = app.rename {
+                                if rs.cursor < rs.text.len() {
+                                    rs.cursor = rs.text[rs.cursor..]
+                                        .char_indices()
+                                        .nth(1)
+                                        .map(|(i, _)| rs.cursor + i)
+                                        .unwrap_or(rs.text.len());
+                                }
+                            }
+                        }
+                        0xff50 => {
+                            // Home
+                            if let Some(ref mut rs) = app.rename {
+                                rs.cursor = 0;
+                            }
+                        }
+                        0xff57 => {
+                            // End
+                            if let Some(ref mut rs) = app.rename {
+                                rs.cursor = rs.text.len();
+                            }
+                        }
+                        _ => {
+                            // Printable character — lookup string from keycode
+                            if let Some(ch) = printable_char_from_sym(sym) {
+                                if let Some(ref mut rs) = app.rename {
+                                    rs.text.insert(rs.cursor, ch);
+                                    rs.cursor += ch.len_utf8();
+                                }
+                            }
+                        }
+                    }
+                    renderer.redraw(&conn, &app)?;
+                }
+                Event::ButtonPress(ev) if ev.event == window => {
+                    // Click outside the rename row → commit
+                    app.commit_rename();
+                    renderer.redraw(&conn, &app)?;
+                }
+                Event::Expose(ev) if ev.count == 0 && ev.window == window => {
+                    renderer.redraw(&conn, &app)?;
+                }
+                Event::ConfigureNotify(ev) if ev.window == window => {
+                    let (new_w, new_h) = (ev.width, ev.height);
+                    if new_w != app.width || new_h != app.height {
+                        app.width = new_w;
+                        app.height = new_h;
+                        renderer.resize(&conn, new_w, new_h)?;
                         renderer.redraw(&conn, &app)?;
                     }
                 }
@@ -1854,7 +2111,7 @@ mod tests {
         assert!(matches!(app.display_rows[1], DisplayRow::Window { wid: 1, group_id: Some(0) }));
     }
 
-    // ── Hit testing ──
+    // ── Hit testing + responsive layout ──
 
     #[test]
     fn row_y_is_sequential() {
@@ -1863,6 +2120,19 @@ mod tests {
         let y1 = app.row_y(1);
         assert_eq!(y0, ITEM_Y_START);
         assert_eq!(y1, ITEM_Y_START + ITEM_H as i16 + ITEM_SPACING);
+    }
+
+    #[test]
+    fn item_width_adapts_to_window_width() {
+        let mut app = make_app();
+        app.width = 250;
+        assert_eq!(app.item_w(), 250 - ITEM_MARGIN as u16 * 2);
+
+        app.width = 400;
+        assert_eq!(app.item_w(), 400 - ITEM_MARGIN as u16 * 2);
+
+        app.width = 100;
+        assert_eq!(app.item_w(), 100 - ITEM_MARGIN as u16 * 2);
     }
 
     #[test]
@@ -1972,18 +2242,55 @@ mod tests {
     }
 
     #[test]
-    fn rename_group_cycles_presets() {
+    fn rename_group_inline() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        assert_eq!(app.groups[0].name, "Group 1");
+
+        // Start rename — populates RenameState with current name
+        app.start_rename(0);
+        assert!(app.rename.is_some());
+        assert_eq!(app.rename.as_ref().unwrap().text, "Group 1");
+
+        // Simulate typing: clear and type new name
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "My Project".to_string();
+            rs.cursor = rs.text.len();
+        }
+
+        // Commit
+        app.commit_rename();
+        assert!(app.rename.is_none());
+        assert_eq!(app.groups[0].name, "My Project");
+    }
+
+    #[test]
+    fn rename_cancel_preserves_old_name() {
         let mut app = make_app();
         add_item(&mut app, 1, "A");
         app.create_group(1);
 
-        // Initial name is "Group 1", not in presets
-        app.rename_group(0);
-        assert_eq!(app.groups[0].name, "Alpha");
-        app.rename_group(0);
-        assert_eq!(app.groups[0].name, "Beta");
-        app.rename_group(0);
-        assert_eq!(app.groups[0].name, "Gamma");
+        app.start_rename(0);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "New Name".to_string();
+        }
+        app.cancel_rename();
+        assert_eq!(app.groups[0].name, "Group 1");
+    }
+
+    #[test]
+    fn rename_empty_string_preserves_old_name() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+
+        app.start_rename(0);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "   ".to_string();
+        }
+        app.commit_rename();
+        assert_eq!(app.groups[0].name, "Group 1"); // blank rejected
     }
 
     // ── Drag-and-drop ──

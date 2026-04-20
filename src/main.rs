@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Write;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
@@ -50,6 +51,10 @@ struct Atoms {
     net_frame_extents: Atom,
     net_workarea: Atom,
     utf8_string: Atom,
+    net_wm_window_type: Atom,
+    net_wm_window_type_normal: Atom,
+    wm_protocols: Atom,
+    wm_delete_window: Atom,
 }
 
 impl Atoms {
@@ -62,6 +67,10 @@ impl Atoms {
         let c5 = conn.intern_atom(false, b"_NET_FRAME_EXTENTS")?;
         let c6 = conn.intern_atom(false, b"_NET_WORKAREA")?;
         let c7 = conn.intern_atom(false, b"UTF8_STRING")?;
+        let c8 = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE")?;
+        let c9 = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_NORMAL")?;
+        let c10 = conn.intern_atom(false, b"WM_PROTOCOLS")?;
+        let c11 = conn.intern_atom(false, b"WM_DELETE_WINDOW")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -71,6 +80,10 @@ impl Atoms {
             net_frame_extents: c5.reply()?.atom,
             net_workarea: c6.reply()?.atom,
             utf8_string: c7.reply()?.atom,
+            net_wm_window_type: c8.reply()?.atom,
+            net_wm_window_type_normal: c9.reply()?.atom,
+            wm_protocols: c10.reply()?.atom,
+            wm_delete_window: c11.reply()?.atom,
         })
     }
 }
@@ -83,6 +96,17 @@ struct Item {
     #[allow(dead_code)]
     wm_class: String,
     accent_pixel: u32,
+    custom_prefix: String,
+}
+
+impl Item {
+    fn display_label(&self) -> String {
+        if self.custom_prefix.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{}: {}", self.custom_prefix, self.label)
+        }
+    }
 }
 
 struct Group {
@@ -111,6 +135,7 @@ enum MenuAction {
     RemoveFromGroup,
     RenameGroup,
     DeleteGroup,
+    RenameTab,
 }
 
 struct MenuEntry {
@@ -139,8 +164,13 @@ struct DragState {
     started: bool,
 }
 
+enum RenameTarget {
+    Group(u32),
+    Window(u32),
+}
+
 struct RenameState {
-    group_id: u32,
+    target: RenameTarget,
     text: String,
     cursor: usize, // byte position in text
 }
@@ -158,6 +188,8 @@ struct App {
     active_wid: Option<u32>,
     hover_row: Option<usize>,
     drag: Option<DragState>,
+    x: i16,
+    y: i16,
     width: u16,
     height: u16,
     our_wid: u32,
@@ -176,6 +208,8 @@ impl App {
             active_wid: None,
             hover_row: None,
             drag: None,
+            x: 0,
+            y: 0,
             width: WIN_W,
             height: WIN_H,
             our_wid,
@@ -328,7 +362,22 @@ impl App {
             .unwrap_or_default();
         let cursor = text.len();
         self.rename = Some(RenameState {
-            group_id: gid,
+            target: RenameTarget::Group(gid),
+            text,
+            cursor,
+        });
+    }
+
+    fn start_tab_rename(&mut self, wid: u32) {
+        let text = self
+            .items
+            .iter()
+            .find(|i| i.wid == wid)
+            .map(|i| i.custom_prefix.clone())
+            .unwrap_or_default();
+        let cursor = text.len();
+        self.rename = Some(RenameState {
+            target: RenameTarget::Window(wid),
             text,
             cursor,
         });
@@ -336,10 +385,24 @@ impl App {
 
     fn commit_rename(&mut self) {
         if let Some(rs) = self.rename.take() {
-            let name = rs.text.trim().to_string();
-            if !name.is_empty() {
-                if let Some(group) = self.groups.iter_mut().find(|g| g.id == rs.group_id) {
-                    group.name = name;
+            match rs.target {
+                RenameTarget::Group(gid) => {
+                    let name = rs.text.trim().to_string();
+                    if !name.is_empty() {
+                        if let Some(group) =
+                            self.groups.iter_mut().find(|g| g.id == gid)
+                        {
+                            group.name = name;
+                        }
+                    }
+                }
+                RenameTarget::Window(wid) => {
+                    let prefix = rs.text.trim().to_string();
+                    if let Some(item) =
+                        self.items.iter_mut().find(|i| i.wid == wid)
+                    {
+                        item.custom_prefix = prefix;
+                    }
                 }
             }
         }
@@ -653,6 +716,32 @@ fn get_window_desktop(
     }
 }
 
+fn is_normal_window(
+    conn: &impl Connection,
+    wid: u32,
+    atoms: &Atoms,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let reply = conn
+        .get_property(
+            false,
+            wid,
+            atoms.net_wm_window_type,
+            AtomEnum::ATOM,
+            0,
+            32,
+        )?
+        .reply()?;
+    if reply.value.is_empty() {
+        return Ok(true); // No type set → treat as normal
+    }
+    let type_atoms: Vec<u32> = reply
+        .value
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok(type_atoms.contains(&atoms.net_wm_window_type_normal))
+}
+
 fn get_frame_extents(
     conn: &impl Connection,
     wid: u32,
@@ -823,28 +912,32 @@ fn refresh_items(
             Ok(Some(d)) if d != current_desktop => continue,
             _ => {}
         }
+        if !is_normal_window(conn, wid, atoms).unwrap_or(true) {
+            continue;
+        }
 
         live_wids.insert(wid);
 
         let title = get_window_title(conn, wid, atoms).unwrap_or_default();
         let (_instance, class) = get_wm_class(conn, wid).unwrap_or_default();
-        let display = if title.len() > 30 {
-            format!("{}...", &title[..27])
-        } else if title.is_empty() {
-            class.clone()
-        } else {
-            title
-        };
+        let display = if title.is_empty() { class.clone() } else { title };
 
         let accent = ACCENT_COLORS[color_idx % ACCENT_COLORS.len()];
         let accent_pixel = alloc_color(conn, colormap, accent)?;
         color_idx += 1;
 
+        let custom_prefix = app
+            .items
+            .iter()
+            .find(|i| i.wid == wid)
+            .map(|i| i.custom_prefix.clone())
+            .unwrap_or_default();
         new_items.push(Item {
             wid,
             label: display,
             wm_class: class,
             accent_pixel,
+            custom_prefix,
         });
     }
 
@@ -1066,11 +1159,17 @@ impl Renderer {
             }
         }
 
-        // Draw rename overlay (draws on top of the group header row)
+        // Draw rename overlay (draws on top of the target row)
         if let Some(ref rs) = app.rename {
-            if let Some(row_idx) = app.display_rows.iter().position(
-                |r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == rs.group_id),
-            ) {
+            let row_idx = match rs.target {
+                RenameTarget::Group(gid) => app.display_rows.iter().position(
+                    |r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == gid),
+                ),
+                RenameTarget::Window(wid) => app.display_rows.iter().position(
+                    |r| matches!(r, DisplayRow::Window { wid: w, .. } if *w == wid),
+                ),
+            };
+            if let Some(row_idx) = row_idx {
                 self.draw_rename_input(conn, pix, app, rs, app.row_y(row_idx))?;
             }
         }
@@ -1189,7 +1288,8 @@ impl Renderer {
         let text_x = x + 8;
         let text_y = y + (h as i16 / 2) + 4;
         let max_chars = ((w as i16 - 12) / CHAR_WIDTH).max(0) as usize;
-        let display: String = item.label.chars().take(max_chars).collect();
+        let full_label = item.display_label();
+        let display: String = full_label.chars().take(max_chars).collect();
         if !display.is_empty() {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
@@ -1414,18 +1514,30 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
         DisplayRow::Window {
             group_id: Some(_), ..
         } => {
-            vec![MenuEntry {
-                label: "Remove from Group".to_string(),
-                action: MenuAction::RemoveFromGroup,
-            }]
+            vec![
+                MenuEntry {
+                    label: "Rename Tab".to_string(),
+                    action: MenuAction::RenameTab,
+                },
+                MenuEntry {
+                    label: "Remove from Group".to_string(),
+                    action: MenuAction::RemoveFromGroup,
+                },
+            ]
         }
         DisplayRow::Window {
             group_id: None, ..
         } => {
-            let mut entries = vec![MenuEntry {
-                label: "New Group".to_string(),
-                action: MenuAction::CreateGroup,
-            }];
+            let mut entries = vec![
+                MenuEntry {
+                    label: "Rename Tab".to_string(),
+                    action: MenuAction::RenameTab,
+                },
+                MenuEntry {
+                    label: "New Group".to_string(),
+                    action: MenuAction::CreateGroup,
+                },
+            ];
             for group in &app.groups {
                 entries.push(MenuEntry {
                     label: format!("Add to {}", group.name),
@@ -1612,6 +1724,11 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
                 app.delete_group(*group_id);
             }
         }
+        MenuAction::RenameTab => {
+            if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
+                app.start_tab_rename(*wid);
+            }
+        }
     }
 }
 
@@ -1646,6 +1763,263 @@ fn printable_char_from_sym(sym: u32) -> Option<char> {
     } else {
         None
     }
+}
+
+// ── Geometry persistence ──
+
+fn geometry_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let mut path = std::path::PathBuf::from(home);
+    path.push(".config");
+    path.push("ptm");
+    path.push("geometry");
+    path
+}
+
+fn save_geometry(x: i16, y: i16, w: u16, h: u16) {
+    let path = geometry_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = write!(f, "{} {} {} {}\n", x, y, w, h);
+    }
+}
+
+fn load_geometry() -> Option<(i16, i16, u16, u16)> {
+    let data = std::fs::read_to_string(geometry_path()).ok()?;
+    let parts: Vec<&str> = data.trim().split_whitespace().collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+    ))
+}
+
+// ── Group persistence ──
+
+struct SavedMember {
+    label: String,
+    wm_class: String,
+    custom_prefix: String,
+}
+
+struct SavedGroup {
+    name: String,
+    collapsed: bool,
+    members: Vec<SavedMember>,
+}
+
+fn groups_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let mut path = std::path::PathBuf::from(home);
+    path.push(".config");
+    path.push("ptm");
+    path.push("groups");
+    path
+}
+
+fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
+    let mut saved = Vec::new();
+    for slot in &app.display_order {
+        if let DisplaySlot::Group(gid) = slot {
+            if let Some(group) = app.groups.iter().find(|g| g.id == *gid) {
+                let members = group
+                    .member_wids
+                    .iter()
+                    .filter_map(|wid| {
+                        app.find_item(*wid).map(|item| SavedMember {
+                            label: item.label.clone(),
+                            wm_class: item.wm_class.clone(),
+                            custom_prefix: item.custom_prefix.clone(),
+                        })
+                    })
+                    .collect();
+                saved.push(SavedGroup {
+                    name: group.name.clone(),
+                    collapsed: group.collapsed,
+                    members,
+                });
+            }
+        }
+    }
+    saved
+}
+
+fn save_groups_to(path: &std::path::Path, groups: &[SavedGroup]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = writeln!(f, "v1");
+        for group in groups {
+            let collapsed = if group.collapsed { "1" } else { "0" };
+            let _ = writeln!(f, "GROUP\t{}\t{}", group.name, collapsed);
+            for member in &group.members {
+                let _ = writeln!(
+                    f,
+                    "MEMBER\t{}\t{}\t{}",
+                    member.label, member.wm_class, member.custom_prefix
+                );
+            }
+        }
+    }
+}
+
+fn save_groups(app: &App) {
+    let groups = extract_saved_state(app);
+    save_groups_to(&groups_path(), &groups);
+}
+
+fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let mut lines = data.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let mut groups: Vec<SavedGroup> = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts.first() {
+            Some(&"GROUP") => {
+                if parts.len() != 3 {
+                    return None;
+                }
+                let collapsed = match parts[2] {
+                    "1" => true,
+                    "0" => false,
+                    _ => return None,
+                };
+                groups.push(SavedGroup {
+                    name: parts[1].to_string(),
+                    collapsed,
+                    members: Vec::new(),
+                });
+            }
+            Some(&"MEMBER") => {
+                if parts.len() != 4 {
+                    return None;
+                }
+                if groups.is_empty() {
+                    return None;
+                }
+                groups.last_mut().unwrap().members.push(SavedMember {
+                    label: parts[1].to_string(),
+                    wm_class: parts[2].to_string(),
+                    custom_prefix: parts[3].to_string(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(groups)
+}
+
+fn load_groups() -> Option<Vec<SavedGroup>> {
+    load_groups_from(&groups_path())
+}
+
+fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
+    let available: Vec<(String, String, u32)> = app
+        .items
+        .iter()
+        .map(|item| (item.label.clone(), item.wm_class.clone(), item.wid))
+        .collect();
+    let mut claimed: HashSet<u32> = HashSet::new();
+
+    for sg in saved {
+        let mut matched_wids: Vec<u32> = Vec::new();
+        let mut matched_prefixes: Vec<String> = Vec::new();
+
+        for sm in &sg.members {
+            // Prefer exact match on (label, wm_class)
+            let exact = available.iter().find(|(l, c, w)| {
+                l == &sm.label && c == &sm.wm_class && !claimed.contains(w)
+            });
+            let matched = exact.or_else(|| {
+                // Fall back to label-only match
+                available
+                    .iter()
+                    .find(|(l, _, w)| l == &sm.label && !claimed.contains(w))
+            });
+            if let Some((_, _, wid)) = matched {
+                matched_wids.push(*wid);
+                matched_prefixes.push(sm.custom_prefix.clone());
+                claimed.insert(*wid);
+            }
+        }
+
+        if matched_wids.is_empty() {
+            continue;
+        }
+
+        // Restore custom_prefix on matched items
+        for (wid, prefix) in matched_wids.iter().zip(matched_prefixes.iter()) {
+            if !prefix.is_empty() {
+                if let Some(item) = app.items.iter_mut().find(|i| i.wid == *wid) {
+                    item.custom_prefix = prefix.clone();
+                }
+            }
+        }
+
+        let gid = app.next_group_id;
+        app.next_group_id += 1;
+        app.groups.push(Group {
+            id: gid,
+            name: sg.name.clone(),
+            collapsed: sg.collapsed,
+            member_wids: matched_wids,
+        });
+    }
+
+    // Rebuild display_order: groups first (in saved order), then ungrouped
+    let mut new_order: Vec<DisplaySlot> = Vec::new();
+    for group in &app.groups {
+        new_order.push(DisplaySlot::Group(group.id));
+    }
+    for slot in &app.display_order {
+        if let DisplaySlot::Window(wid) = slot {
+            if !claimed.contains(wid) {
+                new_order.push(DisplaySlot::Window(*wid));
+            }
+        }
+    }
+    app.display_order = new_order;
+    app.build_display_rows();
+}
+
+#[cfg(test)]
+fn geometry_path_in(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("geometry")
+}
+
+#[cfg(test)]
+fn save_geometry_to(path: &std::path::Path, x: i16, y: i16, w: u16, h: u16) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = write!(f, "{} {} {} {}\n", x, y, w, h);
+    }
+}
+
+#[cfg(test)]
+fn load_geometry_from(path: &std::path::Path) -> Option<(i16, i16, u16, u16)> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let parts: Vec<&str> = data.trim().split_whitespace().collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+    ))
 }
 
 // ── Main ──
@@ -1691,19 +2065,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b"ptm",
     )?;
 
+    // Register WM_DELETE_WINDOW so the WM sends ClientMessage instead of killing us
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.wm_protocols,
+        AtomEnum::ATOM,
+        &[atoms.wm_delete_window],
+    )?;
+
     let mut app = App::new(window);
     let mut renderer = Renderer::new(&conn, screen, window)?;
 
     conn.map_window(window)?;
     conn.flush()?;
 
+    // Restore saved geometry (position + size) from previous session
+    if let Some((x, y, w, h)) = load_geometry() {
+        conn.configure_window(
+            window,
+            &ConfigureWindowAux::new()
+                .x(x as i32)
+                .y(y as i32)
+                .width(w as u32)
+                .height(h as u32),
+        )?;
+        conn.flush()?;
+        app.x = x;
+        app.y = y;
+        app.width = w;
+        app.height = h;
+        renderer.resize(&conn, w, h)?;
+    }
+
     refresh_items(&conn, root, &atoms, &mut app, colormap)?;
+
+    if let Some(saved) = load_groups() {
+        restore_groups(&mut app, &saved);
+    }
 
     let mut event_count: u32 = 0;
 
     loop {
         let event = conn.wait_for_event()?;
         event_count = event_count.wrapping_add(1);
+
+        // Handle WM_DELETE_WINDOW in any mode
+        if let Event::ClientMessage(ev) = &event {
+            if ev.window == window && ev.data.as_data32()[0] == atoms.wm_delete_window {
+                save_geometry(app.x, app.y, app.width, app.height);
+                save_groups(&app);
+                break;
+            }
+        }
 
         // Refresh periodically (skip during drag or menu)
         if event_count % 50 == 0 && app.drag.is_none() && app.context_menu.is_none() && app.rename.is_none() {
@@ -1869,6 +2283,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     renderer.redraw(&conn, &app)?;
                 }
                 Event::ConfigureNotify(ev) if ev.window == window => {
+                    app.x = ev.x;
+                    app.y = ev.y;
                     let (new_w, new_h) = (ev.width, ev.height);
                     if new_w != app.width || new_h != app.height {
                         app.width = new_w;
@@ -1888,6 +2304,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 renderer.redraw(&conn, &app)?;
             }
             Event::ConfigureNotify(ev) if ev.window == window => {
+                app.x = ev.x;
+                app.y = ev.y;
                 let (new_w, new_h) = (ev.width, ev.height);
                 if new_w != app.width || new_h != app.height {
                     app.width = new_w;
@@ -2005,6 +2423,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+
+    Ok(())
 }
 
 fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut App) {
@@ -2047,6 +2467,7 @@ mod tests {
             label: label.to_string(),
             wm_class: "test".to_string(),
             accent_pixel: 0,
+            custom_prefix: String::new(),
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -2377,8 +2798,9 @@ mod tests {
         app.build_display_rows();
 
         let entries = build_menu_entries(&app, 0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].label, "New Group");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "Rename Tab");
+        assert_eq!(entries[1].label, "New Group");
     }
 
     #[test]
@@ -2390,8 +2812,8 @@ mod tests {
         // display_rows: [Header(0), Window(1,g0), Window(2,None)]
 
         let entries = build_menu_entries(&app, 2); // right-click on ungrouped window 2
-        assert_eq!(entries.len(), 2); // "New Group" + "Add to Group 1"
-        assert!(matches!(entries[1].action, MenuAction::AddToGroup(0)));
+        assert_eq!(entries.len(), 3); // "Rename Tab" + "New Group" + "Add to Group 1"
+        assert!(matches!(entries[2].action, MenuAction::AddToGroup(0)));
     }
 
     #[test]
@@ -2402,8 +2824,9 @@ mod tests {
         // display_rows: [Header(0), Window(1,g0)]
 
         let entries = build_menu_entries(&app, 1);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].label, "Remove from Group");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, "Rename Tab");
+        assert_eq!(entries[1].label, "Remove from Group");
     }
 
     #[test]
@@ -2416,6 +2839,116 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].label, "Rename Group");
         assert_eq!(entries[1].label, "Delete Group");
+    }
+
+    // ── Tab rename ──
+
+    #[test]
+    fn display_label_without_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        assert_eq!(app.items[0].display_label(), "Firefox");
+    }
+
+    #[test]
+    fn display_label_with_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "steve@bambam: ~/dev");
+        app.items[0].custom_prefix = "Dev Terminal".to_string();
+        assert_eq!(
+            app.items[0].display_label(),
+            "Dev Terminal: steve@bambam: ~/dev"
+        );
+    }
+
+    #[test]
+    fn menu_for_ungrouped_window_has_rename_tab() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.build_display_rows();
+
+        let entries = build_menu_entries(&app, 0);
+        assert!(entries.iter().any(|e| e.label == "Rename Tab"));
+    }
+
+    #[test]
+    fn menu_for_grouped_window_has_rename_tab() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+
+        let entries = build_menu_entries(&app, 1); // window row inside group
+        assert!(entries.iter().any(|e| e.label == "Rename Tab"));
+    }
+
+    #[test]
+    fn start_tab_rename_initializes_with_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.items[0].custom_prefix = "Browser".to_string();
+        app.build_display_rows();
+
+        app.start_tab_rename(1);
+        assert!(app.rename.is_some());
+        let rs = app.rename.as_ref().unwrap();
+        assert_eq!(rs.text, "Browser");
+    }
+
+    #[test]
+    fn start_tab_rename_empty_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.build_display_rows();
+
+        app.start_tab_rename(1);
+        assert!(app.rename.is_some());
+        let rs = app.rename.as_ref().unwrap();
+        assert_eq!(rs.text, "");
+    }
+
+    #[test]
+    fn commit_tab_rename_sets_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.build_display_rows();
+
+        app.start_tab_rename(1);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "Browser".to_string();
+            rs.cursor = rs.text.len();
+        }
+        app.commit_rename();
+        assert_eq!(app.items[0].custom_prefix, "Browser");
+    }
+
+    #[test]
+    fn commit_tab_rename_empty_clears_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.items[0].custom_prefix = "Browser".to_string();
+        app.build_display_rows();
+
+        app.start_tab_rename(1);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "   ".to_string(); // whitespace only
+        }
+        app.commit_rename();
+        assert_eq!(app.items[0].custom_prefix, ""); // cleared
+    }
+
+    #[test]
+    fn cancel_tab_rename_preserves_prefix() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.items[0].custom_prefix = "Browser".to_string();
+        app.build_display_rows();
+
+        app.start_tab_rename(1);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "Something else".to_string();
+        }
+        app.cancel_rename();
+        assert_eq!(app.items[0].custom_prefix, "Browser"); // unchanged
     }
 
     // ── find_item ──
@@ -2445,5 +2978,334 @@ mod tests {
         assert_eq!(app.display_row_to_slot_position(0), 0); // before header → slot 0
         assert_eq!(app.display_row_to_slot_position(3), 1); // before Window(3) → slot 1
         assert_eq!(app.display_row_to_slot_position(4), 2); // past end → slot 2
+    }
+
+    // ── geometry persistence ──
+
+    #[test]
+    fn geometry_round_trip() {
+        let dir = std::env::temp_dir().join("ptm_test_geom_rt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = geometry_path_in(&dir);
+
+        save_geometry_to(&path, 100, 200, 300, 400);
+        let loaded = load_geometry_from(&path);
+        assert_eq!(loaded, Some((100, 200, 300, 400)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn geometry_negative_coords() {
+        let dir = std::env::temp_dir().join("ptm_test_geom_neg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = geometry_path_in(&dir);
+
+        save_geometry_to(&path, -50, -100, 250, 600);
+        let loaded = load_geometry_from(&path);
+        assert_eq!(loaded, Some((-50, -100, 250, 600)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn geometry_missing_file_returns_none() {
+        let dir = std::env::temp_dir().join("ptm_test_geom_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = geometry_path_in(&dir);
+
+        assert_eq!(load_geometry_from(&path), None);
+    }
+
+    #[test]
+    fn geometry_malformed_file_returns_none() {
+        let dir = std::env::temp_dir().join("ptm_test_geom_bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = geometry_path_in(&dir);
+
+        std::fs::write(&path, "not valid geometry\n").unwrap();
+        assert_eq!(load_geometry_from(&path), None);
+
+        std::fs::write(&path, "1 2 3\n").unwrap();
+        assert_eq!(load_geometry_from(&path), None);
+
+        std::fs::write(&path, "1 2 3 4 5\n").unwrap();
+        assert_eq!(load_geometry_from(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Group persistence ──
+
+    fn groups_path_in(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("groups")
+    }
+
+    fn add_item_with_class(app: &mut App, wid: u32, label: &str, wm_class: &str) {
+        app.items.push(Item {
+            wid,
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+        });
+        app.display_order.push(DisplaySlot::Window(wid));
+    }
+
+    #[test]
+    fn groups_save_load_round_trip() {
+        let dir = std::env::temp_dir().join("ptm_test_groups_rt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = groups_path_in(&dir);
+
+        let groups = vec![
+            SavedGroup {
+                name: "Browsers".to_string(),
+                collapsed: true,
+                members: vec![
+                    SavedMember {
+                        label: "Firefox".to_string(),
+                        wm_class: "Navigator".to_string(),
+                        custom_prefix: "FF".to_string(),
+                    },
+                    SavedMember {
+                        label: "Chrome".to_string(),
+                        wm_class: "google-chrome".to_string(),
+                        custom_prefix: String::new(),
+                    },
+                ],
+            },
+            SavedGroup {
+                name: "Terminals".to_string(),
+                collapsed: false,
+                members: vec![SavedMember {
+                    label: "Terminal".to_string(),
+                    wm_class: "gnome-terminal-server".to_string(),
+                    custom_prefix: "Dev".to_string(),
+                }],
+            },
+        ];
+
+        save_groups_to(&path, &groups);
+        let loaded = load_groups_from(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Browsers");
+        assert!(loaded[0].collapsed);
+        assert_eq!(loaded[0].members.len(), 2);
+        assert_eq!(loaded[0].members[0].label, "Firefox");
+        assert_eq!(loaded[0].members[0].wm_class, "Navigator");
+        assert_eq!(loaded[0].members[0].custom_prefix, "FF");
+        assert_eq!(loaded[0].members[1].label, "Chrome");
+        assert_eq!(loaded[0].members[1].custom_prefix, "");
+        assert_eq!(loaded[1].name, "Terminals");
+        assert!(!loaded[1].collapsed);
+        assert_eq!(loaded[1].members.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn groups_load_missing_file_returns_none() {
+        let dir = std::env::temp_dir().join("ptm_test_groups_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = groups_path_in(&dir);
+        assert!(load_groups_from(&path).is_none());
+    }
+
+    #[test]
+    fn groups_load_malformed_returns_none() {
+        let dir = std::env::temp_dir().join("ptm_test_groups_bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = groups_path_in(&dir);
+
+        // Wrong version
+        std::fs::write(&path, "v2\nGROUP\tFoo\t0\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        // Bad collapsed value
+        std::fs::write(&path, "v1\nGROUP\tFoo\t2\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        // MEMBER before any GROUP
+        std::fs::write(&path, "v1\nMEMBER\tFoo\tbar\t\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        // Wrong number of fields in GROUP
+        std::fs::write(&path, "v1\nGROUP\tFoo\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        // Wrong number of fields in MEMBER
+        std::fs::write(&path, "v1\nGROUP\tFoo\t0\nMEMBER\tBar\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        // Unknown line type
+        std::fs::write(&path, "v1\nGROUP\tFoo\t0\nBADLINE\n").unwrap();
+        assert!(load_groups_from(&path).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_saved_state_from_app() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 1, "Firefox", "Navigator");
+        add_item_with_class(&mut app, 2, "Terminal", "gnome-terminal");
+        add_item_with_class(&mut app, 3, "Code", "code");
+        app.items[0].custom_prefix = "FF".to_string();
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // Group 0 has windows 1, 2; window 3 is ungrouped
+
+        let saved = extract_saved_state(&app);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Group 1");
+        assert!(!saved[0].collapsed);
+        assert_eq!(saved[0].members.len(), 2);
+        assert_eq!(saved[0].members[0].label, "Firefox");
+        assert_eq!(saved[0].members[0].wm_class, "Navigator");
+        assert_eq!(saved[0].members[0].custom_prefix, "FF");
+        assert_eq!(saved[0].members[1].label, "Terminal");
+        assert_eq!(saved[0].members[1].wm_class, "gnome-terminal");
+    }
+
+    #[test]
+    fn restore_groups_basic() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Firefox", "Navigator");
+        add_item_with_class(&mut app, 20, "Terminal", "gnome-terminal");
+        add_item_with_class(&mut app, 30, "Code", "code");
+
+        let saved = vec![SavedGroup {
+            name: "Browsers".to_string(),
+            collapsed: true,
+            members: vec![SavedMember {
+                label: "Firefox".to_string(),
+                wm_class: "Navigator".to_string(),
+                custom_prefix: String::new(),
+            }],
+        }];
+
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].name, "Browsers");
+        assert!(app.groups[0].collapsed);
+        assert_eq!(app.groups[0].member_wids, vec![10]);
+        // display_order: Group first, then ungrouped windows
+        assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
+        assert!(matches!(app.display_order[1], DisplaySlot::Window(20)));
+        assert!(matches!(app.display_order[2], DisplaySlot::Window(30)));
+    }
+
+    #[test]
+    fn restore_groups_partial_match() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Firefox", "Navigator");
+        add_item_with_class(&mut app, 20, "Code", "code");
+
+        let saved = vec![SavedGroup {
+            name: "Dev".to_string(),
+            collapsed: false,
+            members: vec![
+                SavedMember {
+                    label: "Firefox".to_string(),
+                    wm_class: "Navigator".to_string(),
+                    custom_prefix: String::new(),
+                },
+                SavedMember {
+                    label: "Terminal".to_string(),
+                    wm_class: "gnome-terminal".to_string(),
+                    custom_prefix: String::new(),
+                },
+                SavedMember {
+                    label: "Code".to_string(),
+                    wm_class: "code".to_string(),
+                    custom_prefix: String::new(),
+                },
+            ],
+        }];
+
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].member_wids, vec![10, 20]); // Terminal not found
+    }
+
+    #[test]
+    fn restore_groups_no_match_skips_group() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Firefox", "Navigator");
+
+        let saved = vec![SavedGroup {
+            name: "Gone".to_string(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "Terminal".to_string(),
+                wm_class: "gnome-terminal".to_string(),
+                custom_prefix: String::new(),
+            }],
+        }];
+
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 0);
+        assert!(matches!(app.display_order[0], DisplaySlot::Window(10)));
+    }
+
+    #[test]
+    fn restore_groups_duplicate_titles_different_class() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Terminal", "gnome-terminal");
+        add_item_with_class(&mut app, 20, "Terminal", "xterm");
+
+        let saved = vec![SavedGroup {
+            name: "Terms".to_string(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "Terminal".to_string(),
+                wm_class: "xterm".to_string(),
+                custom_prefix: String::new(),
+            }],
+        }];
+
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].member_wids, vec![20]); // matched xterm, not gnome-terminal
+    }
+
+    #[test]
+    fn restore_groups_custom_prefix() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Firefox", "Navigator");
+        add_item_with_class(&mut app, 20, "Terminal", "gnome-terminal");
+
+        let saved = vec![SavedGroup {
+            name: "Dev".to_string(),
+            collapsed: false,
+            members: vec![
+                SavedMember {
+                    label: "Firefox".to_string(),
+                    wm_class: "Navigator".to_string(),
+                    custom_prefix: "Browser".to_string(),
+                },
+                SavedMember {
+                    label: "Terminal".to_string(),
+                    wm_class: "gnome-terminal".to_string(),
+                    custom_prefix: String::new(),
+                },
+            ],
+        }];
+
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.items[0].custom_prefix, "Browser");
+        assert_eq!(app.items[1].custom_prefix, ""); // empty prefix not overwritten
     }
 }

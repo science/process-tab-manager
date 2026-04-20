@@ -6,10 +6,12 @@ Vertical sidebar for managing application windows on Linux/X11. Pure X11 via x11
 
 ```bash
 source "$HOME/.cargo/env"
-CARGO_TARGET_DIR=/tmp/ptm-target cargo test                    # 25 unit tests, no display needed
-CARGO_TARGET_DIR=/tmp/ptm-target cargo build --release          # Build binary
-DISPLAY=:0 /tmp/ptm-target/release/ptm                         # Run (needs X11 desktop)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                       # 25 unit tests, no display needed
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo build --release             # Build dev binary
+DISPLAY=:0 /tmp/ptm-dev/release/ptm                             # Run (needs X11 desktop)
 ```
+
+**Dev vs production**: Dev builds use `/tmp/ptm-dev`. The installed launcher (`install.sh`) uses `/tmp/ptm-target`. This keeps `cargo build` during development from overwriting the production binary.
 
 ## Project Structure
 
@@ -65,7 +67,7 @@ If Cinnamon crashes or becomes unresponsive:
 ### Environment notes
 
 - **DISPLAY=:0** — all GUI commands need this when running from a non-GUI terminal (SSH, tmux)
-- **CARGO_TARGET_DIR=/tmp/ptm-target** — required for builds; virtiofs mount doesn't support exec
+- **CARGO_TARGET_DIR=/tmp/ptm-dev** — dev builds; `/tmp/ptm-target` is reserved for the installed production binary via `install.sh`. Both needed because virtiofs mount doesn't support exec
 - **sudo** uses fingerprint GUI popup (works from Claude Code shell)
 - **git/gh** auth is configured for account `science` (the origin account)
 

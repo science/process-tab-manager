@@ -19,13 +19,19 @@ Linux taskbars are horizontal, icon-based, and treat all windows equally. If you
 
 ## Building
 
-Requires Rust and X11 development headers.
+Requires Rust and X11 development headers. `tmux` is an optional runtime dependency — install it to get the session-marker dot next to tmux-backed windows; PTM runs fine without it.
 
 ```bash
 cargo build --release
 ```
 
 The binary is at `target/release/ptm`.
+
+To install the binary, icon, and desktop entry into `~/.local/` (and install tmux if missing):
+
+```bash
+./install.sh
+```
 
 ## Running
 

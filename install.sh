@@ -6,6 +6,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.local/bin"
 
+# Runtime dependency: tmux is used to mark windows that are attached to a
+# tmux session (green dot on the row). PTM runs without it — the marker is
+# just inactive — but this machine will usually want it installed.
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux not found (used for session-marker detection)."
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "Installing tmux via apt..."
+        if ! sudo apt-get install -y tmux; then
+            echo "warning: tmux install failed — session detection will be disabled"
+        fi
+    else
+        echo "warning: no apt-get on PATH; install tmux manually to enable session detection"
+    fi
+fi
+
 # Build release binary
 source "$HOME/.cargo/env"
 echo "Building ptm..."

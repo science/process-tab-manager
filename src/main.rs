@@ -193,6 +193,7 @@ struct App {
     width: u16,
     height: u16,
     our_wid: u32,
+    subscribed_wids: HashSet<u32>,
 }
 
 impl App {
@@ -213,6 +214,7 @@ impl App {
             width: WIN_W,
             height: WIN_H,
             our_wid,
+            subscribed_wids: HashSet::new(),
         }
     }
 
@@ -918,6 +920,16 @@ fn refresh_items(
 
         live_wids.insert(wid);
 
+        // Subscribe to property changes on this window once, so title edits
+        // and other updates land in the main event loop without polling.
+        if !app.subscribed_wids.contains(&wid) {
+            let _ = conn.change_window_attributes(
+                wid,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            );
+            app.subscribed_wids.insert(wid);
+        }
+
         let title = get_window_title(conn, wid, atoms).unwrap_or_default();
         let (_instance, class) = get_wm_class(conn, wid).unwrap_or_default();
         let display = if title.is_empty() { class.clone() } else { title };
@@ -945,6 +957,11 @@ fn refresh_items(
     for group in &mut app.groups {
         group.member_wids.retain(|w| live_wids.contains(w));
     }
+
+    // Drop subscription bookkeeping for wids that have gone away.
+    // (X11 already stopped delivering events for the destroyed window; we just
+    // prune our HashSet so a wid that's later re-used gets a fresh subscribe.)
+    app.subscribed_wids.retain(|w| live_wids.contains(w));
 
     // Remove dead entries from display_order
     app.display_order.retain(|slot| match slot {
@@ -978,6 +995,38 @@ fn refresh_items(
     app.items = new_items;
     app.build_display_rows();
     Ok(())
+}
+
+// ── Property-change classification (pure, testable) ──
+
+#[derive(Debug, PartialEq, Eq)]
+enum PropertyAction {
+    RefreshClientList,
+    UpdateActiveWindow,
+    UpdateWindowTitle,
+    Ignore,
+}
+
+fn classify_property_event(
+    atom: u32,
+    is_root: bool,
+    net_client_list: u32,
+    net_active_window: u32,
+    net_wm_name: u32,
+) -> PropertyAction {
+    if is_root {
+        if atom == net_client_list {
+            PropertyAction::RefreshClientList
+        } else if atom == net_active_window {
+            PropertyAction::UpdateActiveWindow
+        } else {
+            PropertyAction::Ignore
+        }
+    } else if atom == net_wm_name || atom == u32::from(AtomEnum::WM_NAME) {
+        PropertyAction::UpdateWindowTitle
+    } else {
+        PropertyAction::Ignore
+    }
 }
 
 // ── Helpers ──
@@ -2032,6 +2081,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let atoms = Atoms::new(&conn)?;
 
+    // Subscribe to property changes on the root window so we're notified
+    // when _NET_CLIENT_LIST, _NET_ACTIVE_WINDOW, etc. change — this is how
+    // PTM learns about new/closed/focused windows without polling.
+    conn.change_window_attributes(
+        root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?;
+
     let window: Window = conn.generate_id()?;
     let event_mask = EventMask::BUTTON_PRESS
         | EventMask::BUTTON_RELEASE
@@ -2104,11 +2161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         restore_groups(&mut app, &saved);
     }
 
-    let mut event_count: u32 = 0;
-
     loop {
         let event = conn.wait_for_event()?;
-        event_count = event_count.wrapping_add(1);
 
         // Handle WM_DELETE_WINDOW in any mode
         if let Event::ClientMessage(ev) = &event {
@@ -2119,9 +2173,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Refresh periodically (skip during drag or menu)
-        if event_count % 50 == 0 && app.drag.is_none() && app.context_menu.is_none() && app.rename.is_none() {
-            refresh_items(&conn, root, &atoms, &mut app, colormap)?;
+        // Event-driven refresh: react to PropertyNotify before mode dispatch.
+        // Handled here so menu/rename/drag states stay consistent.
+        if let Event::PropertyNotify(ev) = &event {
+            let action = classify_property_event(
+                ev.atom,
+                ev.window == root,
+                atoms.net_client_list,
+                atoms.net_active_window,
+                atoms.net_wm_name,
+            );
+            match action {
+                PropertyAction::RefreshClientList => {
+                    // Skip full refresh while the user is mid-gesture — the next
+                    // PropertyNotify (or the gesture's completion) will catch up.
+                    if app.drag.is_none()
+                        && app.context_menu.is_none()
+                        && app.rename.is_none()
+                    {
+                        refresh_items(&conn, root, &atoms, &mut app, colormap)?;
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                PropertyAction::UpdateActiveWindow => {
+                    app.active_wid =
+                        get_active_window(&conn, root, &atoms).unwrap_or(None);
+                    if app.context_menu.is_none() && app.rename.is_none() {
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                PropertyAction::UpdateWindowTitle => {
+                    if let Some(item) = app.items.iter_mut().find(|i| i.wid == ev.window) {
+                        if let Ok(t) = get_window_title(&conn, ev.window, &atoms) {
+                            if !t.is_empty() {
+                                item.label = t;
+                            }
+                        }
+                    }
+                    if app.drag.is_none()
+                        && app.context_menu.is_none()
+                        && app.rename.is_none()
+                    {
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                PropertyAction::Ignore => {}
+            }
+            continue;
         }
 
         // ── Context menu mode (pointer grab routes events here) ──
@@ -3307,5 +3405,64 @@ mod tests {
 
         assert_eq!(app.items[0].custom_prefix, "Browser");
         assert_eq!(app.items[1].custom_prefix, ""); // empty prefix not overwritten
+    }
+
+    // ── Property-change classification ──
+
+    #[test]
+    fn classify_property_root_client_list() {
+        assert_eq!(
+            classify_property_event(100, true, 100, 101, 102),
+            PropertyAction::RefreshClientList
+        );
+    }
+
+    #[test]
+    fn classify_property_root_active_window() {
+        assert_eq!(
+            classify_property_event(101, true, 100, 101, 102),
+            PropertyAction::UpdateActiveWindow
+        );
+    }
+
+    #[test]
+    fn classify_property_window_net_wm_name() {
+        assert_eq!(
+            classify_property_event(102, false, 100, 101, 102),
+            PropertyAction::UpdateWindowTitle
+        );
+    }
+
+    #[test]
+    fn classify_property_window_legacy_wm_name() {
+        assert_eq!(
+            classify_property_event(u32::from(AtomEnum::WM_NAME), false, 100, 101, 102),
+            PropertyAction::UpdateWindowTitle
+        );
+    }
+
+    #[test]
+    fn classify_property_ignores_unknown_root_atom() {
+        assert_eq!(
+            classify_property_event(999, true, 100, 101, 102),
+            PropertyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_property_ignores_unknown_window_atom() {
+        assert_eq!(
+            classify_property_event(999, false, 100, 101, 102),
+            PropertyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_property_wm_name_on_root_is_ignored() {
+        // _NET_WM_NAME on the root window is not the taskbar signal we care about
+        assert_eq!(
+            classify_property_event(102, true, 100, 101, 102),
+            PropertyAction::Ignore
+        );
     }
 }

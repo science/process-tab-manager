@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -34,6 +34,7 @@ const MENU_BG_COLOR: u32 = 0x21252b;
 const MENU_BORDER_COLOR: u32 = 0x3e4451;
 const MENU_HOVER_COLOR: u32 = 0x2c313a;
 const GROUP_HEADER_COLOR: u32 = 0x21252b;
+const SESSION_MARKER_COLOR: u32 = 0x98c379; // OneDark green — tmux-backed window indicator
 
 // Accent colors for left-edge stripe (OneDark)
 const ACCENT_COLORS: &[u32] = &[0xe06c75, 0x98c379, 0x61afef, 0xc678dd, 0xe5c07b, 0x56b6c2];
@@ -55,6 +56,7 @@ struct Atoms {
     net_wm_window_type_normal: Atom,
     wm_protocols: Atom,
     wm_delete_window: Atom,
+    net_wm_pid: Atom,
 }
 
 impl Atoms {
@@ -71,6 +73,7 @@ impl Atoms {
         let c9 = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_NORMAL")?;
         let c10 = conn.intern_atom(false, b"WM_PROTOCOLS")?;
         let c11 = conn.intern_atom(false, b"WM_DELETE_WINDOW")?;
+        let c12 = conn.intern_atom(false, b"_NET_WM_PID")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -84,6 +87,7 @@ impl Atoms {
             net_wm_window_type_normal: c9.reply()?.atom,
             wm_protocols: c10.reply()?.atom,
             wm_delete_window: c11.reply()?.atom,
+            net_wm_pid: c12.reply()?.atom,
         })
     }
 }
@@ -97,6 +101,7 @@ struct Item {
     wm_class: String,
     accent_pixel: u32,
     custom_prefix: String,
+    session: Option<String>,
 }
 
 impl Item {
@@ -627,6 +632,24 @@ fn get_active_window(
     }
 }
 
+fn get_window_pid(conn: &impl Connection, wid: u32, atoms: &Atoms) -> Option<u32> {
+    let reply = conn
+        .get_property(false, wid, atoms.net_wm_pid, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.value.len() >= 4 {
+        Some(u32::from_le_bytes([
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
+        ]))
+    } else {
+        None
+    }
+}
+
 fn get_window_title(
     conn: &impl Connection,
     wid: u32,
@@ -901,6 +924,7 @@ fn refresh_items(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wids = get_client_list(conn, root, atoms)?;
     let current_desktop = get_current_desktop(conn, root, atoms).unwrap_or(0);
+    let tmux_clients = list_tmux_clients();
 
     let mut live_wids = HashSet::new();
     let mut new_items = Vec::new();
@@ -944,12 +968,27 @@ fn refresh_items(
             .find(|i| i.wid == wid)
             .map(|i| i.custom_prefix.clone())
             .unwrap_or_default();
+
+        let session = if tmux_clients.is_empty() {
+            None
+        } else {
+            match get_window_pid(conn, wid, atoms) {
+                Some(pid) => {
+                    let mut pids = vec![pid];
+                    pids.extend(process_descendants(pid));
+                    detect_tmux_session(&pids, &tmux_clients)
+                }
+                None => None,
+            }
+        };
+
         new_items.push(Item {
             wid,
             label: display,
             wm_class: class,
             accent_pixel,
             custom_prefix,
+            session,
         });
     }
 
@@ -995,6 +1034,91 @@ fn refresh_items(
     app.items = new_items;
     app.build_display_rows();
     Ok(())
+}
+
+// ── tmux session detection ──
+//
+// Strategy: find each window's root PID via _NET_WM_PID, then check whether
+// any process in its descendant tree is a tmux client. Tmux clients are
+// discovered by parsing `tmux list-clients -F '#{client_pid} #{session_name}'`,
+// which also tells us the session name directly. No reliance on scanning
+// /proc/<pid>/comm strings — the tmux-reported PID is authoritative.
+
+fn parse_tmux_list_clients(stdout: &str) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((pid_str, name)) = line.split_once(char::is_whitespace) {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                let name = name.trim();
+                if !name.is_empty() {
+                    map.insert(pid, name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn parse_proc_children(s: &str) -> Vec<u32> {
+    s.split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok())
+        .collect()
+}
+
+fn detect_tmux_session(
+    pids_to_check: &[u32],
+    clients: &HashMap<u32, String>,
+) -> Option<String> {
+    pids_to_check
+        .iter()
+        .find_map(|p| clients.get(p).cloned())
+}
+
+fn list_tmux_clients() -> HashMap<u32, String> {
+    match std::process::Command::new("tmux")
+        .args(["list-clients", "-F", "#{client_pid} #{session_name}"])
+        .output()
+    {
+        Ok(o) => parse_tmux_list_clients(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => HashMap::new(),
+    }
+}
+
+// Return descendants of `root_pid` as discovered via /proc/<pid>/task/<tid>/children.
+// Walks all tids under the parent so children spawned from non-main threads
+// are still found. Bounded by a `seen` set so loops can't hang us.
+fn process_descendants(root_pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut queue = vec![root_pid];
+    let mut seen = HashSet::new();
+    while let Some(pid) = queue.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let task_dir = format!("/proc/{}/task", pid);
+        let Ok(entries) = std::fs::read_dir(&task_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(tid) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            let children_path = format!("/proc/{}/task/{}/children", pid, tid);
+            if let Ok(s) = std::fs::read_to_string(&children_path) {
+                for child in parse_proc_children(&s) {
+                    if !seen.contains(&child) {
+                        queue.push(child);
+                        out.push(child);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Property-change classification (pure, testable) ──
@@ -1066,6 +1190,7 @@ struct Renderer {
     menu_hover_pixel: u32,
     group_header_pixel: u32,
     group_color_pixels: Vec<u32>,
+    session_marker_pixel: u32,
 }
 
 impl Renderer {
@@ -1090,6 +1215,7 @@ impl Renderer {
         let menu_border_pixel = alloc_color(conn, colormap, MENU_BORDER_COLOR)?;
         let menu_hover_pixel = alloc_color(conn, colormap, MENU_HOVER_COLOR)?;
         let group_header_pixel = alloc_color(conn, colormap, GROUP_HEADER_COLOR)?;
+        let session_marker_pixel = alloc_color(conn, colormap, SESSION_MARKER_COLOR)?;
 
         let mut group_color_pixels = Vec::new();
         for &c in GROUP_COLORS {
@@ -1140,6 +1266,7 @@ impl Renderer {
             menu_hover_pixel,
             group_header_pixel,
             group_color_pixels,
+            session_marker_pixel,
         })
     }
 
@@ -1332,16 +1459,45 @@ impl Renderer {
             }],
         )?;
 
+        // Reserve right-side space for the session marker if present,
+        // so the label truncates cleanly instead of overlapping the dot.
+        let marker_reserve: i16 = if item.session.is_some() { 14 } else { 0 };
+
         // Label
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = x + 8;
         let text_y = y + (h as i16 / 2) + 4;
-        let max_chars = ((w as i16 - 12) / CHAR_WIDTH).max(0) as usize;
+        let max_chars = ((w as i16 - 12 - marker_reserve) / CHAR_WIDTH).max(0) as usize;
         let full_label = item.display_label();
         let display: String = full_label.chars().take(max_chars).collect();
         if !display.is_empty() {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
+
+        // Session marker: small filled circle on the right edge when this
+        // window is attached to a tmux session.
+        if item.session.is_some() {
+            let marker_size: u16 = 6;
+            let marker_x = x + w as i16 - marker_size as i16 - 6;
+            let marker_y = y + (h as i16 - marker_size as i16) / 2;
+            conn.change_gc(
+                self.gc,
+                &ChangeGCAux::new().foreground(self.session_marker_pixel),
+            )?;
+            conn.poly_fill_arc(
+                drawable,
+                self.gc,
+                &[Arc {
+                    x: marker_x,
+                    y: marker_y,
+                    width: marker_size,
+                    height: marker_size,
+                    angle1: 0,
+                    angle2: 360 * 64,
+                }],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -2566,6 +2722,7 @@ mod tests {
             wm_class: "test".to_string(),
             accent_pixel: 0,
             custom_prefix: String::new(),
+            session: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -3149,6 +3306,7 @@ mod tests {
             wm_class: wm_class.to_string(),
             accent_pixel: 0,
             custom_prefix: String::new(),
+            session: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -3463,6 +3621,104 @@ mod tests {
         assert_eq!(
             classify_property_event(102, true, 100, 101, 102),
             PropertyAction::Ignore
+        );
+    }
+
+    // ── tmux detection (pure helpers) ──
+
+    #[test]
+    fn parse_tmux_list_clients_empty() {
+        assert!(parse_tmux_list_clients("").is_empty());
+    }
+
+    #[test]
+    fn parse_tmux_list_clients_basic() {
+        let input = "1234 main\n5678 dev-work\n";
+        let m = parse_tmux_list_clients(input);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&1234).map(String::as_str), Some("main"));
+        assert_eq!(m.get(&5678).map(String::as_str), Some("dev-work"));
+    }
+
+    #[test]
+    fn parse_tmux_list_clients_session_with_spaces() {
+        // tmux allows session names with spaces; split on first whitespace only
+        let input = "1234 my cool session\n";
+        let m = parse_tmux_list_clients(input);
+        assert_eq!(m.get(&1234).map(String::as_str), Some("my cool session"));
+    }
+
+    #[test]
+    fn parse_tmux_list_clients_skips_blank_lines() {
+        let input = "\n1234 main\n\n\n5678 dev\n";
+        let m = parse_tmux_list_clients(input);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn parse_tmux_list_clients_skips_malformed() {
+        // Missing session name, non-numeric PID, etc. — drop silently.
+        let input = "notanum main\n1234\n5678 ok\n";
+        let m = parse_tmux_list_clients(input);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&5678).map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn parse_proc_children_empty() {
+        assert!(parse_proc_children("").is_empty());
+        assert!(parse_proc_children("   \n").is_empty());
+    }
+
+    #[test]
+    fn parse_proc_children_basic() {
+        // /proc/<pid>/task/<tid>/children is space-separated PIDs on one line
+        assert_eq!(parse_proc_children("1234 5678 9012"), vec![1234, 5678, 9012]);
+        assert_eq!(parse_proc_children("1234\n"), vec![1234]);
+    }
+
+    #[test]
+    fn detect_tmux_session_direct_match() {
+        let mut clients = HashMap::new();
+        clients.insert(1234, "dev".to_string());
+        assert_eq!(detect_tmux_session(&[1234], &clients), Some("dev".into()));
+    }
+
+    #[test]
+    fn detect_tmux_session_descendant_match() {
+        let mut clients = HashMap::new();
+        clients.insert(9999, "work".to_string());
+        // win_pid + two descendants; the last is the tmux client.
+        assert_eq!(
+            detect_tmux_session(&[1234, 5678, 9999], &clients),
+            Some("work".into())
+        );
+    }
+
+    #[test]
+    fn detect_tmux_session_no_match() {
+        let mut clients = HashMap::new();
+        clients.insert(42, "other".to_string());
+        assert_eq!(detect_tmux_session(&[1234, 5678], &clients), None);
+    }
+
+    #[test]
+    fn detect_tmux_session_empty_clients() {
+        let clients: HashMap<u32, String> = HashMap::new();
+        assert_eq!(detect_tmux_session(&[1234], &clients), None);
+    }
+
+    #[test]
+    fn detect_tmux_session_first_match_wins() {
+        // If multiple PIDs in the chain are clients (rare — nested tmux),
+        // the shallowest one should win. Caller passes win_pid first, so
+        // the first entry in pids is the closest to the terminal window.
+        let mut clients = HashMap::new();
+        clients.insert(1234, "outer".to_string());
+        clients.insert(5678, "inner".to_string());
+        assert_eq!(
+            detect_tmux_session(&[1234, 5678], &clients),
+            Some("outer".into())
         );
     }
 }

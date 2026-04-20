@@ -144,6 +144,9 @@ enum MenuAction {
     RenameGroup,
     DeleteGroup,
     RenameTab,
+    AttachSession,
+    RenameSession,
+    KillSession,
 }
 
 struct MenuEntry {
@@ -175,6 +178,7 @@ struct DragState {
 enum RenameTarget {
     Group(u32),
     Window(u32),
+    Session(String), // rename a tmux session via `tmux rename-session`
 }
 
 struct RenameState {
@@ -390,6 +394,16 @@ impl App {
         });
     }
 
+    fn start_session_rename(&mut self, session_name: &str) {
+        let text = session_name.to_string();
+        let cursor = text.len();
+        self.rename = Some(RenameState {
+            target: RenameTarget::Session(session_name.to_string()),
+            text,
+            cursor,
+        });
+    }
+
     fn start_tab_rename(&mut self, wid: u32) {
         let text = self
             .items
@@ -424,6 +438,32 @@ impl App {
                         self.items.iter_mut().find(|i| i.wid == wid)
                     {
                         item.custom_prefix = prefix;
+                    }
+                }
+                RenameTarget::Session(old) => {
+                    let new_name = rs.text.trim().to_string();
+                    if new_name.is_empty() || new_name == old {
+                        return;
+                    }
+                    // Ask tmux to rename the session. If it fails (bad name,
+                    // collision, server gone), leave the UI unchanged and
+                    // let the next refresh reconcile with reality.
+                    let ok = std::process::Command::new("tmux")
+                        .args(["rename-session", "-t", &old, &new_name])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if ok {
+                        // Rewrite the slot in-place so the row keeps its
+                        // position in display_order across the next refresh.
+                        for slot in &mut self.display_order {
+                            if let DisplaySlot::Session(n) = slot {
+                                if *n == old {
+                                    *n = new_name.clone();
+                                }
+                            }
+                        }
+                        self.build_display_rows();
                     }
                 }
             }
@@ -1553,12 +1593,15 @@ impl Renderer {
 
         // Draw rename overlay (draws on top of the target row)
         if let Some(ref rs) = app.rename {
-            let row_idx = match rs.target {
+            let row_idx = match &rs.target {
                 RenameTarget::Group(gid) => app.display_rows.iter().position(
-                    |r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == gid),
+                    |r| matches!(r, DisplayRow::GroupHeader { group_id } if group_id == gid),
                 ),
                 RenameTarget::Window(wid) => app.display_rows.iter().position(
-                    |r| matches!(r, DisplayRow::Window { wid: w, .. } if *w == wid),
+                    |r| matches!(r, DisplayRow::Window { wid: w, .. } if w == wid),
+                ),
+                RenameTarget::Session(name) => app.display_rows.iter().position(
+                    |r| matches!(r, DisplayRow::Session { name: n, .. } if n == name),
                 ),
             };
             if let Some(row_idx) = row_idx {
@@ -2083,8 +2126,20 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
             entries
         }
         DisplayRow::Session { .. } => {
-            // Session menu entries land in Stage C.3.
-            vec![]
+            vec![
+                MenuEntry {
+                    label: "Attach".to_string(),
+                    action: MenuAction::AttachSession,
+                },
+                MenuEntry {
+                    label: "Rename Session".to_string(),
+                    action: MenuAction::RenameSession,
+                },
+                MenuEntry {
+                    label: "Kill Session".to_string(),
+                    action: MenuAction::KillSession,
+                },
+            ]
         }
     }
 }
@@ -2267,6 +2322,29 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
         MenuAction::RenameTab => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
                 app.start_tab_rename(*wid);
+            }
+        }
+        MenuAction::AttachSession => {
+            if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
+                spawn_attach_terminal(name);
+            }
+        }
+        MenuAction::RenameSession => {
+            if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
+                app.start_session_rename(&name.clone());
+            }
+        }
+        MenuAction::KillSession => {
+            if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", name])
+                    .status();
+                // Optimistically drop the slot; next refresh will re-confirm.
+                let target = name.clone();
+                app.display_order.retain(|s| {
+                    !matches!(s, DisplaySlot::Session(n) if *n == target)
+                });
+                app.build_display_rows();
             }
         }
     }
@@ -4309,6 +4387,49 @@ mod tests {
     fn terminal_argv_for_attach_empty_term_returns_empty() {
         let argv = terminal_argv_for_attach(&[], "demo");
         assert!(argv.is_empty());
+    }
+
+    // ── Session context menu + inline rename ──
+
+    fn push_session(app: &mut App, name: &str) {
+        app.display_order
+            .push(DisplaySlot::Session(name.to_string()));
+        app.build_display_rows();
+    }
+
+    #[test]
+    fn menu_for_session_has_attach_rename_kill() {
+        let mut app = make_app();
+        push_session(&mut app, "demo");
+        let entries = build_menu_entries(&app, 0);
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0].action, MenuAction::AttachSession));
+        assert!(matches!(entries[1].action, MenuAction::RenameSession));
+        assert!(matches!(entries[2].action, MenuAction::KillSession));
+    }
+
+    #[test]
+    fn start_session_rename_initializes_with_current_name() {
+        let mut app = make_app();
+        app.start_session_rename("my-session");
+        let rs = app.rename.as_ref().expect("rename state should be set");
+        assert_eq!(rs.text, "my-session");
+        assert_eq!(rs.cursor, "my-session".len());
+        assert!(matches!(&rs.target, RenameTarget::Session(n) if n == "my-session"));
+    }
+
+    #[test]
+    fn cancel_session_rename_preserves_display_order() {
+        let mut app = make_app();
+        push_session(&mut app, "demo");
+        app.start_session_rename("demo");
+        // User types then presses escape.
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "renamed".to_string();
+        }
+        app.cancel_rename();
+        assert_eq!(app.display_order.len(), 1);
+        assert!(matches!(&app.display_order[0], DisplaySlot::Session(n) if n == "demo"));
     }
 
     // ── Header button hit-test ──

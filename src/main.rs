@@ -929,6 +929,7 @@ fn refresh_items(
     let mut live_wids = HashSet::new();
     let mut new_items = Vec::new();
     let mut color_idx = 0usize;
+    let mut pid_to_wid: HashMap<u32, u32> = HashMap::new();
 
     for wid in wids {
         if wid == app.our_wid {
@@ -969,18 +970,9 @@ fn refresh_items(
             .map(|i| i.custom_prefix.clone())
             .unwrap_or_default();
 
-        let session = if tmux_clients.is_empty() {
-            None
-        } else {
-            match get_window_pid(conn, wid, atoms) {
-                Some(pid) => {
-                    let mut pids = vec![pid];
-                    pids.extend(process_descendants(pid));
-                    detect_tmux_session(&pids, &tmux_clients)
-                }
-                None => None,
-            }
-        };
+        if let Some(pid) = get_window_pid(conn, wid, atoms) {
+            pid_to_wid.entry(pid).or_insert(wid);
+        }
 
         new_items.push(Item {
             wid,
@@ -988,8 +980,25 @@ fn refresh_items(
             wm_class: class,
             accent_pixel,
             custom_prefix,
-            session,
+            session: None,
         });
+    }
+
+    // Assign tmux sessions by walking UP from each tmux client's PID until
+    // we hit a pid that's a tracked window's _NET_WM_PID. This is the
+    // closest-window-to-client match — walking DOWN from a window's pid is
+    // wrong when many windows share a launcher pid (e.g. cinnamon-session),
+    // because the launcher's descendants include unrelated terminals too.
+    if !tmux_clients.is_empty() && !pid_to_wid.is_empty() {
+        for (&client_pid, session_name) in &tmux_clients {
+            if let Some(wid) =
+                walk_to_window_owner(client_pid, &pid_to_wid, read_ppid, 20)
+            {
+                if let Some(item) = new_items.iter_mut().find(|i| i.wid == wid) {
+                    item.session = Some(session_name.clone());
+                }
+            }
+        }
     }
 
     // Remove dead wids from groups
@@ -1038,11 +1047,18 @@ fn refresh_items(
 
 // ── tmux session detection ──
 //
-// Strategy: find each window's root PID via _NET_WM_PID, then check whether
-// any process in its descendant tree is a tmux client. Tmux clients are
-// discovered by parsing `tmux list-clients -F '#{client_pid} #{session_name}'`,
-// which also tells us the session name directly. No reliance on scanning
-// /proc/<pid>/comm strings — the tmux-reported PID is authoritative.
+// Strategy: ask tmux for its attached clients (PID + session name), then for
+// each client walk UP the /proc parent chain until we hit a PID that matches
+// some tracked window's _NET_WM_PID. That ancestor is the window hosting the
+// tmux client, so we tag it with the session name.
+//
+// The obvious alternative — walk DOWN from each window's _NET_WM_PID looking
+// for tmux-client PIDs — is wrong on desktops where the WM sets _NET_WM_PID
+// to a shared launcher process (e.g. cinnamon-session) for many windows.
+// The launcher's descendant tree contains every GUI app the user ever
+// launched, so every one of those windows would falsely match the tmux
+// client. Walking up from the client instead finds the CLOSEST owning
+// window and stops there.
 
 fn parse_tmux_list_clients(stdout: &str) -> HashMap<u32, String> {
     let mut map = HashMap::new();
@@ -1063,21 +1079,6 @@ fn parse_tmux_list_clients(stdout: &str) -> HashMap<u32, String> {
     map
 }
 
-fn parse_proc_children(s: &str) -> Vec<u32> {
-    s.split_whitespace()
-        .filter_map(|p| p.parse::<u32>().ok())
-        .collect()
-}
-
-fn detect_tmux_session(
-    pids_to_check: &[u32],
-    clients: &HashMap<u32, String>,
-) -> Option<String> {
-    pids_to_check
-        .iter()
-        .find_map(|p| clients.get(p).cloned())
-}
-
 fn list_tmux_clients() -> HashMap<u32, String> {
     match std::process::Command::new("tmux")
         .args(["list-clients", "-F", "#{client_pid} #{session_name}"])
@@ -1088,37 +1089,41 @@ fn list_tmux_clients() -> HashMap<u32, String> {
     }
 }
 
-// Return descendants of `root_pid` as discovered via /proc/<pid>/task/<tid>/children.
-// Walks all tids under the parent so children spawned from non-main threads
-// are still found. Bounded by a `seen` set so loops can't hang us.
-fn process_descendants(root_pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut queue = vec![root_pid];
-    let mut seen = HashSet::new();
-    while let Some(pid) = queue.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        let task_dir = format!("/proc/{}/task", pid);
-        let Ok(entries) = std::fs::read_dir(&task_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Some(tid) = entry.file_name().to_str().map(String::from) else {
-                continue;
-            };
-            let children_path = format!("/proc/{}/task/{}/children", pid, tid);
-            if let Ok(s) = std::fs::read_to_string(&children_path) {
-                for child in parse_proc_children(&s) {
-                    if !seen.contains(&child) {
-                        queue.push(child);
-                        out.push(child);
-                    }
-                }
-            }
+fn parse_proc_status_ppid(s: &str) -> Option<u32> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse::<u32>().ok();
         }
     }
-    out
+    None
+}
+
+fn read_ppid(pid: u32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    parse_proc_status_ppid(&s)
+}
+
+// Walk up from `start_pid` via `read_ppid_fn` until we hit a pid that exists
+// in `pid_to_wid`, or we hit init (ppid=1), or we run out of depth. Returns
+// the matched wid of the closest owning window, if any. Pure — the /proc
+// reader is injected so this can be tested without a running process tree.
+fn walk_to_window_owner(
+    start_pid: u32,
+    pid_to_wid: &HashMap<u32, u32>,
+    mut read_ppid_fn: impl FnMut(u32) -> Option<u32>,
+    max_depth: usize,
+) -> Option<u32> {
+    let mut cur = start_pid;
+    for _ in 0..max_depth {
+        if let Some(&w) = pid_to_wid.get(&cur) {
+            return Some(w);
+        }
+        match read_ppid_fn(cur) {
+            Some(ppid) if ppid > 1 => cur = ppid,
+            _ => return None,
+        }
+    }
+    None
 }
 
 // ── Property-change classification (pure, testable) ──
@@ -3664,61 +3669,92 @@ mod tests {
         assert_eq!(m.get(&5678).map(String::as_str), Some("ok"));
     }
 
+    // ── /proc/<pid>/status parsing ──
+
     #[test]
-    fn parse_proc_children_empty() {
-        assert!(parse_proc_children("").is_empty());
-        assert!(parse_proc_children("   \n").is_empty());
+    fn parse_proc_status_ppid_basic() {
+        let s = "Name:\ttmux: client\nState:\tS (sleeping)\nTgid:\t300\nPid:\t300\nPPid:\t483411\nUid:\t1000\n";
+        assert_eq!(parse_proc_status_ppid(s), Some(483411));
     }
 
     #[test]
-    fn parse_proc_children_basic() {
-        // /proc/<pid>/task/<tid>/children is space-separated PIDs on one line
-        assert_eq!(parse_proc_children("1234 5678 9012"), vec![1234, 5678, 9012]);
-        assert_eq!(parse_proc_children("1234\n"), vec![1234]);
+    fn parse_proc_status_ppid_missing() {
+        assert_eq!(parse_proc_status_ppid("Name:\tfoo\nState:\tR\n"), None);
+        assert_eq!(parse_proc_status_ppid(""), None);
     }
 
     #[test]
-    fn detect_tmux_session_direct_match() {
-        let mut clients = HashMap::new();
-        clients.insert(1234, "dev".to_string());
-        assert_eq!(detect_tmux_session(&[1234], &clients), Some("dev".into()));
+    fn parse_proc_status_ppid_malformed() {
+        assert_eq!(parse_proc_status_ppid("PPid:\tnotanumber\n"), None);
+    }
+
+    // ── Ancestor walk from tmux client up to its owning window ──
+
+    fn ppid_reader(map: HashMap<u32, u32>) -> impl FnMut(u32) -> Option<u32> {
+        move |p| map.get(&p).copied()
     }
 
     #[test]
-    fn detect_tmux_session_descendant_match() {
-        let mut clients = HashMap::new();
-        clients.insert(9999, "work".to_string());
-        // win_pid + two descendants; the last is the tmux client.
-        assert_eq!(
-            detect_tmux_session(&[1234, 5678, 9999], &clients),
-            Some("work".into())
+    fn walk_to_window_owner_start_pid_is_window() {
+        // tmux client is itself running directly under xterm, and xterm's
+        // pid was already harvested as a window pid.
+        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let read = ppid_reader(HashMap::new());
+        assert_eq!(walk_to_window_owner(100, &pid_to_wid, read, 10), Some(42));
+    }
+
+    #[test]
+    fn walk_to_window_owner_walks_up_chain() {
+        // client 300 -> shell 200 -> xterm 100 (window wid=42)
+        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let read = ppid_reader([(300, 200), (200, 100), (100, 1)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), Some(42));
+    }
+
+    #[test]
+    fn walk_to_window_owner_stops_at_closest_match() {
+        // Both 200 and the grand-ancestor 100 are window pids (e.g. cinnamon
+        // is also reported as a window pid). The client is under 200, so we
+        // must stop at 200 and not keep walking to 100.
+        let pid_to_wid: HashMap<u32, u32> = [(200, 42), (100, 99)].iter().cloned().collect();
+        let read = ppid_reader([(300, 200), (200, 100), (100, 1)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), Some(42));
+    }
+
+    #[test]
+    fn walk_to_window_owner_reaches_init_without_match() {
+        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let read = ppid_reader([(300, 1)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
+    }
+
+    #[test]
+    fn walk_to_window_owner_process_disappears() {
+        // read_ppid returns None (e.g. the process was reaped mid-walk).
+        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let read = ppid_reader(HashMap::new());
+        assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
+    }
+
+    #[test]
+    fn walk_to_window_owner_respects_depth_limit() {
+        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let read = ppid_reader(
+            [(500, 400), (400, 300), (300, 200), (200, 100)].iter().cloned().collect(),
         );
-    }
-
-    #[test]
-    fn detect_tmux_session_no_match() {
-        let mut clients = HashMap::new();
-        clients.insert(42, "other".to_string());
-        assert_eq!(detect_tmux_session(&[1234, 5678], &clients), None);
-    }
-
-    #[test]
-    fn detect_tmux_session_empty_clients() {
-        let clients: HashMap<u32, String> = HashMap::new();
-        assert_eq!(detect_tmux_session(&[1234], &clients), None);
-    }
-
-    #[test]
-    fn detect_tmux_session_first_match_wins() {
-        // If multiple PIDs in the chain are clients (rare — nested tmux),
-        // the shallowest one should win. Caller passes win_pid first, so
-        // the first entry in pids is the closest to the terminal window.
-        let mut clients = HashMap::new();
-        clients.insert(1234, "outer".to_string());
-        clients.insert(5678, "inner".to_string());
-        assert_eq!(
-            detect_tmux_session(&[1234, 5678], &clients),
-            Some("outer".into())
+        // depth 3 stops before reaching 100
+        assert_eq!(walk_to_window_owner(500, &pid_to_wid, read, 3), None);
+        // depth 5 reaches it
+        let read2 = ppid_reader(
+            [(500, 400), (400, 300), (300, 200), (200, 100)].iter().cloned().collect(),
         );
+        assert_eq!(walk_to_window_owner(500, &pid_to_wid, read2, 5), Some(42));
+    }
+
+    #[test]
+    fn walk_to_window_owner_empty_window_set() {
+        let pid_to_wid: HashMap<u32, u32> = HashMap::new();
+        let read = ppid_reader([(300, 200), (200, 100)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
     }
 }

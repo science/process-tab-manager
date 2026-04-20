@@ -12,7 +12,8 @@ const WIN_H: u16 = 600;
 const ITEM_MARGIN: i16 = 8; // margin on each side
 const ITEM_H: u16 = 28;
 const ITEM_SPACING: i16 = 2;
-const ITEM_Y_START: i16 = 8;
+const HEADER_H: u16 = ITEM_H; // "+ New terminal" button row at the top
+const ITEM_Y_START: i16 = HEADER_H as i16 + ITEM_SPACING + 8;
 const DRAG_THRESHOLD: i16 = 5;
 const GROUP_INDENT: i16 = 16;
 const MENU_ITEM_H: u16 = 24;
@@ -192,6 +193,7 @@ struct App {
     rename: Option<RenameState>,
     active_wid: Option<u32>,
     hover_row: Option<usize>,
+    header_hovered: bool,
     drag: Option<DragState>,
     x: i16,
     y: i16,
@@ -213,6 +215,7 @@ impl App {
             rename: None,
             active_wid: None,
             hover_row: None,
+            header_hovered: false,
             drag: None,
             x: 0,
             y: 0,
@@ -221,6 +224,10 @@ impl App {
             our_wid,
             subscribed_wids: HashSet::new(),
         }
+    }
+
+    fn hit_test_header_button(&self, y: i16) -> bool {
+        y >= 0 && y < HEADER_H as i16
     }
 
     fn build_display_rows(&mut self) {
@@ -1126,6 +1133,61 @@ fn walk_to_window_owner(
     None
 }
 
+// ── Terminal launch ──
+//
+// PTM delegates terminal configuration to the system: whatever the user has
+// set up as their default is what PTM launches. No tmux wrapping, no shell
+// arguments, no session naming owned by PTM. If the user's shell rc
+// auto-attaches to tmux, they get tmux; otherwise they get a plain shell.
+
+fn detect_terminal_command(
+    env_terminal: Option<&str>,
+    has_binary: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if let Some(term) = env_terminal {
+        let trimmed = term.trim();
+        if !trimmed.is_empty() {
+            return trimmed.split_whitespace().map(String::from).collect();
+        }
+    }
+    for candidate in ["x-terminal-emulator", "xdg-terminal-exec"] {
+        if has_binary(candidate) {
+            return vec![candidate.to_string()];
+        }
+    }
+    vec!["xterm".to_string()]
+}
+
+fn binary_on_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let mut p = std::path::PathBuf::from(dir);
+        p.push(name);
+        if p.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn spawn_default_terminal() {
+    let argv = detect_terminal_command(
+        std::env::var("TERMINAL").ok().as_deref(),
+        binary_on_path,
+    );
+    if argv.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn();
+}
+
 // ── Property-change classification (pure, testable) ──
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1307,6 +1369,9 @@ impl Renderer {
             }],
         )?;
 
+        // Draw the "+ New terminal" header button above the item list.
+        self.draw_new_terminal_button(conn, pix, app)?;
+
         let dragged_row = app
             .drag
             .as_ref()
@@ -1409,6 +1474,40 @@ impl Renderer {
 
         conn.copy_area(pix, self.window, self.gc, 0, 0, 0, 0, app.width, app.height)?;
         conn.flush()?;
+        Ok(())
+    }
+
+    fn draw_new_terminal_button(
+        &self,
+        conn: &impl Connection,
+        drawable: Drawable,
+        app: &App,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let x = ITEM_MARGIN;
+        let y: i16 = 4;
+        let w = (app.width as i16 - ITEM_MARGIN * 2).max(20) as u16;
+        let h = HEADER_H;
+
+        let bg = if app.header_hovered {
+            self.item_hover_pixel
+        } else {
+            self.item_pixel
+        };
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(bg))?;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle { x, y, width: w, height: h }],
+        )?;
+
+        // Label centred horizontally.
+        let label = "+ New terminal";
+        let label_width = label.len() as i16 * CHAR_WIDTH;
+        let text_x = x + (w as i16 - label_width) / 2;
+        let text_y = y + (h as i16 / 2) + 4;
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
+        conn.image_text8(drawable, self.gc, text_x, text_y, label.as_bytes())?;
+
         Ok(())
     }
 
@@ -2576,7 +2675,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::ButtonPress(ev) if ev.event == window => {
                 match ev.detail {
                     1 => {
-                        if let Some(row) = app.hit_test_row(ev.event_y) {
+                        if app.hit_test_header_button(ev.event_y) {
+                            spawn_default_terminal();
+                        } else if let Some(row) = app.hit_test_row(ev.event_y) {
                             app.drag = Some(DragState {
                                 source_row: row,
                                 start_y: ev.event_y,
@@ -2586,7 +2687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     3 => {
-                        if app.drag.is_none() {
+                        if app.drag.is_none() && !app.hit_test_header_button(ev.event_y) {
                             if let Some(row) = app.hit_test_row(ev.event_y) {
                                 open_context_menu(
                                     &conn,
@@ -2640,16 +2741,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     // Hover tracking (no drag active)
                     let new_hover = app.hit_test_row(ev.event_y);
+                    let new_header = app.hit_test_header_button(ev.event_y);
                     if new_hover != app.hover_row {
                         app.hover_row = new_hover;
+                        needs_redraw = true;
+                    }
+                    if new_header != app.header_hovered {
+                        app.header_hovered = new_header;
                         needs_redraw = true;
                     }
                     // Drain queued motion for hover too
                     while let Some(queued) = conn.poll_for_event()? {
                         if let Event::MotionNotify(mn) = queued {
                             let h = app.hit_test_row(mn.event_y);
+                            let hb = app.hit_test_header_button(mn.event_y);
                             if h != app.hover_row {
                                 app.hover_row = h;
+                                needs_redraw = true;
+                            }
+                            if hb != app.header_hovered {
+                                app.header_hovered = hb;
                                 needs_redraw = true;
                             }
                         } else {
@@ -2670,8 +2781,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::LeaveNotify(_) => {
-                if app.hover_row.is_some() {
-                    app.hover_row = None;
+                let was_hovering = app.hover_row.is_some() || app.header_hovered;
+                app.hover_row = None;
+                app.header_hovered = false;
+                if was_hovering {
                     renderer.redraw(&conn, &app)?;
                 }
             }
@@ -3756,5 +3869,74 @@ mod tests {
         let pid_to_wid: HashMap<u32, u32> = HashMap::new();
         let read = ppid_reader([(300, 200), (200, 100)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
+    }
+
+    // ── Terminal detection ──
+
+    #[test]
+    fn detect_terminal_prefers_env_terminal() {
+        let argv = detect_terminal_command(Some("urxvt"), |_| true);
+        assert_eq!(argv, vec!["urxvt".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_env_terminal_splits_whitespace() {
+        // Some users set TERMINAL with args.
+        let argv = detect_terminal_command(Some("alacritty -T MyTerm"), |_| true);
+        assert_eq!(argv, vec!["alacritty", "-T", "MyTerm"]);
+    }
+
+    #[test]
+    fn detect_terminal_empty_env_falls_through() {
+        // Empty string isn't a valid override.
+        let argv = detect_terminal_command(Some(""), |name| name == "x-terminal-emulator");
+        assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_uses_x_terminal_emulator_when_env_unset() {
+        let argv = detect_terminal_command(None, |name| name == "x-terminal-emulator");
+        assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_falls_back_to_xdg_terminal_exec() {
+        let argv = detect_terminal_command(None, |name| name == "xdg-terminal-exec");
+        assert_eq!(argv, vec!["xdg-terminal-exec".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_falls_back_to_xterm() {
+        // No env, no optional binaries on PATH.
+        let argv = detect_terminal_command(None, |_| false);
+        assert_eq!(argv, vec!["xterm".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_prefers_x_terminal_emulator_over_xdg() {
+        let argv = detect_terminal_command(None, |_| true);
+        assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
+    }
+
+    // ── Header button hit-test ──
+
+    #[test]
+    fn header_button_hit_test_top_region() {
+        let app = make_app();
+        assert!(app.hit_test_header_button(0));
+        assert!(app.hit_test_header_button((HEADER_H - 1) as i16));
+    }
+
+    #[test]
+    fn header_button_hit_test_below_header_is_false() {
+        let app = make_app();
+        assert!(!app.hit_test_header_button(HEADER_H as i16));
+        assert!(!app.hit_test_header_button(HEADER_H as i16 + 10));
+    }
+
+    #[test]
+    fn header_button_hit_test_negative_is_false() {
+        let app = make_app();
+        assert!(!app.hit_test_header_button(-1));
     }
 }

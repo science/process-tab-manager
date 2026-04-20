@@ -1,10 +1,16 @@
 # Process Tab Manager
 
-A vertical sidebar for managing application windows on Linux/X11. Think "Firefox vertical tabs" but for your desktop — terminals, browsers, editors, whatever you have open.
+A vertical tab bar for terminals on Linux/X11. An IDE-style sidebar for your shell sessions, because terminals are where AI-assisted development lives now.
 
-## Why?
+## Why this exists
 
-Linux taskbars are horizontal, icon-based, and treat all windows equally. If you work with many terminals (or any group of similar windows), they blur together. PTM is a persistent vertical sidebar that shows your windows in an organized, manageable list — like browser tabs for your desktop.
+Editors have tabs for files — VS Code, JetBrains, Sublime, Vim. Everyone agrees "keep many files open, switch between them fast" is the right model for writing code. Nothing like this exists for terminals.
+
+That matters more now than it used to. AI-assisted development happens inside terminals: Claude Code, aider, opencode, codex-cli, local-model shells. A real project runs five or six terminals at once — one with the agent, one tailing logs, one for git, one for ad-hoc shell work, one for a dev server. Your WM's Alt-Tab treats them all as "Terminal" and your taskbar shows six identical icons.
+
+Process Tab Manager is a vertical tab bar for those sessions. Group them. Rename them. See which ones are attached to a tmux session. Open a new one with a click.
+
+It also works for non-terminal windows (browsers, editors) — anything the WM reports via EWMH shows up — but the design centre is terminal workflows.
 
 ## Features
 

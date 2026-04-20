@@ -58,6 +58,7 @@ struct Atoms {
     wm_protocols: Atom,
     wm_delete_window: Atom,
     net_wm_pid: Atom,
+    ptm_wake: Atom,
 }
 
 impl Atoms {
@@ -75,6 +76,7 @@ impl Atoms {
         let c10 = conn.intern_atom(false, b"WM_PROTOCOLS")?;
         let c11 = conn.intern_atom(false, b"WM_DELETE_WINDOW")?;
         let c12 = conn.intern_atom(false, b"_NET_WM_PID")?;
+        let c13 = conn.intern_atom(false, b"_PTM_WAKE")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -89,8 +91,41 @@ impl Atoms {
             wm_protocols: c10.reply()?.atom,
             wm_delete_window: c11.reply()?.atom,
             net_wm_pid: c12.reply()?.atom,
+            ptm_wake: c13.reply()?.atom,
         })
     }
+}
+
+// Spawn a thread that wakes PTM every `interval` by sending an X11
+// ClientMessage to our own window. The message carries the `ptm_wake` atom as
+// its type, which the main event loop recognises and uses as a cue to
+// refresh items. This is how tmux state changes (sessions created or
+// destroyed outside PTM) get picked up — tmux doesn't fire X11 events of
+// its own, so without this poll the sidebar would only update when some
+// other X activity happens to trigger a refresh.
+fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::Duration) {
+    std::thread::spawn(move || {
+        // Give the main loop a moment to reach wait_for_event before we start
+        // pinging, so our first wake doesn't race the initial refresh.
+        std::thread::sleep(interval);
+        let Ok((c, _)) = x11rb::connect(None) else {
+            return;
+        };
+        loop {
+            let data = ClientMessageData::from([0u32; 5]);
+            let ev = ClientMessageEvent {
+                response_type: 33, // ClientMessage
+                format: 32,
+                sequence: 0,
+                window,
+                type_: wake_atom,
+                data,
+            };
+            let _ = c.send_event(false, window, EventMask::NO_EVENT, ev);
+            let _ = c.flush();
+            std::thread::sleep(interval);
+        }
+    });
 }
 
 // ── Data model ──
@@ -2730,15 +2765,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         restore_groups(&mut app, &saved);
     }
 
+    // Background thread that pokes the main loop every 5 s so tmux state
+    // changes (sessions created or destroyed outside PTM) show up promptly.
+    spawn_tmux_poll_thread(window, atoms.ptm_wake, std::time::Duration::from_secs(5));
+
     loop {
         let event = conn.wait_for_event()?;
 
-        // Handle WM_DELETE_WINDOW in any mode
+        // Handle WM_DELETE_WINDOW and our own wake pings in any mode.
         if let Event::ClientMessage(ev) = &event {
             if ev.window == window && ev.data.as_data32()[0] == atoms.wm_delete_window {
                 save_geometry(app.x, app.y, app.width, app.height);
                 save_groups(&app);
                 break;
+            }
+            if ev.type_ == atoms.ptm_wake {
+                // Scheduled tmux-state poll from the background thread.
+                // Same gating as PropertyNotify refresh: don't rebuild while
+                // the user is mid-gesture.
+                if app.drag.is_none()
+                    && app.context_menu.is_none()
+                    && app.rename.is_none()
+                {
+                    refresh_items(&conn, root, &atoms, &mut app, colormap)?;
+                    renderer.redraw(&conn, &app)?;
+                }
+                continue;
             }
         }
 

@@ -1284,6 +1284,46 @@ fn spawn_default_terminal() {
         .spawn();
 }
 
+// Build the argv for launching a terminal attached to an existing tmux
+// session. Different terminal emulators use different separators before
+// the command: gnome-terminal / ptyxis need `--`, almost everything else
+// (xterm, urxvt, alacritty, kitty, st, konsole) uses `-e`. Unknown
+// terminals fall through to `-e` as a reasonable default.
+fn terminal_argv_for_attach(term_argv: &[String], session_name: &str) -> Vec<String> {
+    if term_argv.is_empty() {
+        return Vec::new();
+    }
+    let term_name = std::path::Path::new(&term_argv[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let separator = match term_name {
+        "gnome-terminal" | "ptyxis" => "--",
+        _ => "-e",
+    };
+    let mut out: Vec<String> = term_argv.to_vec();
+    out.push(separator.to_string());
+    out.push("tmux".to_string());
+    out.push("attach-session".to_string());
+    out.push("-t".to_string());
+    out.push(session_name.to_string());
+    out
+}
+
+fn spawn_attach_terminal(session_name: &str) {
+    let term = detect_terminal_command(
+        std::env::var("TERMINAL").ok().as_deref(),
+        binary_on_path,
+    );
+    let argv = terminal_argv_for_attach(&term, session_name);
+    if argv.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn();
+}
+
 // ── Property-change classification (pure, testable) ──
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3008,8 +3048,8 @@ fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
                     }
-                    DisplayRow::Session { .. } => {
-                        // Click-to-attach lands in Stage C.2.
+                    DisplayRow::Session { name, .. } => {
+                        spawn_attach_terminal(&name);
                     }
                 }
             }
@@ -4172,6 +4212,103 @@ mod tests {
     fn detect_terminal_prefers_x_terminal_emulator_over_xdg() {
         let argv = detect_terminal_command(None, |_| true);
         assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
+    }
+
+    // ── Attach argv builder ──
+
+    #[test]
+    fn terminal_argv_for_attach_xterm_uses_dash_e() {
+        let term = vec!["xterm".to_string()];
+        let argv = terminal_argv_for_attach(&term, "demo");
+        assert_eq!(
+            argv,
+            vec!["xterm", "-e", "tmux", "attach-session", "-t", "demo"]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_gnome_terminal_uses_double_dash() {
+        let term = vec!["gnome-terminal".to_string()];
+        let argv = terminal_argv_for_attach(&term, "demo");
+        assert_eq!(
+            argv,
+            vec!["gnome-terminal", "--", "tmux", "attach-session", "-t", "demo"]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_ptyxis_uses_double_dash() {
+        let term = vec!["ptyxis".to_string()];
+        let argv = terminal_argv_for_attach(&term, "demo");
+        assert_eq!(
+            argv,
+            vec!["ptyxis", "--", "tmux", "attach-session", "-t", "demo"]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_unknown_falls_back_to_dash_e() {
+        let term = vec!["some-obscure-terminal".to_string()];
+        let argv = terminal_argv_for_attach(&term, "dev");
+        assert_eq!(
+            argv,
+            vec![
+                "some-obscure-terminal",
+                "-e",
+                "tmux",
+                "attach-session",
+                "-t",
+                "dev"
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_preserves_leading_args() {
+        // $TERMINAL="alacritty -T MyTerm" case.
+        let term = vec![
+            "alacritty".to_string(),
+            "-T".to_string(),
+            "MyTerm".to_string(),
+        ];
+        let argv = terminal_argv_for_attach(&term, "demo");
+        assert_eq!(
+            argv,
+            vec![
+                "alacritty",
+                "-T",
+                "MyTerm",
+                "-e",
+                "tmux",
+                "attach-session",
+                "-t",
+                "demo"
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_uses_basename_for_match() {
+        // Absolute path still recognised as gnome-terminal.
+        let term = vec!["/usr/bin/gnome-terminal".to_string()];
+        let argv = terminal_argv_for_attach(&term, "demo");
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/bin/gnome-terminal",
+                "--",
+                "tmux",
+                "attach-session",
+                "-t",
+                "demo"
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_empty_term_returns_empty() {
+        let argv = terminal_argv_for_attach(&[], "demo");
+        assert!(argv.is_empty());
     }
 
     // ── Header button hit-test ──

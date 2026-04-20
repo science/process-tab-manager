@@ -126,12 +126,14 @@ struct Group {
 enum DisplaySlot {
     Window(u32),
     Group(u32),
+    Session(String), // orphan tmux session — exists but has no attached window
 }
 
 #[derive(Clone, Debug)]
 enum DisplayRow {
     GroupHeader { group_id: u32 },
     Window { wid: u32, group_id: Option<u32> },
+    Session { name: String, group_id: Option<u32> },
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +254,12 @@ impl App {
                             }
                         }
                     }
+                }
+                DisplaySlot::Session(name) => {
+                    self.display_rows.push(DisplayRow::Session {
+                        name: name.clone(),
+                        group_id: None,
+                    });
                 }
             }
         }
@@ -470,6 +478,9 @@ impl App {
                 DisplaySlot::Window(_) => {
                     row_count += 1;
                 }
+                DisplaySlot::Session(_) => {
+                    row_count += 1;
+                }
                 DisplaySlot::Group(gid) => {
                     row_count += 1;
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
@@ -487,6 +498,7 @@ impl App {
         let src_pos = self.display_order.iter().position(|s| match (target, s) {
             (DisplaySlot::Window(a), DisplaySlot::Window(b)) => a == b,
             (DisplaySlot::Group(a), DisplaySlot::Group(b)) => a == b,
+            (DisplaySlot::Session(a), DisplaySlot::Session(b)) => a == b,
             _ => false,
         });
         if let Some(sp) = src_pos {
@@ -576,6 +588,11 @@ impl App {
                 } else {
                     self.move_slot_to(&DisplaySlot::Window(wid), drop_gap);
                 }
+            }
+            DisplayRow::Session { name, .. } => {
+                // Sessions are standalone rows for now (no groups until C.5);
+                // dragging just reorders them inside display_order.
+                self.move_slot_to(&DisplaySlot::Session(name), drop_gap);
             }
         }
 
@@ -1018,10 +1035,31 @@ fn refresh_items(
     // prune our HashSet so a wid that's later re-used gets a fresh subscribe.)
     app.subscribed_wids.retain(|w| live_wids.contains(w));
 
-    // Remove dead entries from display_order
+    // Orphan tmux sessions — sessions that exist but aren't attached to any
+    // window PTM already tracks. These get standalone rows so the user can
+    // see them and reattach; without this they'd be invisible outside
+    // `tmux ls`.
+    let attached_session_names: HashSet<String> = new_items
+        .iter()
+        .filter_map(|i| i.session.clone())
+        .collect();
+    let live_sessions = list_tmux_sessions();
+    let live_session_names: HashSet<String> = live_sessions
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let orphan_session_names: HashSet<String> = live_session_names
+        .difference(&attached_session_names)
+        .cloned()
+        .collect();
+
+    // Remove dead entries from display_order. Sessions are kept iff they
+    // still exist in tmux AND aren't currently attached to a tracked window
+    // (attached sessions are represented by the window row, not a Session row).
     app.display_order.retain(|slot| match slot {
         DisplaySlot::Window(wid) => live_wids.contains(wid),
         DisplaySlot::Group(gid) => app.groups.iter().any(|g| g.id == *gid),
+        DisplaySlot::Session(name) => orphan_session_names.contains(name),
     });
 
     // Collect wids already tracked
@@ -1041,6 +1079,25 @@ fn refresh_items(
     for wid in &live_wids {
         if !known_wids.contains(wid) {
             app.display_order.push(DisplaySlot::Window(*wid));
+        }
+    }
+
+    // Add new orphan sessions we haven't seen before, appended at the bottom.
+    let known_session_names: HashSet<String> = app
+        .display_order
+        .iter()
+        .filter_map(|s| {
+            if let DisplaySlot::Session(n) = s {
+                Some(n.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for name in &orphan_session_names {
+        if !known_session_names.contains(name) {
+            app.display_order
+                .push(DisplaySlot::Session(name.clone()));
         }
     }
 
@@ -1093,6 +1150,45 @@ fn list_tmux_clients() -> HashMap<u32, String> {
     {
         Ok(o) => parse_tmux_list_clients(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => HashMap::new(),
+    }
+}
+
+// Parse `tmux list-sessions -F '#{session_name} #{session_attached}'` output
+// into (name, attached_count>0) pairs. Sessions whose first token after the
+// name isn't a number are silently dropped.
+fn parse_tmux_list_sessions(stdout: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split on the LAST whitespace so session names with spaces survive.
+        if let Some(idx) = line.rfind(char::is_whitespace) {
+            let name = line[..idx].trim();
+            let attached_str = line[idx + 1..].trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Ok(n) = attached_str.parse::<u32>() {
+                out.push((name.to_string(), n > 0));
+            }
+        }
+    }
+    out
+}
+
+fn list_tmux_sessions() -> Vec<(String, bool)> {
+    match std::process::Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name} #{session_attached}",
+        ])
+        .output()
+    {
+        Ok(o) => parse_tmux_list_sessions(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1402,6 +1498,16 @@ impl Renderer {
                         self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active)?;
                     }
                 }
+                DisplayRow::Session { name, group_id } => {
+                    let ix = app.item_x();
+                    let iw = app.item_w();
+                    let (x, w) = if group_id.is_some() {
+                        (ix + GROUP_INDENT, iw - GROUP_INDENT as u16)
+                    } else {
+                        (ix, iw)
+                    };
+                    self.draw_session_row(conn, pix, x, y, w, ITEM_H as u16, name, hovered)?;
+                }
             }
         }
 
@@ -1466,6 +1572,17 @@ impl Renderer {
                                     conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false,
                                 )?;
                             }
+                        }
+                        DisplayRow::Session { name, group_id } => {
+                            let ix = app.item_x();
+                            let iw = app.item_w();
+                            let (x, w) = if group_id.is_some() {
+                                (ix + GROUP_INDENT, iw - GROUP_INDENT as u16)
+                            } else {
+                                (ix, iw)
+                            };
+                            // Ghost reuses the session-row drawing; hovered=false, no special ghost style.
+                            self.draw_session_row(conn, pix, x, ghost_y, w, ITEM_H as u16, name, false)?;
                         }
                     }
                 }
@@ -1601,6 +1718,76 @@ impl Renderer {
                 }],
             )?;
         }
+
+        Ok(())
+    }
+
+    fn draw_session_row(
+        &self,
+        conn: &impl Connection,
+        drawable: Drawable,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        name: &str,
+        hovered: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Background
+        let bg = if hovered {
+            self.item_hover_pixel
+        } else {
+            self.item_pixel
+        };
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(bg))?;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle { x, y, width: w, height: h }],
+        )?;
+
+        // Grey left-edge stripe so orphan sessions read as "not a window".
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(self.text_dim_pixel),
+        )?;
+        conn.poly_fill_rectangle(
+            drawable,
+            self.gc,
+            &[Rectangle { x, y, width: 3, height: h }],
+        )?;
+
+        // Label (reserve the right-edge marker area so text doesn't overlap).
+        let marker_reserve: i16 = 14;
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
+        let text_x = x + 8;
+        let text_y = y + (h as i16 / 2) + 4;
+        let max_chars = ((w as i16 - 12 - marker_reserve) / CHAR_WIDTH).max(0) as usize;
+        let display: String = name.chars().take(max_chars).collect();
+        if !display.is_empty() {
+            conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
+        }
+
+        // Hollow ring on the right: "session exists but no attached terminal".
+        let marker_size: u16 = 6;
+        let marker_x = x + w as i16 - marker_size as i16 - 6;
+        let marker_y = y + (h as i16 - marker_size as i16) / 2;
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(self.session_marker_pixel),
+        )?;
+        conn.poly_arc(
+            drawable,
+            self.gc,
+            &[Arc {
+                x: marker_x,
+                y: marker_y,
+                width: marker_size,
+                height: marker_size,
+                angle1: 0,
+                angle2: 360 * 64,
+            }],
+        )?;
 
         Ok(())
     }
@@ -1854,6 +2041,10 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
                 });
             }
             entries
+        }
+        DisplayRow::Session { .. } => {
+            // Session menu entries land in Stage C.3.
+            vec![]
         }
     }
 }
@@ -2816,6 +3007,9 @@ fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut
                         app.active_wid = Some(wid);
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
+                    }
+                    DisplayRow::Session { .. } => {
+                        // Click-to-attach lands in Stage C.2.
                     }
                 }
             }
@@ -3780,6 +3974,68 @@ mod tests {
         let m = parse_tmux_list_clients(input);
         assert_eq!(m.len(), 1);
         assert_eq!(m.get(&5678).map(String::as_str), Some("ok"));
+    }
+
+    // ── tmux list-sessions parsing ──
+
+    #[test]
+    fn parse_tmux_list_sessions_empty() {
+        assert!(parse_tmux_list_sessions("").is_empty());
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_single_attached() {
+        let input = "demo 1\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(v, vec![("demo".to_string(), true)]);
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_single_orphan() {
+        let input = "demo 0\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(v, vec![("demo".to_string(), false)]);
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_mixed() {
+        let input = "work 2\norphan 0\ndev 1\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(
+            v,
+            vec![
+                ("work".to_string(), true),
+                ("orphan".to_string(), false),
+                ("dev".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_preserves_spaces_in_name() {
+        // Session names with spaces — split on the LAST whitespace so the
+        // trailing attached-count stays separable.
+        let input = "my cool session 0\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(v, vec![("my cool session".to_string(), false)]);
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_skips_malformed() {
+        // Trailing token isn't a number → drop.
+        let input = "bad notanumber\ngood 1\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(v, vec![("good".to_string(), true)]);
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_skips_blank_lines() {
+        let input = "\n\na 0\n\nb 1\n\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(
+            v,
+            vec![("a".to_string(), false), ("b".to_string(), true)]
+        );
     }
 
     // ── /proc/<pid>/status parsing ──

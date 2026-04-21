@@ -1146,21 +1146,21 @@ fn refresh_items(
     // prune our HashSet so a wid that's later re-used gets a fresh subscribe.)
     app.subscribed_wids.retain(|w| live_wids.contains(w));
 
-    // Orphan tmux sessions — sessions that exist but aren't attached to any
-    // window PTM already tracks. These get standalone rows so the user can
-    // see them and reattach; without this they'd be invisible outside
-    // `tmux ls`.
-    let attached_session_names: HashSet<String> = new_items
-        .iter()
-        .filter_map(|i| i.session.clone())
-        .collect();
+    // Orphan tmux sessions — sessions that exist but have zero attached
+    // clients according to tmux itself. We ask tmux rather than checking
+    // our own item.session attributions, because attribution fails on
+    // gnome-terminal (the PID collision is unresolvable) and falling back
+    // to "attributed by PTM" would leave a bogus orphan row visible for
+    // every attached-but-unattributed session.
+    let sessions_with_clients: HashSet<String> =
+        tmux_clients.values().cloned().collect();
     let live_sessions = list_tmux_sessions();
     let live_session_names: HashSet<String> = live_sessions
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
     let orphan_session_names: HashSet<String> = live_session_names
-        .difference(&attached_session_names)
+        .difference(&sessions_with_clients)
         .cloned()
         .collect();
 
@@ -1347,6 +1347,17 @@ fn walk_to_window_owner(
         }
     }
     None
+}
+
+// True if there's already an in-flight attach for the same session. Used
+// to debounce rapid repeat clicks on an orphan row — otherwise every
+// click spawns another terminal while we wait for the first spawn's
+// window to register.
+fn is_attach_pending_for(
+    pending: &Option<(String, std::time::Instant)>,
+    session_name: &str,
+) -> bool {
+    matches!(pending, Some((n, _)) if n == session_name)
 }
 
 // Consume a pending attach: if a new wid has appeared since the previous
@@ -2457,8 +2468,10 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
         }
         MenuAction::AttachSession => {
             if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
-                app.pending_attach = Some((name.clone(), std::time::Instant::now()));
-                spawn_attach_terminal(name);
+                if !is_attach_pending_for(&app.pending_attach, name) {
+                    app.pending_attach = Some((name.clone(), std::time::Instant::now()));
+                    spawn_attach_terminal(name);
+                }
             }
         }
         MenuAction::RenameSession => {
@@ -3276,8 +3289,10 @@ fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut
                         let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
                     }
                     DisplayRow::Session { name, .. } => {
-                        app.pending_attach = Some((name.clone(), std::time::Instant::now()));
-                        spawn_attach_terminal(&name);
+                        if !is_attach_pending_for(&app.pending_attach, &name) {
+                            app.pending_attach = Some((name.clone(), std::time::Instant::now()));
+                            spawn_attach_terminal(&name);
+                        }
                     }
                 }
             }
@@ -4511,6 +4526,19 @@ mod tests {
         assert!(pre.is_empty());
         assert!(items[1].session.is_none());
         assert!(pending.is_none(), "timed-out pending should be cleared");
+    }
+
+    #[test]
+    fn is_attach_pending_for_matches_same_session() {
+        let pending = Some(("demo".to_string(), std::time::Instant::now()));
+        assert!(is_attach_pending_for(&pending, "demo"));
+        assert!(!is_attach_pending_for(&pending, "other"));
+    }
+
+    #[test]
+    fn is_attach_pending_for_none() {
+        let pending: Option<(String, std::time::Instant)> = None;
+        assert!(!is_attach_pending_for(&pending, "demo"));
     }
 
     #[test]

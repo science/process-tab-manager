@@ -51,6 +51,40 @@ CARGO_TARGET_DIR=/tmp/ptm-target cargo build --release
 DISPLAY=:0 /tmp/ptm-target/release/ptm
 ```
 
+## Configuration
+
+### Custom terminal command
+
+The "+" button and click-to-attach resolve the terminal command in this order:
+
+1. `$PTM_TERMINAL_CMD` — PTM-specific override. Whitespace-split into argv.
+2. `$TERMINAL` — generic fallback.
+3. `x-terminal-emulator` — Debian/Ubuntu default alternative.
+4. `xdg-terminal-exec` — freedesktop default.
+5. `xterm` — last resort.
+
+`$PTM_TERMINAL_CMD` exists separately from `$TERMINAL` because the latter is widely consumed by other tools (git editors, `less`, `man`) which expect a plain emulator binary and misbehave when extra args are baked in.
+
+To make PTM launch a specific terminal with your daily profile across every machine, set it for your graphical session and sync via yadm or similar:
+
+```
+# ~/.config/environment.d/99-ptm.conf
+PTM_TERMINAL_CMD=gnome-terminal --profile=MyProfile
+```
+
+Values are split on whitespace, so args containing spaces aren't supported directly — wrap those in a shell script (`~/.local/bin/my-terminal`) and point `PTM_TERMINAL_CMD` at it.
+
+### Tmux status bar
+
+Click-to-attach runs `tmux attach-session` inside the new terminal, which shows tmux's default green status bar at the bottom. To disable it globally:
+
+```
+# ~/.tmux.conf
+set -g status off
+```
+
+Reload with `tmux source-file ~/.tmux.conf` in any attached session, or start a new one.
+
 ## Testing
 
 ```bash

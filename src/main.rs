@@ -21,6 +21,12 @@ const MENU_PADDING: i16 = 4;
 const MENU_MIN_W: u16 = 180;
 const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 
+// How long a pending attach claim stays live waiting for its new window to
+// appear before giving up. Cheap upper bound — typical gnome-terminal launch
+// is ~300 ms on this machine; anything past a few seconds means the spawn
+// failed or the user closed the window before it registered.
+const PENDING_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // Colors — OneDark-inspired palette
 const BG_COLOR: u32 = 0x282c34;
 const TEXT_COLOR: u32 = 0xabb2bf;
@@ -242,6 +248,12 @@ struct App {
     height: u16,
     our_wid: u32,
     subscribed_wids: HashSet<u32>,
+    // When a user clicks an orphan session row, PTM spawns a terminal that
+    // will attach to that session. Process-tree-based marker detection can
+    // fail for terminals that fork through a shared server pid (gnome-
+    // terminal, konsole), so we instead watch for the next newly-appearing
+    // window and claim it for the pending session.
+    pending_attach: Option<(String, std::time::Instant)>,
 }
 
 impl App {
@@ -264,6 +276,7 @@ impl App {
             height: WIN_H,
             our_wid,
             subscribed_wids: HashSet::new(),
+            pending_attach: None,
         }
     }
 
@@ -1025,6 +1038,10 @@ fn refresh_items(
     let current_desktop = get_current_desktop(conn, root, atoms).unwrap_or(0);
     let tmux_clients = list_tmux_clients();
 
+    // Snapshot wids we already knew about so claim_pending_attach can spot
+    // windows that appeared since the last refresh.
+    let prior_wids: HashSet<u32> = app.items.iter().map(|i| i.wid).collect();
+
     let mut live_wids = HashSet::new();
     let mut new_items = Vec::new();
     let mut color_idx = 0usize;
@@ -1087,6 +1104,18 @@ fn refresh_items(
         });
     }
 
+    // Pending-attach takes priority over the ancestor walk. If the user
+    // just clicked an orphan row, we know which session to expect on the
+    // next new window — much more reliable than walking through a
+    // gnome-terminal-server pid collision.
+    let pre_assigned = claim_pending_attach(
+        &mut app.pending_attach,
+        &prior_wids,
+        &mut new_items,
+        PENDING_ATTACH_TIMEOUT,
+        std::time::Instant::now(),
+    );
+
     // Assign tmux sessions by walking UP from each tmux client's PID until
     // we hit a pid that's a tracked window's _NET_WM_PID. This is the
     // closest-window-to-client match — walking DOWN from a window's pid is
@@ -1094,6 +1123,9 @@ fn refresh_items(
     // because the launcher's descendants include unrelated terminals too.
     if !tmux_clients.is_empty() && !pid_to_wid.is_empty() {
         for (&client_pid, session_name) in &tmux_clients {
+            if pre_assigned.contains(session_name) {
+                continue;
+            }
             if let Some(wid) =
                 walk_to_window_owner(client_pid, &pid_to_wid, read_ppid, 20)
             {
@@ -1315,6 +1347,49 @@ fn walk_to_window_owner(
         }
     }
     None
+}
+
+// Consume a pending attach: if a new wid has appeared since the previous
+// refresh, assign the pending session to it. Returns the set of sessions
+// that were pre-assigned so the ancestor-walk loop can skip them.
+//
+// "Exactly one new wid" is the safe case — we know which window is ours.
+// Zero new wids → window hasn't appeared yet, keep waiting. Multiple new
+// wids → can't disambiguate (user opened something else in parallel), also
+// keep waiting. Either way, the pending entry stays until it times out.
+//
+// Pure: `now` is injected so tests can simulate timeout without sleeping.
+fn claim_pending_attach(
+    pending: &mut Option<(String, std::time::Instant)>,
+    prior_wids: &HashSet<u32>,
+    new_items: &mut [Item],
+    timeout: std::time::Duration,
+    now: std::time::Instant,
+) -> HashSet<String> {
+    let mut pre_assigned = HashSet::new();
+    let Some((session_name, spawn_time)) = pending.as_ref() else {
+        return pre_assigned;
+    };
+    if now.saturating_duration_since(*spawn_time) > timeout {
+        *pending = None;
+        return pre_assigned;
+    }
+    let new_wids: Vec<u32> = new_items
+        .iter()
+        .map(|i| i.wid)
+        .filter(|w| !prior_wids.contains(w))
+        .collect();
+    if new_wids.len() != 1 {
+        return pre_assigned;
+    }
+    let claimed_wid = new_wids[0];
+    let session = session_name.clone();
+    if let Some(item) = new_items.iter_mut().find(|i| i.wid == claimed_wid) {
+        item.session = Some(session.clone());
+        pre_assigned.insert(session);
+    }
+    *pending = None;
+    pre_assigned
 }
 
 // ── Terminal launch ──
@@ -2374,6 +2449,7 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
         }
         MenuAction::AttachSession => {
             if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
+                app.pending_attach = Some((name.clone(), std::time::Instant::now()));
                 spawn_attach_terminal(name);
             }
         }
@@ -3192,6 +3268,7 @@ fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut
                         let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
                     }
                     DisplayRow::Session { name, .. } => {
+                        app.pending_attach = Some((name.clone(), std::time::Instant::now()));
                         spawn_attach_terminal(&name);
                     }
                 }
@@ -4336,6 +4413,114 @@ mod tests {
         let pid_to_wid = mk_pid_map(&[(2380, 42), (2380, 99), (1179, 7)]);
         let read = ppid_reader([(605774, 2380), (2380, 1179)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(605774, &pid_to_wid, read, 10), None);
+    }
+
+    // ── Pending-attach claim ──
+
+    fn mk_item(wid: u32) -> Item {
+        Item {
+            wid,
+            label: format!("w{}", wid),
+            wm_class: String::new(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: None,
+        }
+    }
+
+    #[test]
+    fn pending_attach_claims_sole_new_wid() {
+        let now = std::time::Instant::now();
+        let mut pending = Some(("demo".to_string(), now));
+        let prior: HashSet<u32> = [1, 2].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
+        let pre = claim_pending_attach(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            now,
+        );
+        assert_eq!(items[2].session.as_deref(), Some("demo"));
+        assert!(items[0].session.is_none());
+        assert!(items[1].session.is_none());
+        assert!(pending.is_none(), "claim should clear pending");
+        assert!(pre.contains("demo"));
+    }
+
+    #[test]
+    fn pending_attach_defers_when_no_new_wid() {
+        let now = std::time::Instant::now();
+        let mut pending = Some(("demo".to_string(), now));
+        let prior: HashSet<u32> = [1, 2].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(2)];
+        let pre = claim_pending_attach(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            now,
+        );
+        assert!(pre.is_empty());
+        assert!(pending.is_some(), "pending stays until window appears or timeout");
+    }
+
+    #[test]
+    fn pending_attach_defers_when_multiple_new_wids() {
+        // User clicked attach but also happened to open an unrelated window
+        // in the same refresh window. We can't tell which is which — wait.
+        let now = std::time::Instant::now();
+        let mut pending = Some(("demo".to_string(), now));
+        let prior: HashSet<u32> = [1].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
+        let pre = claim_pending_attach(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            now,
+        );
+        assert!(pre.is_empty());
+        assert!(items[1].session.is_none());
+        assert!(items[2].session.is_none());
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn pending_attach_times_out() {
+        let spawn = std::time::Instant::now();
+        let later = spawn + std::time::Duration::from_secs(10);
+        let mut pending = Some(("demo".to_string(), spawn));
+        let prior: HashSet<u32> = [1].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(2)];
+        let pre = claim_pending_attach(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            later,
+        );
+        assert!(pre.is_empty());
+        assert!(items[1].session.is_none());
+        assert!(pending.is_none(), "timed-out pending should be cleared");
+    }
+
+    #[test]
+    fn pending_attach_none_is_noop() {
+        let now = std::time::Instant::now();
+        let mut pending: Option<(String, std::time::Instant)> = None;
+        let prior: HashSet<u32> = HashSet::new();
+        let mut items = vec![mk_item(1)];
+        let pre = claim_pending_attach(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            now,
+        );
+        assert!(pre.is_empty());
+        assert!(items[0].session.is_none());
+        assert!(pending.is_none());
     }
 
     // ── Terminal detection ──

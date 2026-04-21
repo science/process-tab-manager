@@ -1400,13 +1400,19 @@ fn claim_pending_attach(
 // auto-attaches to tmux, they get tmux; otherwise they get a plain shell.
 
 fn detect_terminal_command(
+    env_ptm_terminal_cmd: Option<&str>,
     env_terminal: Option<&str>,
     has_binary: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    if let Some(term) = env_terminal {
-        let trimmed = term.trim();
-        if !trimmed.is_empty() {
-            return trimmed.split_whitespace().map(String::from).collect();
+    // PTM-specific override comes first. Lets the user point PTM at a
+    // specific terminal+profile without polluting $TERMINAL (which many
+    // CLI tools use as a plain terminal emulator and would break on args).
+    for candidate in [env_ptm_terminal_cmd, env_terminal] {
+        if let Some(val) = candidate {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.split_whitespace().map(String::from).collect();
+            }
         }
     }
     for candidate in ["x-terminal-emulator", "xdg-terminal-exec"] {
@@ -1436,6 +1442,7 @@ fn binary_on_path(name: &str) -> bool {
 
 fn spawn_default_terminal() {
     let argv = detect_terminal_command(
+        std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
         std::env::var("TERMINAL").ok().as_deref(),
         binary_on_path,
     );
@@ -1475,6 +1482,7 @@ fn terminal_argv_for_attach(term_argv: &[String], session_name: &str) -> Vec<Str
 
 fn spawn_attach_terminal(session_name: &str) {
     let term = detect_terminal_command(
+        std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
         std::env::var("TERMINAL").ok().as_deref(),
         binary_on_path,
     );
@@ -4527,47 +4535,65 @@ mod tests {
 
     #[test]
     fn detect_terminal_prefers_env_terminal() {
-        let argv = detect_terminal_command(Some("urxvt"), |_| true);
+        let argv = detect_terminal_command(None, Some("urxvt"), |_| true);
         assert_eq!(argv, vec!["urxvt".to_string()]);
     }
 
     #[test]
     fn detect_terminal_env_terminal_splits_whitespace() {
         // Some users set TERMINAL with args.
-        let argv = detect_terminal_command(Some("alacritty -T MyTerm"), |_| true);
+        let argv = detect_terminal_command(None, Some("alacritty -T MyTerm"), |_| true);
         assert_eq!(argv, vec!["alacritty", "-T", "MyTerm"]);
     }
 
     #[test]
     fn detect_terminal_empty_env_falls_through() {
         // Empty string isn't a valid override.
-        let argv = detect_terminal_command(Some(""), |name| name == "x-terminal-emulator");
+        let argv = detect_terminal_command(None, Some(""), |name| name == "x-terminal-emulator");
         assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
     }
 
     #[test]
     fn detect_terminal_uses_x_terminal_emulator_when_env_unset() {
-        let argv = detect_terminal_command(None, |name| name == "x-terminal-emulator");
+        let argv = detect_terminal_command(None, None, |name| name == "x-terminal-emulator");
         assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
     }
 
     #[test]
     fn detect_terminal_falls_back_to_xdg_terminal_exec() {
-        let argv = detect_terminal_command(None, |name| name == "xdg-terminal-exec");
+        let argv = detect_terminal_command(None, None, |name| name == "xdg-terminal-exec");
         assert_eq!(argv, vec!["xdg-terminal-exec".to_string()]);
     }
 
     #[test]
     fn detect_terminal_falls_back_to_xterm() {
         // No env, no optional binaries on PATH.
-        let argv = detect_terminal_command(None, |_| false);
+        let argv = detect_terminal_command(None, None, |_| false);
         assert_eq!(argv, vec!["xterm".to_string()]);
     }
 
     #[test]
     fn detect_terminal_prefers_x_terminal_emulator_over_xdg() {
-        let argv = detect_terminal_command(None, |_| true);
+        let argv = detect_terminal_command(None, None, |_| true);
         assert_eq!(argv, vec!["x-terminal-emulator".to_string()]);
+    }
+
+    #[test]
+    fn detect_terminal_prefers_ptm_terminal_cmd_over_env_terminal() {
+        // PTM-specific override must win even when $TERMINAL is set.
+        let argv = detect_terminal_command(
+            Some("gnome-terminal --profile=MyProfile"),
+            Some("xterm"),
+            |_| true,
+        );
+        assert_eq!(argv, vec!["gnome-terminal", "--profile=MyProfile"]);
+    }
+
+    #[test]
+    fn detect_terminal_empty_ptm_cmd_falls_through_to_env_terminal() {
+        // Empty/whitespace PTM_TERMINAL_CMD shouldn't shadow $TERMINAL.
+        let argv = detect_terminal_command(Some("   "), Some("alacritty"), |_| true);
+        assert_eq!(argv, vec!["alacritty".to_string()]);
     }
 
     // ── Attach argv builder ──

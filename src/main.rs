@@ -1028,7 +1028,11 @@ fn refresh_items(
     let mut live_wids = HashSet::new();
     let mut new_items = Vec::new();
     let mut color_idx = 0usize;
-    let mut pid_to_wid: HashMap<u32, u32> = HashMap::new();
+    // Multiple windows can share a PID (e.g. every gnome-terminal window
+    // reports the server PID). Keep a list so the walk can detect collisions
+    // and refuse to guess, rather than silently attributing a tmux session
+    // to whichever window happened to enumerate first.
+    let mut pid_to_wid: HashMap<u32, Vec<u32>> = HashMap::new();
 
     for wid in wids {
         if wid == app.our_wid {
@@ -1070,7 +1074,7 @@ fn refresh_items(
             .unwrap_or_default();
 
         if let Some(pid) = get_window_pid(conn, wid, atoms) {
-            pid_to_wid.entry(pid).or_insert(wid);
+            pid_to_wid.entry(pid).or_insert_with(Vec::new).push(wid);
         }
 
         new_items.push(Item {
@@ -1285,16 +1289,25 @@ fn read_ppid(pid: u32) -> Option<u32> {
 // in `pid_to_wid`, or we hit init (ppid=1), or we run out of depth. Returns
 // the matched wid of the closest owning window, if any. Pure — the /proc
 // reader is injected so this can be tested without a running process tree.
+//
+// Collision semantics: if the hit pid maps to multiple windows (e.g.
+// gnome-terminal-server hosts every gnome-terminal window under one pid),
+// we give up and return None rather than pick arbitrarily. "No marker" is
+// strictly better than "wrong marker." Climbing further past an ambiguous
+// hit would only find unrelated ancestors (systemd, init), so stop here.
 fn walk_to_window_owner(
     start_pid: u32,
-    pid_to_wid: &HashMap<u32, u32>,
+    pid_to_wid: &HashMap<u32, Vec<u32>>,
     mut read_ppid_fn: impl FnMut(u32) -> Option<u32>,
     max_depth: usize,
 ) -> Option<u32> {
     let mut cur = start_pid;
     for _ in 0..max_depth {
-        if let Some(&w) = pid_to_wid.get(&cur) {
-            return Some(w);
+        if let Some(wids) = pid_to_wid.get(&cur) {
+            if wids.len() == 1 {
+                return Some(wids[0]);
+            }
+            return None;
         }
         match read_ppid_fn(cur) {
             Some(ppid) if ppid > 1 => cur = ppid,
@@ -4233,11 +4246,19 @@ mod tests {
         move |p| map.get(&p).copied()
     }
 
+    fn mk_pid_map(pairs: &[(u32, u32)]) -> HashMap<u32, Vec<u32>> {
+        let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(pid, wid) in pairs {
+            m.entry(pid).or_default().push(wid);
+        }
+        m
+    }
+
     #[test]
     fn walk_to_window_owner_start_pid_is_window() {
         // tmux client is itself running directly under xterm, and xterm's
         // pid was already harvested as a window pid.
-        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(100, 42)]);
         let read = ppid_reader(HashMap::new());
         assert_eq!(walk_to_window_owner(100, &pid_to_wid, read, 10), Some(42));
     }
@@ -4245,7 +4266,7 @@ mod tests {
     #[test]
     fn walk_to_window_owner_walks_up_chain() {
         // client 300 -> shell 200 -> xterm 100 (window wid=42)
-        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(100, 42)]);
         let read = ppid_reader([(300, 200), (200, 100), (100, 1)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), Some(42));
     }
@@ -4255,14 +4276,14 @@ mod tests {
         // Both 200 and the grand-ancestor 100 are window pids (e.g. cinnamon
         // is also reported as a window pid). The client is under 200, so we
         // must stop at 200 and not keep walking to 100.
-        let pid_to_wid: HashMap<u32, u32> = [(200, 42), (100, 99)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(200, 42), (100, 99)]);
         let read = ppid_reader([(300, 200), (200, 100), (100, 1)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), Some(42));
     }
 
     #[test]
     fn walk_to_window_owner_reaches_init_without_match() {
-        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(100, 42)]);
         let read = ppid_reader([(300, 1)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
     }
@@ -4270,14 +4291,14 @@ mod tests {
     #[test]
     fn walk_to_window_owner_process_disappears() {
         // read_ppid returns None (e.g. the process was reaped mid-walk).
-        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(100, 42)]);
         let read = ppid_reader(HashMap::new());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
     }
 
     #[test]
     fn walk_to_window_owner_respects_depth_limit() {
-        let pid_to_wid: HashMap<u32, u32> = [(100, 42)].iter().cloned().collect();
+        let pid_to_wid = mk_pid_map(&[(100, 42)]);
         let read = ppid_reader(
             [(500, 400), (400, 300), (300, 200), (200, 100)].iter().cloned().collect(),
         );
@@ -4292,9 +4313,29 @@ mod tests {
 
     #[test]
     fn walk_to_window_owner_empty_window_set() {
-        let pid_to_wid: HashMap<u32, u32> = HashMap::new();
+        let pid_to_wid: HashMap<u32, Vec<u32>> = HashMap::new();
         let read = ppid_reader([(300, 200), (200, 100)].iter().cloned().collect());
         assert_eq!(walk_to_window_owner(300, &pid_to_wid, read, 10), None);
+    }
+
+    #[test]
+    fn walk_to_window_owner_returns_none_on_collision() {
+        // gnome-terminal-server pid 2380 hosts two tracked windows. The walk
+        // lands here and must refuse to pick one — wrong attribution is worse
+        // than no attribution.
+        let pid_to_wid = mk_pid_map(&[(2380, 42), (2380, 99)]);
+        let read = ppid_reader([(605774, 2380), (2380, 1)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(605774, &pid_to_wid, read, 10), None);
+    }
+
+    #[test]
+    fn walk_to_window_owner_collision_does_not_fall_through_to_ancestor() {
+        // If the first hit is ambiguous, the walk gives up rather than
+        // climbing further and matching an unrelated ancestor (e.g. systemd,
+        // if it were a tracked window pid for some reason).
+        let pid_to_wid = mk_pid_map(&[(2380, 42), (2380, 99), (1179, 7)]);
+        let read = ppid_reader([(605774, 2380), (2380, 1179)].iter().cloned().collect());
+        assert_eq!(walk_to_window_owner(605774, &pid_to_wid, read, 10), None);
     }
 
     // ── Terminal detection ──

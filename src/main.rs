@@ -1021,65 +1021,291 @@ impl App {
     }
 
     fn handle_drop(&mut self, source_row: usize, current_y: i16) {
-        if source_row >= self.display_rows.len() {
+        let target = classify_drop(self, source_row, current_y);
+        self.apply_drop_target(source_row, target);
+    }
+
+    /// Apply a pre-computed DropTarget. Returns early without mutating
+    /// (no build_display_rows, no mark_dirty) when the drop is a no-op.
+    fn apply_drop_target(&mut self, source_row: usize, target: DropTarget) {
+        if matches!(target, DropTarget::NoOp) || source_row >= self.display_rows.len() {
             return;
         }
         let source = self.display_rows[source_row].clone();
 
-        let on_header_gid = self.hit_test_row(current_y).and_then(|r| {
-            if let DisplayRow::GroupHeader { group_id } = &self.display_rows[r] {
-                Some(*group_id)
-            } else {
-                None
+        let mutated = match target {
+            DropTarget::NoOp => false,
+            DropTarget::JoinGroup { gid, at } => self.do_join_group(&source, gid, at),
+            DropTarget::ReorderInGroup { gid, to } => {
+                self.do_reorder_in_group(&source, gid, to)
             }
-        });
-
-        let drop_gap = self.drop_index_from_y(current_y);
-
-        match source {
-            DisplayRow::GroupHeader { group_id } => {
-                self.move_slot_to(&DisplaySlot::Group(group_id), drop_gap);
+            DropTarget::InsertBefore(row_idx) => {
+                let dst_slot = self.display_row_to_slot_position(row_idx);
+                self.do_insert_at_slot(&source, Some(dst_slot))
             }
-            DisplayRow::Window {
-                wid,
-                group_id: src_gid,
-            } => {
-                if let Some(target_gid) = on_header_gid {
-                    if src_gid == Some(target_gid) {
-                        return;
-                    }
-                    if let Some(gid) = src_gid {
-                        self.remove_wid_from_group(gid, wid);
-                    } else {
-                        self.display_order
-                            .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
-                    }
-                    let new_member = self.make_group_member_for_wid(wid);
-                    if let Some(g) = self.groups.iter_mut().find(|g| g.id == target_gid) {
-                        g.members.push(new_member);
-                    }
-                } else if let Some(src_gid) = src_gid {
-                    if self.is_gap_in_group(drop_gap, src_gid) {
-                        self.reorder_within_group(src_gid, wid, drop_gap);
-                    } else {
-                        self.remove_wid_from_group(src_gid, wid);
-                        let slot_pos = self.display_row_to_slot_position(drop_gap);
-                        self.display_order
-                            .insert(slot_pos, DisplaySlot::Window(wid));
-                    }
+            DropTarget::InsertAtEnd => self.do_insert_at_slot(&source, None),
+        };
+
+        if mutated {
+            self.build_display_rows();
+            self.mark_dirty();
+        }
+    }
+
+    /// Add a Window source to group `gid` at member position `at`, removing
+    /// it from its prior location. Returns true if anything actually changed.
+    fn do_join_group(&mut self, source: &DisplayRow, gid: u32, at: usize) -> bool {
+        let (wid, src_gid) = match source {
+            DisplayRow::Window { wid, group_id } => (*wid, *group_id),
+            _ => return false, // groups/sessions can't join groups
+        };
+        // Source already in target group? Classifier should have returned
+        // ReorderInGroup; defensive no-op here.
+        if src_gid == Some(gid) {
+            return false;
+        }
+        // Detach from prior location.
+        if let Some(src_g) = src_gid {
+            self.remove_wid_from_group(src_g, wid);
+        } else {
+            self.display_order
+                .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
+        }
+        let new_member = self.make_group_member_for_wid(wid);
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == gid) {
+            let pos = at.min(g.members.len());
+            g.members.insert(pos, new_member);
+        }
+        true
+    }
+
+    /// Reorder a Window within its current group to position `to`.
+    /// Returns false (no-op, no mark_dirty) if `to` resolves to source's
+    /// existing position — fixing the G-4 "bouncing" snap-back.
+    fn do_reorder_in_group(&mut self, source: &DisplayRow, gid: u32, to: usize) -> bool {
+        let wid = match source {
+            DisplayRow::Window { wid, .. } => *wid,
+            _ => return false,
+        };
+        let group = match self.groups.iter_mut().find(|g| g.id == gid) {
+            Some(g) => g,
+            None => return false,
+        };
+        let sp = match group.position_of_live_wid(wid) {
+            Some(p) => p,
+            None => return false,
+        };
+        // No-op: target slot equals current position (either side of the
+        // member). Both `to == sp` (insert before self) and `to == sp + 1`
+        // (insert after self) collapse to identity once the remove+insert
+        // index math runs.
+        if to == sp || to == sp + 1 {
+            return false;
+        }
+        let m = group.members.remove(sp);
+        let insert_at = if to > sp {
+            (to - 1).min(group.members.len())
+        } else {
+            to.min(group.members.len())
+        };
+        group.members.insert(insert_at, m);
+        true
+    }
+
+    /// Insert the source as an ungrouped slot at `dst_slot` (or end if None).
+    /// Returns false when the move would be a no-op (same position).
+    fn do_insert_at_slot(&mut self, source: &DisplayRow, dst_slot: Option<usize>) -> bool {
+        let (new_slot, src_in_display_order) = match source {
+            DisplayRow::Window { wid, group_id } => {
+                if let Some(gid) = group_id {
+                    self.remove_wid_from_group(*gid, *wid);
+                    (DisplaySlot::Window(*wid), None)
                 } else {
-                    self.move_slot_to(&DisplaySlot::Window(wid), drop_gap);
+                    let pos = self.display_order.iter().position(
+                        |s| matches!(s, DisplaySlot::Window(w) if *w == *wid),
+                    );
+                    if let Some(p) = pos {
+                        self.display_order.remove(p);
+                    }
+                    (DisplaySlot::Window(*wid), pos)
                 }
             }
+            DisplayRow::GroupHeader { group_id } => {
+                let pos = self.display_order.iter().position(
+                    |s| matches!(s, DisplaySlot::Group(g) if *g == *group_id),
+                );
+                if let Some(p) = pos {
+                    self.display_order.remove(p);
+                }
+                (DisplaySlot::Group(*group_id), pos)
+            }
             DisplayRow::Session { name, .. } => {
-                // Sessions are standalone rows for now (no groups until C.5);
-                // dragging just reorders them inside display_order.
-                self.move_slot_to(&DisplaySlot::Session(name), drop_gap);
+                let nm = name.clone();
+                let pos = self.display_order.iter().position(
+                    |s| matches!(s, DisplaySlot::Session(n) if *n == nm),
+                );
+                if let Some(p) = pos {
+                    self.display_order.remove(p);
+                }
+                (DisplaySlot::Session(nm), pos)
+            }
+        };
+        // Adjust dst_slot if source was in display_order before the dst.
+        let insert_at = match dst_slot {
+            Some(p) => {
+                let adjusted = match src_in_display_order {
+                    Some(sp) if p > sp => p - 1,
+                    _ => p,
+                };
+                adjusted.min(self.display_order.len())
+            }
+            None => self.display_order.len(),
+        };
+        // No-op: removing then inserting at the same position changes nothing.
+        if let Some(sp) = src_in_display_order {
+            if insert_at == sp {
+                self.display_order.insert(sp, new_slot);
+                return false;
             }
         }
+        self.display_order.insert(insert_at, new_slot);
+        true
+    }
+}
 
-        self.build_display_rows();
-        self.mark_dirty();
+// ── Stage G: drop-target classifier (T3.1) ──
+//
+// Pure function consumed by both `handle_drop` (action) and the renderer
+// (drop-indicator preview), so the visual indicator can never show one
+// landing while the actual drop produces another (G-3 fix).
+//
+// Hot-zone rules (per MVP_PLAN.md Stage G):
+//   - Group header row → JoinGroup(g, 0).
+//   - Member row of group g (upper half) → JoinGroup(g, idx) [or
+//     ReorderInGroup if source is in g].
+//   - Member row + spacing below (lower half) → JoinGroup(g, idx+1).
+//   - Above the first row → InsertBefore(0).
+//   - Past the last row → InsertAtEnd.
+//   - Anywhere else → InsertBefore at the row's gap position.
+//
+// Net effect: a group's full vertical extent (header + members + bottom
+// spacing) is a join-or-reorder zone — small overshoots no longer eject
+// (G-2 fix), and dropping into a group's body actually joins (G-1 fix).
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DropTarget {
+    /// Insert at display_rows position N (i.e., before the row currently
+    /// at index N), as an ungrouped slot.
+    InsertBefore(usize),
+    /// Insert at the very end of display_order as an ungrouped slot.
+    InsertAtEnd,
+    /// Add the source to group `gid` at member position `at`.
+    JoinGroup { gid: u32, at: usize },
+    /// Reorder source within group `gid` to member position `to`.
+    ReorderInGroup { gid: u32, to: usize },
+    /// Drop is invalid (source row out of range) — produce no change.
+    NoOp,
+}
+
+fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
+    if source_row >= app.display_rows.len() {
+        return DropTarget::NoOp;
+    }
+    let source = app.display_rows[source_row].clone();
+    let source_gid = match source {
+        DisplayRow::Window { group_id, .. } => group_id,
+        _ => None,
+    };
+
+    // Header / Session source: simple gap-based reorder. (OQ-G3's
+    // group-on-group dropping is deferred.)
+    if matches!(
+        source,
+        DisplayRow::GroupHeader { .. } | DisplayRow::Session { .. }
+    ) {
+        let gap = app.drop_index_from_y(current_y);
+        if gap >= app.display_rows.len() {
+            return DropTarget::InsertAtEnd;
+        }
+        return DropTarget::InsertBefore(gap);
+    }
+
+    // Window source. Find which row's drop zone current_y sits in, where
+    // each row's zone extends from its top to the next row's top
+    // (= row + bottom spacing). The last row's zone extends one full
+    // row-height below.
+    if app.display_rows.is_empty() {
+        return DropTarget::InsertAtEnd;
+    }
+    if current_y < app.row_y(0) {
+        return DropTarget::InsertBefore(0);
+    }
+    let n = app.display_rows.len();
+    let mut target_row_index: Option<usize> = None;
+    for i in 0..n {
+        let zone_top = app.row_y(i);
+        let zone_bottom = if i + 1 < n {
+            app.row_y(i + 1)
+        } else {
+            app.row_y(i) + ITEM_H as i16 + ITEM_SPACING
+        };
+        if current_y >= zone_top && current_y < zone_bottom {
+            target_row_index = Some(i);
+            break;
+        }
+    }
+    let Some(t) = target_row_index else {
+        return DropTarget::InsertAtEnd;
+    };
+
+    let target_row = &app.display_rows[t];
+    let zone_top = app.row_y(t);
+    let row_mid = zone_top + (ITEM_H as i16 / 2);
+    let upper_half = current_y < row_mid;
+
+    match target_row {
+        DisplayRow::GroupHeader { group_id } => {
+            // Whole header row → JoinGroup(g, 0).
+            DropTarget::JoinGroup { gid: *group_id, at: 0 }
+        }
+        DisplayRow::Window {
+            group_id: Some(target_gid),
+            ..
+        } => {
+            // Find this group's header row to compute member index.
+            let hr = match app
+                .display_rows
+                .iter()
+                .position(|r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == *target_gid))
+            {
+                Some(p) => p,
+                None => return DropTarget::InsertBefore(t),
+            };
+            let member_idx = t - hr - 1;
+            let pos = if upper_half { member_idx } else { member_idx + 1 };
+            if source_gid == Some(*target_gid) {
+                DropTarget::ReorderInGroup {
+                    gid: *target_gid,
+                    to: pos,
+                }
+            } else {
+                DropTarget::JoinGroup {
+                    gid: *target_gid,
+                    at: pos,
+                }
+            }
+        }
+        DisplayRow::Window {
+            group_id: None, ..
+        }
+        | DisplayRow::Session { .. } => {
+            let pos = if upper_half { t } else { t + 1 };
+            if pos >= app.display_rows.len() {
+                DropTarget::InsertAtEnd
+            } else {
+                DropTarget::InsertBefore(pos)
+            }
+        }
     }
 }
 
@@ -4242,8 +4468,61 @@ mod tests {
         let header_y = app.row_y(0) + ITEM_H as i16 / 2;
         app.handle_drop(2, header_y);
 
-        assert_eq!(app.groups[0].live_wids(), vec![1, 2]);
+        // Stage G classifier: drop on header → JoinGroup at position 0,
+        // so the dragged window inserts at the TOP of the group rather
+        // than appending. (Pre-Stage G behaviour was append.)
+        assert_eq!(app.groups[0].live_wids(), vec![2, 1]);
         assert_eq!(app.display_order.len(), 1); // only group remains
+    }
+
+    #[test]
+    fn handle_drop_g2_regression_small_overshoot_still_in_group() {
+        // G-2: dragging a window already in group X to the gap just past
+        // the last member used to eject it from the group. With the Stage G
+        // classifier, a small overshoot (still within the spacing below the
+        // last member) keeps the window in the group.
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // display_rows: [Header(0), Window(1,g0), Window(2,g0), Window(3,None)]
+
+        // Drag B (row 2, in group) to y just past row 2's bottom — within the
+        // ITEM_SPACING gap before row 3 starts. Pre-G this ejected B; post-G
+        // it stays in group as a (no-op) reorder.
+        let last_member_bottom = app.row_y(2) + ITEM_H as i16 + 1;
+        app.handle_drop(2, last_member_bottom);
+
+        assert_eq!(app.groups[0].live_wids(), vec![1, 2], "still in group");
+        // Window 3 still ungrouped at row 3.
+        assert!(matches!(
+            app.display_order.last(),
+            Some(DisplaySlot::Window(3))
+        ));
+    }
+
+    #[test]
+    fn handle_drop_g4_regression_no_op_does_not_mutate() {
+        // G-4: dropping at the same position the source already occupies
+        // should be a no-op (no mutation, no mark_dirty). This prevents the
+        // "bouncing" snap-back the user reported.
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        // display_rows: [Header(0), Window(1,g0), Window(2,g0)]
+
+        app.clear_dirty();
+        // Drop window 2 (row 2) right at row 2's mid — should classify as
+        // ReorderInGroup{gid:0,to:2} which equals sp+1=2 → no-op.
+        let on_self = app.row_y(2) + ITEM_H as i16 / 2;
+        app.handle_drop(2, on_self);
+
+        assert_eq!(app.groups[0].live_wids(), vec![1, 2], "order preserved");
+        assert!(!app.is_dirty(), "no-op should not mark dirty");
     }
 
     #[test]
@@ -6211,6 +6490,163 @@ mod tests {
     #[test]
     fn select_keysym_empty_row_returns_zero() {
         assert_eq!(super::select_keysym(&[], 0x00), 0);
+    }
+
+    // ── Stage G / T3.1: DropTarget classifier ──
+
+    fn setup_classifier_app() -> App {
+        // [Header(g0), Window(1,g0), Window(2,g0), Window(3,None)]
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        add_item(&mut app, 3, "C");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        app
+    }
+
+    #[test]
+    fn classify_drop_on_group_header_joins_at_zero() {
+        let app = setup_classifier_app();
+        // Drag window C (row 3, ungrouped) onto group header (row 0)
+        let header_y = app.row_y(0) + 5;
+        assert_eq!(
+            super::classify_drop(&app, 3, header_y),
+            super::DropTarget::JoinGroup { gid: 0, at: 0 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_into_group_body_top_half_joins_at_member_pos() {
+        // G-1 fix: drop into the upper half of a member row joins ABOVE it.
+        let app = setup_classifier_app();
+        let row1_y = app.row_y(1) + 2; // upper half of member row 1 (window 1)
+        assert_eq!(
+            super::classify_drop(&app, 3, row1_y),
+            super::DropTarget::JoinGroup { gid: 0, at: 0 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_into_group_body_bottom_half_joins_at_next_pos() {
+        let app = setup_classifier_app();
+        let row1_bottom_y = app.row_y(1) + ITEM_H as i16 - 1;
+        assert_eq!(
+            super::classify_drop(&app, 3, row1_bottom_y),
+            super::DropTarget::JoinGroup { gid: 0, at: 1 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_in_spacing_below_last_member_joins_at_end() {
+        // G-2 fix: dropping in the small spacing right after the last member
+        // of a group still counts as in-group (joins at end), not eject.
+        let app = setup_classifier_app();
+        // Last member is row 2; spacing below extends to row_y(3).
+        let in_spacing = app.row_y(2) + ITEM_H as i16 + 1;
+        assert_eq!(
+            super::classify_drop(&app, 3, in_spacing),
+            super::DropTarget::JoinGroup { gid: 0, at: 2 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_within_same_group_reorders() {
+        // Drop window B (row 2, in group) onto window A (row 1, in group).
+        let app = setup_classifier_app();
+        let row1_y = app.row_y(1) + 2;
+        assert_eq!(
+            super::classify_drop(&app, 2, row1_y),
+            super::DropTarget::ReorderInGroup { gid: 0, to: 0 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_on_member_from_outside_joins_at_pos() {
+        // Drop window C (ungrouped, row 3) onto member row 2 — bottom half.
+        let app = setup_classifier_app();
+        let row2_bottom = app.row_y(2) + ITEM_H as i16 - 1;
+        assert_eq!(
+            super::classify_drop(&app, 3, row2_bottom),
+            super::DropTarget::JoinGroup { gid: 0, at: 2 }
+        );
+    }
+
+    #[test]
+    fn classify_drop_clearly_outside_group_extracts() {
+        // Drop window B (in-group, row 2) ONTO row 3 (an ungrouped window).
+        // This is "clearly outside" the group → InsertBefore (extracts).
+        let app = setup_classifier_app();
+        let row3_top = app.row_y(3) + 2;
+        assert_eq!(
+            super::classify_drop(&app, 2, row3_top),
+            super::DropTarget::InsertBefore(3)
+        );
+    }
+
+    #[test]
+    fn classify_drop_above_first_row_inserts_at_zero() {
+        let app = setup_classifier_app();
+        let above = app.row_y(0) - 5;
+        assert_eq!(
+            super::classify_drop(&app, 3, above),
+            super::DropTarget::InsertBefore(0)
+        );
+    }
+
+    #[test]
+    fn classify_drop_past_last_row_is_insert_at_end() {
+        let app = setup_classifier_app();
+        let below = app.row_y(3) + (ITEM_H as i16) * 5;
+        assert_eq!(
+            super::classify_drop(&app, 1, below),
+            super::DropTarget::InsertAtEnd
+        );
+    }
+
+    #[test]
+    fn classify_drop_invalid_source_row_is_noop() {
+        let app = setup_classifier_app();
+        assert_eq!(
+            super::classify_drop(&app, 99, 100),
+            super::DropTarget::NoOp
+        );
+    }
+
+    #[test]
+    fn classify_drop_session_source_just_inserts() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.display_order.push(DisplaySlot::Session("foo".to_string()));
+        app.build_display_rows();
+        // [Window(1, None), Session("foo")]
+        // Drag the session onto window 1 — top half.
+        let y = app.row_y(0) + 2;
+        // Sessions just reorder via drop_index_from_y — equivalent to
+        // InsertBefore at the top-half-of-row-0 gap.
+        assert!(matches!(
+            super::classify_drop(&app, 1, y),
+            super::DropTarget::InsertBefore(0)
+        ));
+    }
+
+    #[test]
+    fn classify_drop_collapsed_group_header_still_joins() {
+        let app = {
+            let mut a = setup_classifier_app();
+            a.toggle_collapse(0);
+            a
+        };
+        // Now display_rows = [Header(0), Window(3,None)]
+        let header_y = a_row_y(&app, 0) + 5;
+        assert_eq!(
+            super::classify_drop(&app, 1, header_y),
+            super::DropTarget::JoinGroup { gid: 0, at: 0 }
+        );
+    }
+
+    fn a_row_y(app: &App, i: usize) -> i16 {
+        app.row_y(i)
     }
 
     // ── Stage F / Phase 2a: profile-aware paths + atomic writes ──

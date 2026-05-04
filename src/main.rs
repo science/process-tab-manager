@@ -193,7 +193,45 @@ struct Group {
     id: u32,
     name: String,
     collapsed: bool,
-    member_wids: Vec<u32>,
+    /// Members in display order. Each member carries an identity tuple
+    /// (label, wm_class) for cross-restart matching plus an optional
+    /// `live_wid`. A member with `live_wid: None` is a "ghost" — saved on
+    /// disk but not currently mapped to an X11 window. Ghost members are
+    /// preserved across PTM lifecycle events so groups don't get wiped
+    /// when their windows briefly disappear (Phase 2c / Stage F fix for
+    /// FM-2 in MVP_PLAN.md).
+    members: Vec<GroupMember>,
+}
+
+#[derive(Clone, Debug)]
+struct GroupMember {
+    /// Window title at the time the member was added; used for matching
+    /// when a window with the same identity reappears.
+    label: String,
+    /// WM_CLASS, also used for matching.
+    wm_class: String,
+    /// Restored onto the matched item; not used for matching.
+    custom_prefix: String,
+    /// Some(wid) when bound to a live X11 window; None for ghosts.
+    live_wid: Option<u32>,
+}
+
+impl Group {
+    /// Wids for currently-live members, in display order. Ghost members
+    /// (live_wid: None) are skipped.
+    fn live_wids(&self) -> Vec<u32> {
+        self.members.iter().filter_map(|m| m.live_wid).collect()
+    }
+
+    /// Number of live (non-ghost) members.
+    fn live_count(&self) -> usize {
+        self.members.iter().filter(|m| m.live_wid.is_some()).count()
+    }
+
+    /// Index in `members` of the member currently bound to `wid`, if any.
+    fn position_of_live_wid(&self, wid: u32) -> Option<usize> {
+        self.members.iter().position(|m| m.live_wid == Some(wid))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -591,9 +629,9 @@ impl App {
                     self.display_rows.push(DisplayRow::GroupHeader { group_id: *gid });
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
                         if !group.collapsed {
-                            for member_wid in &group.member_wids {
+                            for member_wid in group.live_wids() {
                                 self.display_rows.push(DisplayRow::Window {
-                                    wid: *member_wid,
+                                    wid: member_wid,
                                     group_id: Some(*gid),
                                 });
                             }
@@ -652,11 +690,12 @@ impl App {
         let gid = self.next_group_id;
         self.next_group_id += 1;
         let name = format!("Group {}", gid + 1);
+        let member = self.make_group_member_for_wid(wid);
         self.groups.push(Group {
             id: gid,
             name,
             collapsed: false,
-            member_wids: vec![wid],
+            members: vec![member],
         });
         for slot in &mut self.display_order {
             if matches!(slot, DisplaySlot::Window(w) if *w == wid) {
@@ -671,11 +710,16 @@ impl App {
     fn add_to_group(&mut self, gid: u32, wid: u32) {
         self.display_order
             .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
+        // Remove the wid from any other group's member list. The user's
+        // intent in moving a window between groups is "leave the source",
+        // so we remove the entry entirely rather than turning it into a
+        // ghost — they made an explicit choice.
         for group in &mut self.groups {
-            group.member_wids.retain(|w| *w != wid);
+            group.members.retain(|m| m.live_wid != Some(wid));
         }
+        let new_member = self.make_group_member_for_wid(wid);
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
-            group.member_wids.push(wid);
+            group.members.push(new_member);
         }
         self.build_display_rows();
         self.mark_dirty();
@@ -684,9 +728,11 @@ impl App {
     fn remove_from_group(&mut self, wid: u32) {
         let mut group_gid = None;
         for group in &mut self.groups {
-            if let Some(pos) = group.member_wids.iter().position(|w| *w == wid) {
+            if let Some(pos) = group.position_of_live_wid(wid) {
                 group_gid = Some(group.id);
-                group.member_wids.remove(pos);
+                // Explicit user remove → drop the member entry entirely
+                // (no ghost retention; user chose to ungroup).
+                group.members.remove(pos);
                 break;
             }
         }
@@ -706,7 +752,10 @@ impl App {
     fn delete_group(&mut self, gid: u32) {
         let group_pos = self.groups.iter().position(|g| g.id == gid);
         if let Some(gpos) = group_pos {
-            let members = self.groups[gpos].member_wids.clone();
+            // Promote currently-live members back to ungrouped slots in the
+            // group's old position. Ghost members (live_wid = None) have no
+            // window to ungroup, so they're discarded with the group.
+            let live_wids = self.groups[gpos].live_wids();
             self.groups.remove(gpos);
             let slot_pos = self
                 .display_order
@@ -714,7 +763,7 @@ impl App {
                 .position(|s| matches!(s, DisplaySlot::Group(g) if *g == gid));
             if let Some(sp) = slot_pos {
                 self.display_order.remove(sp);
-                for (i, wid) in members.iter().enumerate() {
+                for (i, wid) in live_wids.iter().enumerate() {
                     self.display_order
                         .insert(sp + i, DisplaySlot::Window(*wid));
                 }
@@ -722,6 +771,27 @@ impl App {
         }
         self.build_display_rows();
         self.mark_dirty();
+    }
+
+    /// Build a `GroupMember` from a live wid by reading the matching item.
+    /// Returns a ghost (Some(wid) but blank label/wm_class) if the wid isn't
+    /// currently in `items` — this should be unreachable in practice but we
+    /// don't want to panic on the edge case.
+    fn make_group_member_for_wid(&self, wid: u32) -> GroupMember {
+        match self.find_item(wid) {
+            Some(item) => GroupMember {
+                label: item.label.clone(),
+                wm_class: item.wm_class.clone(),
+                custom_prefix: item.custom_prefix.clone(),
+                live_wid: Some(wid),
+            },
+            None => GroupMember {
+                label: String::new(),
+                wm_class: String::new(),
+                custom_prefix: String::new(),
+                live_wid: Some(wid),
+            },
+        }
     }
 
     fn start_rename(&mut self, gid: u32) {
@@ -847,8 +917,10 @@ impl App {
     }
 
     fn remove_wid_from_group(&mut self, gid: u32, wid: u32) {
+        // Used by drag operations that explicitly leave the source group;
+        // remove the entry entirely (matches user intent — see add_to_group).
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
-            group.member_wids.retain(|w| *w != wid);
+            group.members.retain(|m| m.live_wid != Some(wid));
         }
     }
 
@@ -890,7 +962,7 @@ impl App {
                     row_count += 1;
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
                         if !group.collapsed {
-                            row_count += group.member_wids.len();
+                            row_count += group.live_count();
                         }
                     }
                 }
@@ -925,20 +997,24 @@ impl App {
             .position(|r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == gid));
         if let Some(hr) = header_row {
             if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
-                let src_pos = group.member_wids.iter().position(|w| *w == wid);
+                // Direct port of pre-2c semantics. With no ghost members
+                // (the common case while the user is reordering visible
+                // rows), live_wids() and `members` are positionally
+                // equivalent so the existing index math stays correct.
+                let src_pos = group.position_of_live_wid(wid);
                 if let Some(sp) = src_pos {
                     let target_member = if drop_gap > hr + 1 {
                         drop_gap - hr - 1
                     } else {
                         0
                     };
-                    group.member_wids.remove(sp);
+                    let m = group.members.remove(sp);
                     let insert_at = if target_member > sp {
-                        (target_member - 1).min(group.member_wids.len())
+                        (target_member - 1).min(group.members.len())
                     } else {
-                        target_member.min(group.member_wids.len())
+                        target_member.min(group.members.len())
                     };
-                    group.member_wids.insert(insert_at, wid);
+                    group.members.insert(insert_at, m);
                 }
             }
         }
@@ -978,8 +1054,9 @@ impl App {
                         self.display_order
                             .retain(|s| !matches!(s, DisplaySlot::Window(w) if *w == wid));
                     }
+                    let new_member = self.make_group_member_for_wid(wid);
                     if let Some(g) = self.groups.iter_mut().find(|g| g.id == target_gid) {
-                        g.member_wids.push(wid);
+                        g.members.push(new_member);
                     }
                 } else if let Some(src_gid) = src_gid {
                     if self.is_gap_in_group(drop_gap, src_gid) {
@@ -1454,9 +1531,59 @@ fn refresh_items(
         }
     }
 
-    // Remove dead wids from groups
+    // FM-2 fix (Phase 2c): preserve members whose live wid disappeared as
+    // GHOSTS rather than removing them. This means a group whose windows
+    // briefly close (e.g. closing then reopening a terminal) will not
+    // collapse to zero-members and trigger the wipe path.
     for group in &mut app.groups {
-        group.member_wids.retain(|w| live_wids.contains(w));
+        for member in &mut group.members {
+            if let Some(wid) = member.live_wid {
+                if !live_wids.contains(&wid) {
+                    member.live_wid = None;
+                }
+            }
+        }
+    }
+
+    // Re-match: a wid that just appeared (in live_wids but not bound to any
+    // group member) gets a chance to claim a matching ghost slot by identity.
+    // Exact (label, wm_class) match preferred; label-only fallback after.
+    // Once claimed, the saved custom_prefix is restored onto the item.
+    let already_claimed: HashSet<u32> = app.groups
+        .iter()
+        .flat_map(|g| g.live_wids())
+        .collect();
+    for wid in &live_wids {
+        if already_claimed.contains(wid) {
+            continue;
+        }
+        let (label, wm_class) = match new_items.iter().find(|i| i.wid == *wid) {
+            Some(i) => (i.label.clone(), i.wm_class.clone()),
+            None => continue,
+        };
+        let mut restored_prefix: Option<String> = None;
+        for group in &mut app.groups {
+            let exact_pos = group.members.iter().position(|m| {
+                m.live_wid.is_none() && m.label == label && m.wm_class == wm_class
+            });
+            let pos = exact_pos.or_else(|| {
+                group.members.iter().position(|m| {
+                    m.live_wid.is_none() && m.label == label
+                })
+            });
+            if let Some(p) = pos {
+                group.members[p].live_wid = Some(*wid);
+                if !group.members[p].custom_prefix.is_empty() {
+                    restored_prefix = Some(group.members[p].custom_prefix.clone());
+                }
+                break;
+            }
+        }
+        if let Some(prefix) = restored_prefix {
+            if let Some(item) = new_items.iter_mut().find(|i| i.wid == *wid) {
+                item.custom_prefix = prefix;
+            }
+        }
     }
 
     // Drop subscription bookkeeping for wids that have gone away.
@@ -1491,7 +1618,9 @@ fn refresh_items(
         DisplaySlot::Session(name) => orphan_session_names.contains(name),
     });
 
-    // Collect wids already tracked
+    // Collect wids already tracked (live members of groups + ungrouped
+    // entries in display_order). Ghost members (live_wid: None) are not
+    // included — by construction, no live wid can match a ghost.
     let mut known_wids = HashSet::new();
     for slot in &app.display_order {
         if let DisplaySlot::Window(wid) = slot {
@@ -1499,8 +1628,8 @@ fn refresh_items(
         }
     }
     for group in &app.groups {
-        for wid in &group.member_wids {
-            known_wids.insert(*wid);
+        for wid in group.live_wids() {
+            known_wids.insert(wid);
         }
     }
 
@@ -2419,7 +2548,7 @@ impl Renderer {
 
         // Member count (dimmed) when collapsed
         if group.collapsed {
-            let count_text = format!("({})", group.member_wids.len());
+            let count_text = format!("({})", group.live_count());
             let name_width = (display.len() as i16 + 1) * CHAR_WIDTH;
             conn.change_gc(
                 self.gc,
@@ -2459,7 +2588,7 @@ impl Renderer {
             }],
         )?;
         if let Some(group) = app.groups.iter().find(|g| g.id == group_id) {
-            let text = format!("{} (+{})", group.name, group.member_wids.len());
+            let text = format!("{} (+{})", group.name, group.live_count());
             conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
             conn.image_text8(
                 drawable,
@@ -3061,15 +3190,16 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
     for slot in &app.display_order {
         if let DisplaySlot::Group(gid) = slot {
             if let Some(group) = app.groups.iter().find(|g| g.id == *gid) {
+                // Serialize ALL members (live and ghost) — that's the
+                // whole point of Phase 2c: a group with only ghost
+                // members must still round-trip across PTM restarts.
                 let members = group
-                    .member_wids
+                    .members
                     .iter()
-                    .filter_map(|wid| {
-                        app.find_item(*wid).map(|item| SavedMember {
-                            label: item.label.clone(),
-                            wm_class: item.wm_class.clone(),
-                            custom_prefix: item.custom_prefix.clone(),
-                        })
+                    .map(|m| SavedMember {
+                        label: m.label.clone(),
+                        wm_class: m.wm_class.clone(),
+                        custom_prefix: m.custom_prefix.clone(),
                     })
                     .collect();
                 saved.push(SavedGroup {
@@ -3161,9 +3291,10 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
     let mut claimed: HashSet<u32> = HashSet::new();
 
     for sg in saved {
-        let mut matched_wids: Vec<u32> = Vec::new();
-        let mut matched_prefixes: Vec<String> = Vec::new();
-
+        // Phase 2c: ALWAYS construct the group, even if no members match
+        // any current window. Unmatched members are kept as ghosts so the
+        // group survives PTM restarts where its windows aren't yet up.
+        let mut members: Vec<GroupMember> = Vec::new();
         for sm in &sg.members {
             // Prefer exact match on (label, wm_class)
             let exact = available.iter().find(|(l, c, w)| {
@@ -3175,24 +3306,24 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
                     .iter()
                     .find(|(l, _, w)| l == &sm.label && !claimed.contains(w))
             });
-            if let Some((_, _, wid)) = matched {
-                matched_wids.push(*wid);
-                matched_prefixes.push(sm.custom_prefix.clone());
-                claimed.insert(*wid);
-            }
-        }
-
-        if matched_wids.is_empty() {
-            continue;
-        }
-
-        // Restore custom_prefix on matched items
-        for (wid, prefix) in matched_wids.iter().zip(matched_prefixes.iter()) {
-            if !prefix.is_empty() {
-                if let Some(item) = app.items.iter_mut().find(|i| i.wid == *wid) {
-                    item.custom_prefix = prefix.clone();
+            let live_wid = matched.map(|(_, _, w)| {
+                claimed.insert(*w);
+                *w
+            });
+            // Restore custom_prefix on matched items
+            if let Some(wid) = live_wid {
+                if !sm.custom_prefix.is_empty() {
+                    if let Some(item) = app.items.iter_mut().find(|i| i.wid == wid) {
+                        item.custom_prefix = sm.custom_prefix.clone();
+                    }
                 }
             }
+            members.push(GroupMember {
+                label: sm.label.clone(),
+                wm_class: sm.wm_class.clone(),
+                custom_prefix: sm.custom_prefix.clone(),
+                live_wid,
+            });
         }
 
         let gid = app.next_group_id;
@@ -3201,7 +3332,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
             id: gid,
             name: sg.name.clone(),
             collapsed: sg.collapsed,
-            member_wids: matched_wids,
+            members,
         });
     }
 
@@ -3942,7 +4073,7 @@ mod tests {
         app.create_group(1);
 
         assert_eq!(app.groups.len(), 1);
-        assert_eq!(app.groups[0].member_wids, vec![1]);
+        assert_eq!(app.groups[0].live_wids(), vec![1]);
         assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
         assert!(matches!(app.display_order[1], DisplaySlot::Window(2)));
     }
@@ -3955,7 +4086,7 @@ mod tests {
         app.create_group(1);
         app.add_to_group(0, 2);
 
-        assert_eq!(app.groups[0].member_wids, vec![1, 2]);
+        assert_eq!(app.groups[0].live_wids(), vec![1, 2]);
         assert_eq!(app.display_order.len(), 1); // only the group slot remains
     }
 
@@ -3968,7 +4099,7 @@ mod tests {
         app.add_to_group(0, 2);
         app.remove_from_group(1); // remove window 1
 
-        assert_eq!(app.groups[0].member_wids, vec![2]);
+        assert_eq!(app.groups[0].live_wids(), vec![2]);
         assert_eq!(app.display_order.len(), 2);
         assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
         assert!(matches!(app.display_order[1], DisplaySlot::Window(1)));
@@ -4092,7 +4223,7 @@ mod tests {
         let header_y = app.row_y(0) + ITEM_H as i16 / 2;
         app.handle_drop(2, header_y);
 
-        assert_eq!(app.groups[0].member_wids, vec![1, 2]);
+        assert_eq!(app.groups[0].live_wids(), vec![1, 2]);
         assert_eq!(app.display_order.len(), 1); // only group remains
     }
 
@@ -4109,7 +4240,7 @@ mod tests {
         // Drag window 1 (row 1) past end of list (well below everything)
         app.handle_drop(1, 9999);
 
-        assert_eq!(app.groups[0].member_wids, vec![2]); // only window 2 remains
+        assert_eq!(app.groups[0].live_wids(), vec![2]); // only window 2 remains
         // Window 1 should now be ungrouped in display_order
         let ungrouped_wids: Vec<u32> = app
             .display_order
@@ -4527,7 +4658,7 @@ mod tests {
         assert_eq!(app.groups.len(), 1);
         assert_eq!(app.groups[0].name, "Browsers");
         assert!(app.groups[0].collapsed);
-        assert_eq!(app.groups[0].member_wids, vec![10]);
+        assert_eq!(app.groups[0].live_wids(), vec![10]);
         // display_order: Group first, then ungrouped windows
         assert!(matches!(app.display_order[0], DisplaySlot::Group(0)));
         assert!(matches!(app.display_order[1], DisplaySlot::Window(20)));
@@ -4565,11 +4696,17 @@ mod tests {
         restore_groups(&mut app, &saved);
 
         assert_eq!(app.groups.len(), 1);
-        assert_eq!(app.groups[0].member_wids, vec![10, 20]); // Terminal not found
+        assert_eq!(app.groups[0].live_wids(), vec![10, 20]); // Terminal not found
     }
 
     #[test]
-    fn restore_groups_no_match_skips_group() {
+    fn restore_groups_no_match_keeps_group_as_ghost() {
+        // Phase 2c semantics flip: a saved group whose members aren't
+        // currently present must be RETAINED with all members as ghosts
+        // (live_wid: None), so it survives PTM-restart-while-app-not-running
+        // and the member can rejoin when the window reappears.
+        // (Previous behavior: the group was silently dropped — see FM-2 in
+        // MVP_PLAN.md.)
         let mut app = make_app();
         add_item_with_class(&mut app, 10, "Firefox", "Navigator");
 
@@ -4585,8 +4722,111 @@ mod tests {
 
         restore_groups(&mut app, &saved);
 
-        assert_eq!(app.groups.len(), 0);
-        assert!(matches!(app.display_order[0], DisplaySlot::Window(10)));
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].name, "Gone");
+        assert_eq!(app.groups[0].members.len(), 1);
+        assert_eq!(app.groups[0].members[0].live_wid, None, "member is a ghost");
+        assert_eq!(app.groups[0].members[0].label, "Terminal");
+        assert_eq!(app.groups[0].live_wids().len(), 0);
+        // Firefox window 10 still appears as ungrouped (it didn't match anything).
+        assert!(app.display_order.iter().any(|s| matches!(s, DisplaySlot::Window(10))));
+        // The group also appears in display_order (so its header renders).
+        assert!(app.display_order.iter().any(|s| matches!(s, DisplaySlot::Group(_))));
+    }
+
+    // ── Stage F / Phase 2c: ghost members + identity-on-refresh ──
+
+    #[test]
+    fn group_live_wids_skips_ghosts() {
+        let g = Group {
+            id: 0,
+            name: "G".to_string(),
+            collapsed: false,
+            members: vec![
+                GroupMember {
+                    label: "A".into(),
+                    wm_class: "ac".into(),
+                    custom_prefix: "".into(),
+                    live_wid: Some(11),
+                },
+                GroupMember {
+                    label: "B".into(),
+                    wm_class: "bc".into(),
+                    custom_prefix: "".into(),
+                    live_wid: None,
+                },
+                GroupMember {
+                    label: "C".into(),
+                    wm_class: "cc".into(),
+                    custom_prefix: "".into(),
+                    live_wid: Some(33),
+                },
+            ],
+        };
+        assert_eq!(g.live_wids(), vec![11, 33]);
+        assert_eq!(g.live_count(), 2);
+        assert_eq!(g.position_of_live_wid(33), Some(2));
+        assert_eq!(g.position_of_live_wid(99), None);
+    }
+
+    #[test]
+    fn restore_groups_partial_match_keeps_unmatched_as_ghost() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "Firefox", "Navigator");
+
+        let saved = vec![SavedGroup {
+            name: "Mixed".to_string(),
+            collapsed: false,
+            members: vec![
+                SavedMember {
+                    label: "Firefox".into(),
+                    wm_class: "Navigator".into(),
+                    custom_prefix: "FF".into(),
+                },
+                SavedMember {
+                    label: "Slack".into(),
+                    wm_class: "Slack".into(),
+                    custom_prefix: "Chat".into(),
+                },
+            ],
+        }];
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].members.len(), 2);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(10));
+        assert_eq!(app.groups[0].members[1].live_wid, None);
+        // Custom prefix restored on the matched live item
+        assert_eq!(app.find_item(10).unwrap().custom_prefix, "FF");
+        // The ghost still carries its saved custom_prefix for later restoration
+        assert_eq!(app.groups[0].members[1].custom_prefix, "Chat");
+    }
+
+    #[test]
+    fn extract_saved_state_serializes_ghost_members() {
+        // Round-trip: a ghost member must serialize so the next save→load
+        // cycle preserves it.
+        let mut app = make_app();
+        let gid = app.next_group_id;
+        app.next_group_id += 1;
+        app.groups.push(Group {
+            id: gid,
+            name: "Persistent".into(),
+            collapsed: false,
+            members: vec![GroupMember {
+                label: "Vim".into(),
+                wm_class: "vim".into(),
+                custom_prefix: String::new(),
+                live_wid: None, // ghost
+            }],
+        });
+        app.display_order.push(DisplaySlot::Group(gid));
+
+        let saved = extract_saved_state(&app);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].members.len(), 1);
+        assert_eq!(saved[0].members[0].label, "Vim");
+        assert_eq!(saved[0].members[0].wm_class, "vim");
     }
 
     #[test]
@@ -4608,7 +4848,7 @@ mod tests {
         restore_groups(&mut app, &saved);
 
         assert_eq!(app.groups.len(), 1);
-        assert_eq!(app.groups[0].member_wids, vec![20]); // matched xterm, not gnome-terminal
+        assert_eq!(app.groups[0].live_wids(), vec![20]); // matched xterm, not gnome-terminal
     }
 
     #[test]

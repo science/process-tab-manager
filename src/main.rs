@@ -334,24 +334,75 @@ impl RenameState {
     }
 
     /// Delete from cursor back to the previous word boundary.
-    /// Does NOT consult the selection (T1.4 wires selection-first behaviour
-    /// into the Backspace key handler).
+    /// If a selection exists, deletes only the selection (selection takes
+    /// precedence — standard UX).
     fn delete_word_left(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let target = prev_word_boundary(&self.text, self.cursor);
         if target < self.cursor {
             self.text.drain(target..self.cursor);
             self.cursor = target;
-            self.selection_anchor = None;
         }
     }
 
     /// Delete from cursor forward to the next word boundary.
+    /// If a selection exists, deletes only the selection.
     fn delete_word_right(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let target = next_word_boundary(&self.text, self.cursor);
         if target > self.cursor {
             self.text.drain(self.cursor..target);
-            self.selection_anchor = None;
         }
+    }
+
+    /// If a selection exists, drop the selected bytes and return true.
+    /// Cursor lands at the start of the deleted range. Mirrors the helper
+    /// shape used internally by the editing operations below.
+    fn delete_selection(&mut self) -> bool {
+        if let Some((lo, hi)) = self.selection_range() {
+            self.text.drain(lo..hi);
+            self.cursor = lo;
+            self.selection_anchor = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Insert a char at the cursor. If a selection exists, replace it first.
+    fn insert_char(&mut self, ch: char) {
+        self.delete_selection();
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    /// Backspace: if selection, delete it; else delete the char before cursor.
+    fn delete_back_char(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.prev_char_boundary();
+        self.text.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    /// Delete (forward): if selection, delete it; else delete the char after cursor.
+    fn delete_forward_char(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let next = self.next_char_boundary();
+        self.text.drain(self.cursor..next);
     }
 }
 
@@ -3213,32 +3264,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0xff08 => {
                             // Backspace
                             if let Some(ref mut rs) = app.rename {
-                                if ctrl {
-                                    rs.delete_word_left();
-                                } else if rs.cursor > 0 {
-                                    let prev = rs.text[..rs.cursor]
-                                        .char_indices()
-                                        .next_back()
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(0);
-                                    rs.text.drain(prev..rs.cursor);
-                                    rs.cursor = prev;
-                                }
+                                if ctrl { rs.delete_word_left(); } else { rs.delete_back_char(); }
                             }
                         }
                         0xffff => {
                             // Delete
                             if let Some(ref mut rs) = app.rename {
-                                if ctrl {
-                                    rs.delete_word_right();
-                                } else if rs.cursor < rs.text.len() {
-                                    let next = rs.text[rs.cursor..]
-                                        .char_indices()
-                                        .nth(1)
-                                        .map(|(i, _)| rs.cursor + i)
-                                        .unwrap_or(rs.text.len());
-                                    rs.text.drain(rs.cursor..next);
-                                }
+                                if ctrl { rs.delete_word_right(); } else { rs.delete_forward_char(); }
                             }
                         }
                         0xff51 => {
@@ -3280,8 +3312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !ctrl {
                                 if let Some(ch) = printable_char_from_sym(sym) {
                                     if let Some(ref mut rs) = app.rename {
-                                        rs.text.insert(rs.cursor, ch);
-                                        rs.cursor += ch.len_utf8();
+                                        rs.insert_char(ch);
                                     }
                                 }
                             }
@@ -5315,5 +5346,113 @@ mod tests {
         rs.delete_word_right();
         assert_eq!(rs.text, "hello");
         assert_eq!(rs.cursor, 5);
+    }
+
+    // ── Stage H: T1.4 — printable input replaces selection;
+    //                    selection-aware backspace/delete ──
+
+    #[test]
+    fn rename_insert_char_no_selection_inserts_at_cursor() {
+        let mut rs = make_rename_state("hllo", 1, None);
+        rs.insert_char('e');
+        assert_eq!(rs.text, "hello");
+        assert_eq!(rs.cursor, 2);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_insert_char_replaces_selection() {
+        let mut rs = make_rename_state("hello world", 5, Some(0));
+        rs.insert_char('X');
+        assert_eq!(rs.text, "X world");
+        assert_eq!(rs.cursor, 1); // after the inserted X
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_insert_char_replaces_selection_with_reversed_anchor() {
+        let mut rs = make_rename_state("hello world", 0, Some(5));
+        rs.insert_char('Y');
+        assert_eq!(rs.text, "Y world");
+        assert_eq!(rs.cursor, 1);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_insert_multibyte_char_advances_cursor_correctly() {
+        let mut rs = make_rename_state("caf", 3, None);
+        rs.insert_char('é');
+        assert_eq!(rs.text, "café");
+        assert_eq!(rs.cursor, 5); // é is 2 bytes
+    }
+
+    #[test]
+    fn rename_delete_back_char_with_selection_only_deletes_selection() {
+        let mut rs = make_rename_state("hello world", 5, Some(0));
+        rs.delete_back_char();
+        assert_eq!(rs.text, " world");
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_delete_back_char_without_selection_deletes_char_before() {
+        let mut rs = make_rename_state("hello", 5, None);
+        rs.delete_back_char();
+        assert_eq!(rs.text, "hell");
+        assert_eq!(rs.cursor, 4);
+    }
+
+    #[test]
+    fn rename_delete_back_char_at_zero_is_noop_when_no_selection() {
+        let mut rs = make_rename_state("hello", 0, None);
+        rs.delete_back_char();
+        assert_eq!(rs.text, "hello");
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_delete_forward_char_with_selection_only_deletes_selection() {
+        let mut rs = make_rename_state("hello world", 5, Some(0));
+        rs.delete_forward_char();
+        assert_eq!(rs.text, " world");
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_delete_forward_char_without_selection_deletes_char_after() {
+        let mut rs = make_rename_state("hello", 0, None);
+        rs.delete_forward_char();
+        assert_eq!(rs.text, "ello");
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_delete_forward_char_at_end_is_noop_when_no_selection() {
+        let mut rs = make_rename_state("hello", 5, None);
+        rs.delete_forward_char();
+        assert_eq!(rs.text, "hello");
+        assert_eq!(rs.cursor, 5);
+    }
+
+    #[test]
+    fn rename_delete_word_left_with_selection_only_deletes_selection() {
+        // Word delete with active selection should NOT also delete a word —
+        // standard UX: selection takes precedence.
+        let mut rs = make_rename_state("hello world", 5, Some(0));
+        rs.delete_word_left();
+        assert_eq!(rs.text, " world");
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_delete_word_right_with_selection_only_deletes_selection() {
+        let mut rs = make_rename_state("hello world", 5, Some(0));
+        rs.delete_word_right();
+        assert_eq!(rs.text, " world");
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
     }
 }

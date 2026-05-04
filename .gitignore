@@ -2,3 +2,4 @@
 /vm
 claude-max-key.txt
 claude-install.sh
+.claude/scheduled_tasks.lock

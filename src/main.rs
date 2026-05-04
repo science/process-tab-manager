@@ -226,6 +226,35 @@ struct RenameState {
     target: RenameTarget,
     text: String,
     cursor: usize, // byte position in text
+    selection_anchor: Option<usize>, // byte position; None = no active selection
+}
+
+impl RenameState {
+    /// Returns (start, end) byte positions, normalized so start < end.
+    /// None when no anchor is set or when the anchor is collapsed onto the cursor.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        match self.selection_anchor {
+            Some(a) if a != self.cursor => Some((a.min(self.cursor), a.max(self.cursor))),
+            _ => None,
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Set anchor to current cursor only if it isn't already set. Used at the
+    /// start of a Shift+arrow extension so subsequent Shift+arrows extend from
+    /// the original cursor position.
+    fn anchor_if_none(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+    }
 }
 
 // ── App ──
@@ -439,6 +468,7 @@ impl App {
             target: RenameTarget::Group(gid),
             text,
             cursor,
+            selection_anchor: None,
         });
     }
 
@@ -449,6 +479,7 @@ impl App {
             target: RenameTarget::Session(session_name.to_string()),
             text,
             cursor,
+            selection_anchor: None,
         });
     }
 
@@ -464,6 +495,7 @@ impl App {
             target: RenameTarget::Window(wid),
             text,
             cursor,
+            selection_anchor: None,
         });
     }
 
@@ -4784,5 +4816,66 @@ mod tests {
     fn header_button_hit_test_negative_is_false() {
         let app = make_app();
         assert!(!app.hit_test_header_button(-1));
+    }
+
+    // ── Stage H: rename selection (T1.1 — selection_anchor data + helpers) ──
+
+    fn make_rename_state(text: &str, cursor: usize, anchor: Option<usize>) -> RenameState {
+        RenameState {
+            target: RenameTarget::Group(0),
+            text: text.to_string(),
+            cursor,
+            selection_anchor: anchor,
+        }
+    }
+
+    #[test]
+    fn rename_selection_range_none_when_anchor_unset() {
+        let rs = make_rename_state("hello", 3, None);
+        assert_eq!(rs.selection_range(), None);
+        assert!(!rs.has_selection());
+    }
+
+    #[test]
+    fn rename_selection_range_normalized_when_anchor_before_cursor() {
+        let rs = make_rename_state("hello world", 7, Some(2));
+        assert_eq!(rs.selection_range(), Some((2, 7)));
+        assert!(rs.has_selection());
+    }
+
+    #[test]
+    fn rename_selection_range_normalized_when_anchor_after_cursor() {
+        let rs = make_rename_state("hello world", 2, Some(7));
+        assert_eq!(rs.selection_range(), Some((2, 7)));
+        assert!(rs.has_selection());
+    }
+
+    #[test]
+    fn rename_selection_range_none_when_anchor_equals_cursor() {
+        let rs = make_rename_state("hello", 3, Some(3));
+        assert_eq!(rs.selection_range(), None);
+        assert!(!rs.has_selection());
+    }
+
+    #[test]
+    fn rename_clear_selection_unsets_anchor() {
+        let mut rs = make_rename_state("hello", 3, Some(0));
+        rs.clear_selection();
+        assert_eq!(rs.selection_anchor, None);
+        assert_eq!(rs.cursor, 3); // cursor unchanged
+    }
+
+    #[test]
+    fn rename_anchor_if_none_sets_anchor_to_cursor_when_unset() {
+        let mut rs = make_rename_state("hello", 3, None);
+        rs.anchor_if_none();
+        assert_eq!(rs.selection_anchor, Some(3));
+    }
+
+    #[test]
+    fn rename_anchor_if_none_preserves_existing_anchor() {
+        let mut rs = make_rename_state("hello", 3, Some(0));
+        rs.anchor_if_none();
+        assert_eq!(rs.selection_anchor, Some(0)); // not overwritten
     }
 }

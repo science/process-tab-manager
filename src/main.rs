@@ -42,6 +42,9 @@ const MENU_BORDER_COLOR: u32 = 0x3e4451;
 const MENU_HOVER_COLOR: u32 = 0x2c313a;
 const GROUP_HEADER_COLOR: u32 = 0x21252b;
 const SESSION_MARKER_COLOR: u32 = 0x98c379; // OneDark green — tmux-backed window indicator
+// Subdued blue for the rename selection background; dark enough that the
+// regular text colour stays readable on top.
+const SELECTION_BG_COLOR: u32 = 0x3a5a7e;
 
 // Accent colors for left-edge stripe (OneDark)
 const ACCENT_COLORS: &[u32] = &[0xe06c75, 0x98c379, 0x61afef, 0xc678dd, 0xe5c07b, 0x56b6c2];
@@ -239,6 +242,7 @@ impl RenameState {
         }
     }
 
+    #[allow(dead_code)] // exposed for tests / external callers
     fn has_selection(&self) -> bool {
         self.selection_range().is_some()
     }
@@ -1811,6 +1815,7 @@ struct Renderer {
     group_header_pixel: u32,
     group_color_pixels: Vec<u32>,
     session_marker_pixel: u32,
+    selection_bg_pixel: u32,
 }
 
 impl Renderer {
@@ -1836,6 +1841,7 @@ impl Renderer {
         let menu_hover_pixel = alloc_color(conn, colormap, MENU_HOVER_COLOR)?;
         let group_header_pixel = alloc_color(conn, colormap, GROUP_HEADER_COLOR)?;
         let session_marker_pixel = alloc_color(conn, colormap, SESSION_MARKER_COLOR)?;
+        let selection_bg_pixel = alloc_color(conn, colormap, SELECTION_BG_COLOR)?;
 
         let mut group_color_pixels = Vec::new();
         for &c in GROUP_COLORS {
@@ -1887,6 +1893,7 @@ impl Renderer {
             group_header_pixel,
             group_color_pixels,
             session_marker_pixel,
+            selection_bg_pixel,
         })
     }
 
@@ -2420,17 +2427,70 @@ impl Renderer {
         conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix, y, width: 1, height: ITEM_H as u16 }])?;
         conn.poly_fill_rectangle(drawable, self.gc, &[Rectangle { x: ix + iw as i16 - 1, y, width: 1, height: ITEM_H as u16 }])?;
 
-        // Text
-        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = ix + 8;
         let text_y = y + (ITEM_H as i16 / 2) + 4;
         let max_chars = ((iw as i16 - 16) / CHAR_WIDTH).max(0) as usize;
-        let display: String = rs.text.chars().take(max_chars).collect();
-        if !display.is_empty() {
-            conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
+        let display_chars: Vec<char> = rs.text.chars().take(max_chars).collect();
+
+        // Map byte selection to visible char range (if any).
+        let (sel_lo_chars, sel_hi_chars) = match rs.selection_range() {
+            Some((lo_byte, hi_byte)) => {
+                let lo_b = lo_byte.min(rs.text.len());
+                let hi_b = hi_byte.min(rs.text.len());
+                let lo_c = rs.text[..lo_b].chars().count().min(max_chars);
+                let hi_c = rs.text[..hi_b].chars().count().min(max_chars);
+                (lo_c, hi_c)
+            }
+            None => (0, 0),
+        };
+
+        // Selection highlight (drawn underneath the text so the per-glyph
+        // backgrounds from image_text8 overwrite it cleanly within character
+        // cells; we then re-draw the selected cells with the selection
+        // background to recover the highlight).
+        if sel_hi_chars > sel_lo_chars {
+            let sel_x = text_x + (sel_lo_chars as i16) * CHAR_WIDTH;
+            let sel_w = ((sel_hi_chars - sel_lo_chars) as i16 * CHAR_WIDTH) as u16;
+            conn.change_gc(
+                self.gc,
+                &ChangeGCAux::new().foreground(self.selection_bg_pixel),
+            )?;
+            conn.poly_fill_rectangle(
+                drawable,
+                self.gc,
+                &[Rectangle {
+                    x: sel_x,
+                    y: y + 4,
+                    width: sel_w,
+                    height: ITEM_H as u16 - 8,
+                }],
+            )?;
+        }
+
+        // Text — draw in 1 or 3 segments so each glyph's image_text8 background
+        // matches the underlying selection highlight.
+        let visible = display_chars.len();
+        let draw_text_segment = |start: usize, end: usize, bg: u32| -> Result<(), Box<dyn std::error::Error>> {
+            if end <= start { return Ok(()); }
+            let segment: String = display_chars[start..end].iter().collect();
+            conn.change_gc(
+                self.gc,
+                &ChangeGCAux::new().foreground(self.text_pixel).background(bg),
+            )?;
+            let seg_x = text_x + (start as i16) * CHAR_WIDTH;
+            conn.image_text8(drawable, self.gc, seg_x, text_y, segment.as_bytes())?;
+            Ok(())
+        };
+        if sel_hi_chars > sel_lo_chars {
+            draw_text_segment(0, sel_lo_chars, self.bg_pixel)?;
+            draw_text_segment(sel_lo_chars, sel_hi_chars, self.selection_bg_pixel)?;
+            draw_text_segment(sel_hi_chars, visible, self.bg_pixel)?;
+        } else {
+            draw_text_segment(0, visible, self.bg_pixel)?;
         }
 
         // Cursor bar
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let cursor_chars = rs.text[..rs.cursor].chars().count().min(max_chars);
         let cursor_x = text_x + (cursor_chars as i16) * CHAR_WIDTH;
         conn.poly_fill_rectangle(
@@ -2748,10 +2808,30 @@ fn keysym_from_keycode(
     if offset >= reply.keysyms.len() {
         return Ok(0);
     }
-    // Column 0 = unshifted, column 1 = shifted
-    let shifted = u16::from(state) & 1 != 0; // ShiftMask = bit 0
-    let col = if shifted && syms_per_kc > 1 { 1 } else { 0 };
-    Ok(reply.keysyms[offset + col])
+    let row_end = (offset + syms_per_kc).min(reply.keysyms.len());
+    Ok(select_keysym(&reply.keysyms[offset..row_end], u16::from(state)))
+}
+
+/// Pure keysym-column picker. Given a single keycode's row of keysyms and
+/// the X11 modifier state, return the keysym we should act on.
+///
+/// Column 0 = unshifted, column 1 = shifted. Per X11 protocol semantics, if
+/// the shifted column is NoSymbol (0) — which is typical for non-printing
+/// keys like arrows where Shift+Left has no distinct keysym — fall back to
+/// the unshifted symbol so callers see the expected key.
+fn select_keysym(row: &[u32], state: u16) -> u32 {
+    if row.is_empty() {
+        return 0;
+    }
+    let unshifted = row[0];
+    let shift_held = state & 1 != 0; // X11 ShiftMask
+    if shift_held {
+        let shifted_sym = row.get(1).copied().unwrap_or(0);
+        if shifted_sym != 0 {
+            return shifted_sym;
+        }
+    }
+    unshifted
 }
 
 fn printable_char_from_sym(sym: u32) -> Option<char> {
@@ -5524,5 +5604,36 @@ mod tests {
         assert_eq!(rs.cursor, 1);
         // Important: no phantom selection of the just-typed char.
         assert_eq!(rs.selection_anchor, None);
+    }
+
+    // ── Stage H: keysym-column fallback (regression for shift+arrow / Home / End) ──
+
+    #[test]
+    fn select_keysym_no_shift_returns_col_zero() {
+        // keycode for 'a': col0=0x61 ('a'), col1=0x41 ('A')
+        assert_eq!(super::select_keysym(&[0x61, 0x41], 0x00), 0x61);
+    }
+
+    #[test]
+    fn select_keysym_shift_returns_col_one_when_distinct() {
+        assert_eq!(super::select_keysym(&[0x61, 0x41], 0x01), 0x41);
+    }
+
+    #[test]
+    fn select_keysym_shift_falls_back_to_col_zero_when_col_one_is_no_symbol() {
+        // Arrow key: col0=0xff51 (Left), col1=0 (NoSymbol). Shift+Left should
+        // still return Left so the rename handler's match arm fires.
+        assert_eq!(super::select_keysym(&[0xff51, 0x0], 0x01), 0xff51);
+    }
+
+    #[test]
+    fn select_keysym_shift_falls_back_when_only_one_column() {
+        // Some keycodes have only one symbol — must still return it under shift.
+        assert_eq!(super::select_keysym(&[0xff50], 0x01), 0xff50);
+    }
+
+    #[test]
+    fn select_keysym_empty_row_returns_zero() {
+        assert_eq!(super::select_keysym(&[], 0x00), 0);
     }
 }

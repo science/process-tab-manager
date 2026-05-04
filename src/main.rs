@@ -43,7 +43,8 @@ const MENU_HOVER_COLOR: u32 = 0x2c313a;
 const GROUP_HEADER_COLOR: u32 = 0x21252b;
 const SESSION_MARKER_COLOR: u32 = 0x98c379; // OneDark green — tmux-backed window indicator
 // Subdued blue for the rename selection background; dark enough that the
-// regular text colour stays readable on top.
+// regular text colour stays readable on top. Also reused for the
+// post-drop row flash (T3.5).
 const SELECTION_BG_COLOR: u32 = 0x3a5a7e;
 
 // Accent colors for left-edge stripe (OneDark)
@@ -563,7 +564,17 @@ struct App {
     /// Updated on EVERY mutation; the debounced save fires when enough idle
     /// time has elapsed since this timestamp.
     last_dirty_at: Option<std::time::Instant>,
+    /// (wid, started_at) for a drop the user just completed. The renderer
+    /// uses this to flash the destination row briefly so the user sees
+    /// where their dragged window landed (G-5 / Stage G T3.5). Cleared
+    /// implicitly: after DROP_HIGHLIGHT_DURATION elapses, the renderer
+    /// stops drawing the highlight even if the field is still set.
+    last_drop_highlight: Option<(u32, std::time::Instant)>,
 }
+
+/// How long a successful-drop row highlight stays visible before fading out.
+/// (Drops that resolved as no-ops do not set the highlight.)
+const DROP_HIGHLIGHT_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl App {
     fn new(our_wid: u32) -> Self {
@@ -588,6 +599,18 @@ impl App {
             pending_attach: None,
             first_dirty_at: None,
             last_dirty_at: None,
+            last_drop_highlight: None,
+        }
+    }
+
+    /// Returns true while a post-drop highlight is still within its
+    /// fade duration. Used by the renderer to flash the destination row.
+    fn drop_highlight_active_for(&self, wid: u32) -> bool {
+        match self.last_drop_highlight {
+            Some((hwid, when)) if hwid == wid => {
+                when.elapsed() < DROP_HIGHLIGHT_DURATION
+            }
+            _ => false,
         }
     }
 
@@ -1035,6 +1058,10 @@ impl App {
             return;
         }
         let source = self.display_rows[source_row].clone();
+        let highlight_wid = match source {
+            DisplayRow::Window { wid, .. } => Some(wid),
+            _ => None,
+        };
 
         let mutated = match target {
             DropTarget::NoOp => false,
@@ -1050,6 +1077,11 @@ impl App {
         };
 
         if mutated {
+            // T3.5 (G-5): flash the destination row so the user sees where
+            // it landed. Only set on actual moves — no-ops skip this.
+            if let Some(wid) = highlight_wid {
+                self.last_drop_highlight = Some((wid, std::time::Instant::now()));
+            }
             self.build_display_rows();
             self.mark_dirty();
         }
@@ -2482,6 +2514,7 @@ impl Renderer {
                 DisplayRow::Window { wid, group_id } => {
                     if let Some(item) = app.find_item(*wid) {
                         let is_active = app.active_wid == Some(*wid);
+                        let drop_hi = app.drop_highlight_active_for(*wid);
                         let ix = app.item_x();
                         let iw = app.item_w();
                         let (x, w) = if group_id.is_some() {
@@ -2489,7 +2522,7 @@ impl Renderer {
                         } else {
                             (ix, iw)
                         };
-                        self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active)?;
+                        self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active, drop_hi)?;
                     }
                 }
                 DisplayRow::Session { name, group_id } => {
@@ -2587,7 +2620,7 @@ impl Renderer {
                                     (ix, iw)
                                 };
                                 self.draw_item(
-                                    conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false,
+                                    conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false, false,
                                 )?;
                             }
                         }
@@ -2658,9 +2691,15 @@ impl Renderer {
         ghost: bool,
         hovered: bool,
         is_active: bool,
+        drop_highlighted: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Drop-highlight (T3.5) overrides hover/active so the user can't
+        // miss the post-drop flash, but ghost (drag preview) still wins
+        // because the dragged item shouldn't pretend it landed yet.
         let bg = if ghost {
             self.ghost_pixel
+        } else if drop_highlighted {
+            self.selection_bg_pixel
         } else if is_active {
             self.item_active_pixel
         } else if hovered {
@@ -3865,6 +3904,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.clear_dirty();
                     }
                 }
+                // T3.5: while a post-drop highlight is mid-fade, request a
+                // redraw on every save tick so the fade visibly progresses
+                // and clears once the duration expires.
+                if let Some((_, when)) = app.last_drop_highlight {
+                    if when.elapsed() < DROP_HIGHLIGHT_DURATION + std::time::Duration::from_millis(250) {
+                        renderer.redraw(&conn, &app)?;
+                    } else {
+                        // Past the visible window — clear so it doesn't
+                        // accumulate across many drops.
+                        app.last_drop_highlight = None;
+                    }
+                }
                 continue;
             }
             if ev.type_ == atoms.ptm_wake {
@@ -4608,6 +4659,37 @@ mod tests {
             app.display_order.last(),
             Some(DisplaySlot::Window(3))
         ));
+    }
+
+    #[test]
+    fn handle_drop_sets_last_drop_highlight_on_success() {
+        // T3.5 (G-5): a real (non-no-op) drop sets last_drop_highlight to
+        // the moved wid, so the renderer can flash the destination row.
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.build_display_rows();
+        // Drop B (row 1) above A (row 0)
+        let above = app.row_y(0) - 5;
+        app.handle_drop(1, above);
+        let (wid, _) = app.last_drop_highlight.expect("highlight set");
+        assert_eq!(wid, 2);
+        assert!(app.drop_highlight_active_for(2));
+        assert!(!app.drop_highlight_active_for(1));
+    }
+
+    #[test]
+    fn handle_drop_does_not_set_highlight_on_noop() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.add_to_group(0, 2);
+        app.last_drop_highlight = None;
+        // Drop B onto itself (no-op)
+        let on_self = app.row_y(2) + ITEM_H as i16 / 2;
+        app.handle_drop(2, on_self);
+        assert!(app.last_drop_highlight.is_none());
     }
 
     #[test]

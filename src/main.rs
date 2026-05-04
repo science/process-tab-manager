@@ -68,6 +68,7 @@ struct Atoms {
     wm_delete_window: Atom,
     net_wm_pid: Atom,
     ptm_wake: Atom,
+    ptm_save_tick: Atom,
 }
 
 impl Atoms {
@@ -86,6 +87,7 @@ impl Atoms {
         let c11 = conn.intern_atom(false, b"WM_DELETE_WINDOW")?;
         let c12 = conn.intern_atom(false, b"_NET_WM_PID")?;
         let c13 = conn.intern_atom(false, b"_PTM_WAKE")?;
+        let c14 = conn.intern_atom(false, b"_PTM_SAVE_TICK")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -101,6 +103,7 @@ impl Atoms {
             wm_delete_window: c11.reply()?.atom,
             net_wm_pid: c12.reply()?.atom,
             ptm_wake: c13.reply()?.atom,
+            ptm_save_tick: c14.reply()?.atom,
         })
     }
 }
@@ -128,6 +131,33 @@ fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::
                 sequence: 0,
                 window,
                 type_: wake_atom,
+                data,
+            };
+            let _ = c.send_event(false, window, EventMask::NO_EVENT, ev);
+            let _ = c.flush();
+            std::thread::sleep(interval);
+        }
+    });
+}
+
+/// Wakes PTM every `interval` so the dirty-flag debounce can be checked
+/// during pure-idle periods (no X events flowing). Identical mechanism to
+/// `spawn_tmux_poll_thread` but with a distinct atom so the main loop can
+/// avoid the cost of refreshing tmux state on every save tick.
+fn spawn_save_tick_thread(window: Window, save_tick_atom: Atom, interval: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(interval);
+        let Ok((c, _)) = x11rb::connect(None) else {
+            return;
+        };
+        loop {
+            let data = ClientMessageData::from([0u32; 5]);
+            let ev = ClientMessageEvent {
+                response_type: 33,
+                format: 32,
+                sequence: 0,
+                window,
+                type_: save_tick_atom,
                 data,
             };
             let _ = c.send_event(false, window, EventMask::NO_EVENT, ev);
@@ -487,6 +517,14 @@ struct App {
     // terminal, konsole), so we instead watch for the next newly-appearing
     // window and claim it for the pending session.
     pending_attach: Option<(String, std::time::Instant)>,
+    /// Set on the FIRST mutation in a dirty epoch; preserved across
+    /// subsequent mutations. Used by the 30-second backstop to bound the
+    /// worst-case data loss when a long burst of edits would otherwise
+    /// keep the debounce window open indefinitely.
+    first_dirty_at: Option<std::time::Instant>,
+    /// Updated on EVERY mutation; the debounced save fires when enough idle
+    /// time has elapsed since this timestamp.
+    last_dirty_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -510,11 +548,33 @@ impl App {
             our_wid,
             subscribed_wids: HashSet::new(),
             pending_attach: None,
+            first_dirty_at: None,
+            last_dirty_at: None,
         }
     }
 
     fn hit_test_header_button(&self, y: i16) -> bool {
         y >= 0 && y < HEADER_H as i16
+    }
+
+    /// Mark persistence-relevant state as dirty. Idempotent within a single
+    /// dirty epoch — `first_dirty_at` is preserved, `last_dirty_at` advances.
+    fn mark_dirty(&mut self) {
+        let now = std::time::Instant::now();
+        if self.first_dirty_at.is_none() {
+            self.first_dirty_at = Some(now);
+        }
+        self.last_dirty_at = Some(now);
+    }
+
+    fn clear_dirty(&mut self) {
+        self.first_dirty_at = None;
+        self.last_dirty_at = None;
+    }
+
+    #[allow(dead_code)] // exposed for tests / external callers
+    fn is_dirty(&self) -> bool {
+        self.first_dirty_at.is_some()
     }
 
     fn build_display_rows(&mut self) {
@@ -605,6 +665,7 @@ impl App {
             }
         }
         self.build_display_rows();
+        self.mark_dirty();
     }
 
     fn add_to_group(&mut self, gid: u32, wid: u32) {
@@ -617,6 +678,7 @@ impl App {
             group.member_wids.push(wid);
         }
         self.build_display_rows();
+        self.mark_dirty();
     }
 
     fn remove_from_group(&mut self, wid: u32) {
@@ -638,6 +700,7 @@ impl App {
                 .insert(insert_at, DisplaySlot::Window(wid));
         }
         self.build_display_rows();
+        self.mark_dirty();
     }
 
     fn delete_group(&mut self, gid: u32) {
@@ -658,6 +721,7 @@ impl App {
             }
         }
         self.build_display_rows();
+        self.mark_dirty();
     }
 
     fn start_rename(&mut self, gid: u32) {
@@ -715,7 +779,10 @@ impl App {
                         if let Some(group) =
                             self.groups.iter_mut().find(|g| g.id == gid)
                         {
-                            group.name = name;
+                            if group.name != name {
+                                group.name = name;
+                                self.mark_dirty();
+                            }
                         }
                     }
                 }
@@ -724,7 +791,10 @@ impl App {
                     if let Some(item) =
                         self.items.iter_mut().find(|i| i.wid == wid)
                     {
-                        item.custom_prefix = prefix;
+                        if item.custom_prefix != prefix {
+                            item.custom_prefix = prefix;
+                            self.mark_dirty();
+                        }
                     }
                 }
                 RenameTarget::Session(old) => {
@@ -751,6 +821,9 @@ impl App {
                             }
                         }
                         self.build_display_rows();
+                        // Tmux session names aren't persisted to PTM's groups
+                        // file (tmux is the source of truth there), so no
+                        // mark_dirty needed for this branch.
                     }
                 }
             }
@@ -762,10 +835,15 @@ impl App {
     }
 
     fn toggle_collapse(&mut self, gid: u32) {
+        let mut toggled = false;
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == gid) {
             group.collapsed = !group.collapsed;
+            toggled = true;
         }
         self.build_display_rows();
+        if toggled {
+            self.mark_dirty();
+        }
     }
 
     fn remove_wid_from_group(&mut self, gid: u32, wid: u32) {
@@ -924,6 +1002,7 @@ impl App {
         }
 
         self.build_display_rows();
+        self.mark_dirty();
     }
 }
 
@@ -2843,6 +2922,37 @@ fn printable_char_from_sym(sym: u32) -> Option<char> {
     }
 }
 
+// ── Persistence: dirty/save policy ──
+
+/// How long to wait after the last mutation before debouncing a save out.
+/// Short bursts of edits coalesce into one write; this is the lower bound
+/// on the post-burst idle period before disk activity.
+const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Hard upper bound on time between mutation and save. If the user keeps
+/// mutating fast enough that the debounce window never closes, the backstop
+/// fires anyway so worst-case data loss is bounded.
+const SAVE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pure debounce/backstop check. Returns true when the dirty state has
+/// satisfied either the post-edit idle window OR the absolute backstop.
+fn should_save_now(
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    let (Some(first), Some(last)) = (first, last) else {
+        return false;
+    };
+    if now.saturating_duration_since(last) >= SAVE_DEBOUNCE {
+        return true;
+    }
+    if now.saturating_duration_since(first) >= SAVE_BACKSTOP {
+        return true;
+    }
+    false
+}
+
 // ── Persistence: paths, atomic writes, legacy migration ──
 
 /// The data directory for the active profile. v1 hard-codes the profile name
@@ -3240,6 +3350,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // changes (sessions created or destroyed outside PTM) show up promptly.
     spawn_tmux_poll_thread(window, atoms.ptm_wake, std::time::Duration::from_secs(5));
 
+    // Save-tick thread: pings the main loop every 250 ms so the dirty-flag
+    // debounce can fire even during pure-idle periods. Distinct atom from
+    // the tmux poll so we don't pay tmux-list-sessions cost 4x/s.
+    spawn_save_tick_thread(
+        window,
+        atoms.ptm_save_tick,
+        std::time::Duration::from_millis(250),
+    );
+
     loop {
         let event = conn.wait_for_event()?;
 
@@ -3248,7 +3367,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ev.window == window && ev.data.as_data32()[0] == atoms.wm_delete_window {
                 save_geometry(app.x, app.y, app.width, app.height);
                 save_groups(&app);
+                app.clear_dirty();
                 break;
+            }
+            if ev.type_ == atoms.ptm_save_tick {
+                // Cheap idle tick: just check whether the dirty-flag debounce
+                // has elapsed. Skip during user gestures so a drag/rename
+                // bursting through a save tick doesn't write a half-state.
+                if app.drag.is_none() && app.rename.is_none() {
+                    let now = std::time::Instant::now();
+                    if should_save_now(app.first_dirty_at, app.last_dirty_at, now) {
+                        save_groups(&app);
+                        save_geometry(app.x, app.y, app.width, app.height);
+                        app.clear_dirty();
+                    }
+                }
+                continue;
             }
             if ev.type_ == atoms.ptm_wake {
                 // Scheduled tmux-state poll from the background thread.
@@ -5861,6 +5995,179 @@ mod tests {
         assert!(!new.join("groups").exists());
         assert!(!new.join("geometry").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Stage F / Phase 2b: dirty-flag + debounced save ──
+
+    #[test]
+    fn app_starts_not_dirty() {
+        let app = make_app();
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn create_group_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn delete_group_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        app.clear_dirty();
+        app.delete_group(0);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn add_to_group_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        add_item(&mut app, 2, "B");
+        app.create_group(1);
+        app.clear_dirty();
+        app.add_to_group(0, 2);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn remove_from_group_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        app.clear_dirty();
+        app.remove_from_group(1);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn toggle_collapse_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        app.clear_dirty();
+        app.toggle_collapse(0);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn commit_rename_with_change_marks_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1); // "Group 1"
+        app.clear_dirty();
+        app.start_rename(0);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "Renamed".to_string();
+        }
+        app.commit_rename();
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn cancel_rename_does_not_mark_dirty() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        app.clear_dirty();
+        app.start_rename(0);
+        if let Some(ref mut rs) = app.rename {
+            rs.text = "Renamed".to_string();
+        }
+        app.cancel_rename();
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn restore_groups_does_not_leave_app_dirty() {
+        let mut app = make_app();
+        add_item_with_class(&mut app, 1, "Foo", "FooClass");
+        let saved = vec![SavedGroup {
+            name: "G".to_string(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "Foo".to_string(),
+                wm_class: "FooClass".to_string(),
+                custom_prefix: String::new(),
+            }],
+        }];
+        super::restore_groups(&mut app, &saved);
+        // Restoration mirrors on-disk state; should not request a save.
+        assert!(!app.is_dirty());
+    }
+
+    // Pure debounce/backstop logic (testable without Instant juggling):
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn should_save_now_returns_false_when_clean() {
+        let now = Instant::now();
+        assert!(!super::should_save_now(None, None, now));
+    }
+
+    #[test]
+    fn should_save_now_false_within_debounce_window() {
+        let now = Instant::now();
+        let last = now - Duration::from_millis(100);
+        let first = last;
+        assert!(!super::should_save_now(Some(first), Some(last), now));
+    }
+
+    #[test]
+    fn should_save_now_true_after_debounce_idle() {
+        let now = Instant::now();
+        let last = now - Duration::from_millis(300);
+        let first = last;
+        assert!(super::should_save_now(Some(first), Some(last), now));
+    }
+
+    #[test]
+    fn should_save_now_true_via_backstop_even_when_still_mutating() {
+        // User keeps mutating: last is recent (within debounce) but first is
+        // long ago — the backstop must fire so we don't lose >30s of work.
+        let now = Instant::now();
+        let last = now - Duration::from_millis(50); // still actively typing
+        let first = now - Duration::from_secs(31); // started 31s ago
+        assert!(super::should_save_now(Some(first), Some(last), now));
+    }
+
+    #[test]
+    fn mark_dirty_sets_first_and_last_timestamps() {
+        let mut app = make_app();
+        assert!(app.first_dirty_at.is_none());
+        app.mark_dirty();
+        let first = app.first_dirty_at.expect("first set");
+        let last = app.last_dirty_at.expect("last set");
+        assert!(first <= last);
+    }
+
+    #[test]
+    fn mark_dirty_twice_preserves_first_updates_last() {
+        let mut app = make_app();
+        app.mark_dirty();
+        let first1 = app.first_dirty_at.unwrap();
+        let last1 = app.last_dirty_at.unwrap();
+        // Force some time to pass for the second mark.
+        std::thread::sleep(Duration::from_millis(2));
+        app.mark_dirty();
+        let first2 = app.first_dirty_at.unwrap();
+        let last2 = app.last_dirty_at.unwrap();
+        assert_eq!(first1, first2, "first preserved");
+        assert!(last2 > last1, "last advances");
+    }
+
+    #[test]
+    fn clear_dirty_resets_both_timestamps() {
+        let mut app = make_app();
+        app.mark_dirty();
+        app.clear_dirty();
+        assert!(app.first_dirty_at.is_none());
+        assert!(app.last_dirty_at.is_none());
+        assert!(!app.is_dirty());
     }
 
     #[test]

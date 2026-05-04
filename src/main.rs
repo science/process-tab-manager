@@ -255,6 +255,68 @@ impl RenameState {
             self.selection_anchor = Some(self.cursor);
         }
     }
+
+    fn prev_char_boundary(&self) -> usize {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    fn next_char_boundary(&self) -> usize {
+        self.text[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| self.cursor + i)
+            .unwrap_or(self.text.len())
+    }
+
+    /// Apply a cursor move to `target`. With shift, extend selection (anchor at
+    /// the original cursor). Without shift, clear selection.
+    fn apply_motion(&mut self, target: usize, shift: bool) {
+        if shift {
+            self.anchor_if_none();
+        } else {
+            self.clear_selection();
+        }
+        self.cursor = target;
+    }
+
+    fn move_left_char(&mut self, shift: bool) {
+        // Plain Left with active selection collapses to selection start without
+        // moving the cursor further (gtk-style; matches modern text inputs).
+        if !shift {
+            if let Some((start, _)) = self.selection_range() {
+                self.cursor = start;
+                self.clear_selection();
+                return;
+            }
+        }
+        let target = self.prev_char_boundary();
+        self.apply_motion(target, shift);
+    }
+
+    fn move_right_char(&mut self, shift: bool) {
+        if !shift {
+            if let Some((_, end)) = self.selection_range() {
+                self.cursor = end;
+                self.clear_selection();
+                return;
+            }
+        }
+        let target = self.next_char_boundary();
+        self.apply_motion(target, shift);
+    }
+
+    fn move_home(&mut self, shift: bool) {
+        self.apply_motion(0, shift);
+    }
+
+    fn move_end(&mut self, shift: bool) {
+        let len = self.text.len();
+        self.apply_motion(len, shift);
+    }
 }
 
 // ── App ──
@@ -3050,6 +3112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 Event::KeyPress(ev) => {
                     let sym = keysym_from_keycode(&conn, ev.detail, ev.state)?;
+                    let shift = u16::from(ev.state) & 0x01 != 0;
+                    let _ctrl = u16::from(ev.state) & 0x04 != 0; // wired in T1.3
                     match sym {
                         0xff0d | 0xff8d => {
                             // Return / KP_Enter → commit
@@ -3090,37 +3154,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0xff51 => {
                             // Left arrow
                             if let Some(ref mut rs) = app.rename {
-                                if rs.cursor > 0 {
-                                    rs.cursor = rs.text[..rs.cursor]
-                                        .char_indices()
-                                        .next_back()
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(0);
-                                }
+                                rs.move_left_char(shift);
                             }
                         }
                         0xff53 => {
                             // Right arrow
                             if let Some(ref mut rs) = app.rename {
-                                if rs.cursor < rs.text.len() {
-                                    rs.cursor = rs.text[rs.cursor..]
-                                        .char_indices()
-                                        .nth(1)
-                                        .map(|(i, _)| rs.cursor + i)
-                                        .unwrap_or(rs.text.len());
-                                }
+                                rs.move_right_char(shift);
                             }
                         }
                         0xff50 => {
                             // Home
                             if let Some(ref mut rs) = app.rename {
-                                rs.cursor = 0;
+                                rs.move_home(shift);
                             }
                         }
                         0xff57 => {
                             // End
                             if let Some(ref mut rs) = app.rename {
-                                rs.cursor = rs.text.len();
+                                rs.move_end(shift);
                             }
                         }
                         _ => {
@@ -4877,5 +4929,124 @@ mod tests {
         let mut rs = make_rename_state("hello", 3, Some(0));
         rs.anchor_if_none();
         assert_eq!(rs.selection_anchor, Some(0)); // not overwritten
+    }
+
+    // ── Stage H: motion (T1.2 — Shift+Left/Right/Home/End) ──
+
+    #[test]
+    fn rename_move_left_char_no_shift_no_selection_moves_one() {
+        let mut rs = make_rename_state("hello", 3, None);
+        rs.move_left_char(false);
+        assert_eq!(rs.cursor, 2);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_move_left_char_no_shift_with_selection_collapses_to_start() {
+        let mut rs = make_rename_state("hello world", 7, Some(2));
+        rs.move_left_char(false);
+        assert_eq!(rs.cursor, 2); // collapse to start, no further motion
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_move_right_char_no_shift_with_selection_collapses_to_end() {
+        let mut rs = make_rename_state("hello world", 2, Some(7));
+        rs.move_right_char(false);
+        assert_eq!(rs.cursor, 7);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_shift_right_from_no_selection_anchors_then_moves() {
+        let mut rs = make_rename_state("hello", 2, None);
+        rs.move_right_char(true);
+        assert_eq!(rs.cursor, 3);
+        assert_eq!(rs.selection_anchor, Some(2));
+        assert_eq!(rs.selection_range(), Some((2, 3)));
+    }
+
+    #[test]
+    fn rename_shift_right_extends_existing_selection() {
+        let mut rs = make_rename_state("hello world", 3, Some(1));
+        rs.move_right_char(true);
+        assert_eq!(rs.cursor, 4);
+        assert_eq!(rs.selection_anchor, Some(1)); // preserved
+        assert_eq!(rs.selection_range(), Some((1, 4)));
+    }
+
+    #[test]
+    fn rename_shift_left_shrinks_selection_when_cursor_past_anchor() {
+        let mut rs = make_rename_state("hello", 3, Some(1));
+        rs.move_left_char(true);
+        assert_eq!(rs.cursor, 2);
+        assert_eq!(rs.selection_range(), Some((1, 2)));
+    }
+
+    #[test]
+    fn rename_shift_left_collapses_selection_when_cursor_meets_anchor() {
+        let mut rs = make_rename_state("hello", 2, Some(1));
+        rs.move_left_char(true);
+        assert_eq!(rs.cursor, 1);
+        assert_eq!(rs.selection_anchor, Some(1)); // anchor still set...
+        assert_eq!(rs.selection_range(), None); // ...but collapsed
+    }
+
+    #[test]
+    fn rename_move_home_clears_selection_when_no_shift() {
+        let mut rs = make_rename_state("hello", 3, Some(0));
+        rs.move_home(false);
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_move_end_clears_selection_when_no_shift() {
+        let mut rs = make_rename_state("hello", 2, Some(0));
+        rs.move_end(false);
+        assert_eq!(rs.cursor, 5);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_shift_home_anchors_and_jumps_to_zero() {
+        let mut rs = make_rename_state("hello", 3, None);
+        rs.move_home(true);
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, Some(3));
+        assert_eq!(rs.selection_range(), Some((0, 3)));
+    }
+
+    #[test]
+    fn rename_shift_end_anchors_and_jumps_to_len() {
+        let mut rs = make_rename_state("hello", 2, None);
+        rs.move_end(true);
+        assert_eq!(rs.cursor, 5);
+        assert_eq!(rs.selection_anchor, Some(2));
+        assert_eq!(rs.selection_range(), Some((2, 5)));
+    }
+
+    #[test]
+    fn rename_move_left_at_zero_is_clamped() {
+        let mut rs = make_rename_state("hello", 0, None);
+        rs.move_left_char(false);
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_move_right_at_end_is_clamped() {
+        let mut rs = make_rename_state("hello", 5, None);
+        rs.move_right_char(false);
+        assert_eq!(rs.cursor, 5);
+    }
+
+    #[test]
+    fn rename_motion_is_char_aware_for_multibyte() {
+        // "café" is 5 bytes (c, a, f, é=2 bytes). Cursor at 5 (end).
+        let mut rs = make_rename_state("café", 5, None);
+        rs.move_left_char(false);
+        assert_eq!(rs.cursor, 3); // back to start of é
+        rs.move_left_char(false);
+        assert_eq!(rs.cursor, 2);
     }
 }

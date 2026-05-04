@@ -1563,14 +1563,19 @@ fn refresh_items(
         };
         let mut restored_prefix: Option<String> = None;
         for group in &mut app.groups {
+            // Same cascade as restore_groups (Phase 2d): exact → label →
+            // wm_class. wm_class-only catches terminals whose title drifted
+            // since the saved snapshot.
             let exact_pos = group.members.iter().position(|m| {
                 m.live_wid.is_none() && m.label == label && m.wm_class == wm_class
             });
-            let pos = exact_pos.or_else(|| {
-                group.members.iter().position(|m| {
-                    m.live_wid.is_none() && m.label == label
-                })
+            let label_only = || group.members.iter().position(|m| {
+                m.live_wid.is_none() && m.label == label
             });
+            let class_only = || group.members.iter().position(|m| {
+                m.live_wid.is_none() && m.wm_class == wm_class
+            });
+            let pos = exact_pos.or_else(label_only).or_else(class_only);
             if let Some(p) = pos {
                 group.members[p].live_wid = Some(*wid);
                 if !group.members[p].custom_prefix.is_empty() {
@@ -3296,16 +3301,25 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
         // group survives PTM restarts where its windows aren't yet up.
         let mut members: Vec<GroupMember> = Vec::new();
         for sm in &sg.members {
-            // Prefer exact match on (label, wm_class)
+            // Matching cascade (Phase 2c + 2d):
+            //   1. exact (label, wm_class)
+            //   2. label-only (titles often match across restarts)
+            //   3. wm_class-only (terminals churn their titles every command,
+            //      so without this their groups would re-shatter every restart)
             let exact = available.iter().find(|(l, c, w)| {
                 l == &sm.label && c == &sm.wm_class && !claimed.contains(w)
             });
-            let matched = exact.or_else(|| {
-                // Fall back to label-only match
-                available
-                    .iter()
-                    .find(|(l, _, w)| l == &sm.label && !claimed.contains(w))
-            });
+            let matched = exact
+                .or_else(|| {
+                    available
+                        .iter()
+                        .find(|(l, _, w)| l == &sm.label && !claimed.contains(w))
+                })
+                .or_else(|| {
+                    available
+                        .iter()
+                        .find(|(_, c, w)| c == &sm.wm_class && !claimed.contains(w))
+                });
             let live_wid = matched.map(|(_, _, w)| {
                 claimed.insert(*w);
                 *w
@@ -4800,6 +4814,57 @@ mod tests {
         assert_eq!(app.find_item(10).unwrap().custom_prefix, "FF");
         // The ghost still carries its saved custom_prefix for later restoration
         assert_eq!(app.groups[0].members[1].custom_prefix, "Chat");
+    }
+
+    #[test]
+    fn restore_groups_wm_class_only_fallback_when_label_drifted() {
+        // Phase 2d: terminals especially churn their titles (PWD, running
+        // command, tmux info). When neither the exact (label, wm_class) match
+        // nor the label-only fallback hits, fall back to wm_class-only so the
+        // window still rejoins its group.
+        let mut app = make_app();
+        // Window currently has a different title than what was saved.
+        add_item_with_class(&mut app, 10, "bash - other-dir", "Gnome-terminal");
+
+        let saved = vec![SavedGroup {
+            name: "Terms".into(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "claude - process-tab-manager".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: String::new(),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].members.len(), 1);
+        assert_eq!(
+            app.groups[0].members[0].live_wid,
+            Some(10),
+            "should match by wm_class even when label differs"
+        );
+    }
+
+    #[test]
+    fn restore_groups_wm_class_fallback_does_not_match_different_class() {
+        // Sanity: wm_class fallback should NOT cross class boundaries.
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "anything", "Firefox");
+
+        let saved = vec![SavedGroup {
+            name: "Terms".into(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "different".into(),
+                wm_class: "Gnome-terminal".into(), // not Firefox
+                custom_prefix: String::new(),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].members[0].live_wid, None, "no class match");
     }
 
     #[test]

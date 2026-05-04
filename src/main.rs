@@ -317,6 +317,93 @@ impl RenameState {
         let len = self.text.len();
         self.apply_motion(len, shift);
     }
+
+    fn move_left_word(&mut self, shift: bool) {
+        let target = prev_word_boundary(&self.text, self.cursor);
+        self.apply_motion(target, shift);
+    }
+
+    fn move_right_word(&mut self, shift: bool) {
+        let target = next_word_boundary(&self.text, self.cursor);
+        self.apply_motion(target, shift);
+    }
+
+    fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
+    /// Delete from cursor back to the previous word boundary.
+    /// Does NOT consult the selection (T1.4 wires selection-first behaviour
+    /// into the Backspace key handler).
+    fn delete_word_left(&mut self) {
+        let target = prev_word_boundary(&self.text, self.cursor);
+        if target < self.cursor {
+            self.text.drain(target..self.cursor);
+            self.cursor = target;
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Delete from cursor forward to the next word boundary.
+    fn delete_word_right(&mut self) {
+        let target = next_word_boundary(&self.text, self.cursor);
+        if target > self.cursor {
+            self.text.drain(self.cursor..target);
+            self.selection_anchor = None;
+        }
+    }
+}
+
+/// Find the byte offset of the next word boundary at or after `pos`.
+/// Word = run of `is_alphanumeric` chars; anything else is a separator.
+/// Stops at the end of the next word (readline-style: skip separators, then
+/// skip word). Unicode-safe via `chars()`.
+fn next_word_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos;
+    let len = s.len();
+    // Skip leading non-alnum chars.
+    while i < len {
+        let ch = s[i..].chars().next().unwrap();
+        if ch.is_alphanumeric() {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    // Then skip the alnum run.
+    while i < len {
+        let ch = s[i..].chars().next().unwrap();
+        if !ch.is_alphanumeric() {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
+/// Find the byte offset of the previous word boundary at or before `pos`.
+/// Mirror of `next_word_boundary`.
+fn prev_word_boundary(s: &str, pos: usize) -> usize {
+    let mut i = pos;
+    // Skip trailing non-alnum chars.
+    while i > 0 {
+        let prev = s[..i].char_indices().next_back().map(|(j, _)| j).unwrap_or(0);
+        let ch = s[prev..i].chars().next().unwrap();
+        if ch.is_alphanumeric() {
+            break;
+        }
+        i = prev;
+    }
+    // Then skip the alnum run.
+    while i > 0 {
+        let prev = s[..i].char_indices().next_back().map(|(j, _)| j).unwrap_or(0);
+        let ch = s[prev..i].chars().next().unwrap();
+        if !ch.is_alphanumeric() {
+            break;
+        }
+        i = prev;
+    }
+    i
 }
 
 // ── App ──
@@ -3113,7 +3200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::KeyPress(ev) => {
                     let sym = keysym_from_keycode(&conn, ev.detail, ev.state)?;
                     let shift = u16::from(ev.state) & 0x01 != 0;
-                    let _ctrl = u16::from(ev.state) & 0x04 != 0; // wired in T1.3
+                    let ctrl = u16::from(ev.state) & 0x04 != 0;
                     match sym {
                         0xff0d | 0xff8d => {
                             // Return / KP_Enter → commit
@@ -3126,8 +3213,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0xff08 => {
                             // Backspace
                             if let Some(ref mut rs) = app.rename {
-                                if rs.cursor > 0 {
-                                    // Remove the char before cursor
+                                if ctrl {
+                                    rs.delete_word_left();
+                                } else if rs.cursor > 0 {
                                     let prev = rs.text[..rs.cursor]
                                         .char_indices()
                                         .next_back()
@@ -3141,7 +3229,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0xffff => {
                             // Delete
                             if let Some(ref mut rs) = app.rename {
-                                if rs.cursor < rs.text.len() {
+                                if ctrl {
+                                    rs.delete_word_right();
+                                } else if rs.cursor < rs.text.len() {
                                     let next = rs.text[rs.cursor..]
                                         .char_indices()
                                         .nth(1)
@@ -3154,13 +3244,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0xff51 => {
                             // Left arrow
                             if let Some(ref mut rs) = app.rename {
-                                rs.move_left_char(shift);
+                                if ctrl { rs.move_left_word(shift); } else { rs.move_left_char(shift); }
                             }
                         }
                         0xff53 => {
                             // Right arrow
                             if let Some(ref mut rs) = app.rename {
-                                rs.move_right_char(shift);
+                                if ctrl { rs.move_right_word(shift); } else { rs.move_right_char(shift); }
                             }
                         }
                         0xff50 => {
@@ -3175,12 +3265,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 rs.move_end(shift);
                             }
                         }
+                        // Ctrl+A → select all. Match keysym 'a' (0x61) only;
+                        // when ctrl+shift is held the keysym from
+                        // keysym_from_keycode comes back as 'A' (0x41), so
+                        // accept either to match user intent.
+                        0x61 | 0x41 if ctrl => {
+                            if let Some(ref mut rs) = app.rename {
+                                rs.select_all();
+                            }
+                        }
                         _ => {
-                            // Printable character — lookup string from keycode
-                            if let Some(ch) = printable_char_from_sym(sym) {
-                                if let Some(ref mut rs) = app.rename {
-                                    rs.text.insert(rs.cursor, ch);
-                                    rs.cursor += ch.len_utf8();
+                            // Printable character — but ignore when ctrl is held
+                            // so Ctrl+<other letter> doesn't accidentally type.
+                            if !ctrl {
+                                if let Some(ch) = printable_char_from_sym(sym) {
+                                    if let Some(ref mut rs) = app.rename {
+                                        rs.text.insert(rs.cursor, ch);
+                                        rs.cursor += ch.len_utf8();
+                                    }
                                 }
                             }
                         }
@@ -5048,5 +5150,170 @@ mod tests {
         assert_eq!(rs.cursor, 3); // back to start of é
         rs.move_left_char(false);
         assert_eq!(rs.cursor, 2);
+    }
+
+    // ── Stage H: T1.3 — Ctrl+A select-all, Ctrl+Backspace/Delete word delete,
+    //                    Ctrl+Left/Right word motion ──
+
+    #[test]
+    fn rename_select_all_anchors_zero_cursor_len() {
+        let mut rs = make_rename_state("hello world", 4, None);
+        rs.select_all();
+        assert_eq!(rs.selection_anchor, Some(0));
+        assert_eq!(rs.cursor, 11);
+        assert_eq!(rs.selection_range(), Some((0, 11)));
+    }
+
+    #[test]
+    fn rename_select_all_on_empty_text_is_no_op_collapse() {
+        let mut rs = make_rename_state("", 0, None);
+        rs.select_all();
+        // anchor at 0 and cursor at 0 → range is None (collapsed)
+        assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_range(), None);
+    }
+
+    // Word-boundary helpers (alnum vs non-alnum transitions, readline-style).
+    // Forward = "skip non-alnum, then skip alnum" → lands at end of (next) word.
+    // Backward = mirror → lands at start of (current/previous) word.
+
+    #[test]
+    fn rename_next_word_boundary_basic_word() {
+        let s = "hello world";
+        // From start of "hello": skip alnum to end → 5.
+        assert_eq!(super::next_word_boundary(s, 0), 5);
+        // From end of "hello": skip space, skip "world" → 11.
+        assert_eq!(super::next_word_boundary(s, 5), 11);
+        // At end of string: stays at end.
+        assert_eq!(super::next_word_boundary(s, 11), 11);
+    }
+
+    #[test]
+    fn rename_next_word_boundary_skips_run_of_non_alnum() {
+        let s = "a   b";
+        assert_eq!(super::next_word_boundary(s, 1), 5); // skip "   ", skip "b"
+    }
+
+    #[test]
+    fn rename_next_word_boundary_punctuation_treated_as_non_alnum() {
+        let s = "foo,bar";
+        assert_eq!(super::next_word_boundary(s, 3), 7); // ',' then "bar"
+    }
+
+    #[test]
+    fn rename_prev_word_boundary_basic_word() {
+        let s = "hello world";
+        // From end-of-string: skip nothing (alnum), skip "world" → 6.
+        assert_eq!(super::prev_word_boundary(s, 11), 6);
+        // From 6 (start of "world"): skip ' ', skip "hello" → 0.
+        assert_eq!(super::prev_word_boundary(s, 6), 0);
+        // From 0: stays at 0.
+        assert_eq!(super::prev_word_boundary(s, 0), 0);
+    }
+
+    #[test]
+    fn rename_prev_word_boundary_skips_run_of_non_alnum() {
+        let s = "a   b";
+        // From end: skip nothing (alnum 'b'), skip "b" → 4. Then from 4: skip "   " → 1. Then skip "a" → 0.
+        assert_eq!(super::prev_word_boundary(s, 5), 4);
+        assert_eq!(super::prev_word_boundary(s, 4), 0);
+    }
+
+    #[test]
+    fn rename_word_boundaries_are_unicode_safe() {
+        // "café world" — é = 2 bytes. Total length 10 bytes.
+        // alnum positions: 0,1,2,3 (caf), 3..5 (é), 6..10 (world)
+        let s = "café world";
+        // From end: skip nothing (alnum), skip "world" → 6.
+        assert_eq!(super::next_word_boundary(s, 0), 5); // "café" ends at byte 5
+        assert_eq!(super::prev_word_boundary(s, 10), 6);
+    }
+
+    // Word-motion methods (Ctrl+Left/Right with optional Shift)
+
+    #[test]
+    fn rename_move_left_word_no_shift_jumps_word() {
+        let mut rs = make_rename_state("hello world", 11, None);
+        rs.move_left_word(false);
+        assert_eq!(rs.cursor, 6);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_move_right_word_no_shift_jumps_word() {
+        let mut rs = make_rename_state("hello world", 0, None);
+        rs.move_right_word(false);
+        assert_eq!(rs.cursor, 5);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn rename_shift_ctrl_right_extends_selection_by_word() {
+        let mut rs = make_rename_state("hello world", 0, None);
+        rs.move_right_word(true);
+        assert_eq!(rs.cursor, 5);
+        assert_eq!(rs.selection_anchor, Some(0));
+        assert_eq!(rs.selection_range(), Some((0, 5)));
+    }
+
+    #[test]
+    fn rename_shift_ctrl_left_extends_selection_by_word() {
+        let mut rs = make_rename_state("hello world", 11, None);
+        rs.move_left_word(true);
+        assert_eq!(rs.cursor, 6);
+        assert_eq!(rs.selection_anchor, Some(11));
+        assert_eq!(rs.selection_range(), Some((6, 11)));
+    }
+
+    #[test]
+    fn rename_no_shift_ctrl_right_with_selection_clears_anchor() {
+        let mut rs = make_rename_state("hello world", 0, Some(2));
+        rs.move_right_word(false);
+        // No-shift word motion clears the selection (per plan table).
+        assert_eq!(rs.selection_anchor, None);
+        assert_eq!(rs.cursor, 5);
+    }
+
+    // Word-delete methods
+
+    #[test]
+    fn rename_delete_word_left_removes_prev_word() {
+        let mut rs = make_rename_state("hello world", 11, None);
+        rs.delete_word_left();
+        assert_eq!(rs.text, "hello ");
+        assert_eq!(rs.cursor, 6);
+    }
+
+    #[test]
+    fn rename_delete_word_left_removes_only_whitespace_when_in_whitespace_run() {
+        let mut rs = make_rename_state("hello   ", 8, None);
+        rs.delete_word_left();
+        // From end: skip "   " backward (5), skip "hello" backward (0). Delete bytes 0..8.
+        assert_eq!(rs.text, "");
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_delete_word_left_at_start_is_noop() {
+        let mut rs = make_rename_state("hello", 0, None);
+        rs.delete_word_left();
+        assert_eq!(rs.text, "hello");
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_delete_word_right_removes_next_word() {
+        let mut rs = make_rename_state("hello world", 0, None);
+        rs.delete_word_right();
+        assert_eq!(rs.text, " world");
+        assert_eq!(rs.cursor, 0);
+    }
+
+    #[test]
+    fn rename_delete_word_right_at_end_is_noop() {
+        let mut rs = make_rename_state("hello", 5, None);
+        rs.delete_word_right();
+        assert_eq!(rs.text, "hello");
+        assert_eq!(rs.cursor, 5);
     }
 }

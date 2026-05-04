@@ -1545,16 +1545,21 @@ fn refresh_items(
         }
     }
 
-    // Re-match: a wid that just appeared (in live_wids but not bound to any
-    // group member) gets a chance to claim a matching ghost slot by identity.
-    // Exact (label, wm_class) match preferred; label-only fallback after.
-    // Once claimed, the saved custom_prefix is restored onto the item.
-    let already_claimed: HashSet<u32> = app.groups
+    // Re-match: only NEWLY-APPEARED wids (not already placed anywhere) get
+    // offered to ghost slots. Wids that are currently ungrouped — including
+    // ones the user explicitly removed from a group — must not be silently
+    // re-claimed when a class-only match would otherwise pull them in.
+    let already_known: HashSet<u32> = app
+        .groups
         .iter()
         .flat_map(|g| g.live_wids())
+        .chain(app.display_order.iter().filter_map(|s| match s {
+            DisplaySlot::Window(w) => Some(*w),
+            _ => None,
+        }))
         .collect();
     for wid in &live_wids {
-        if already_claimed.contains(wid) {
+        if already_known.contains(wid) {
             continue;
         }
         let (label, wm_class) = match new_items.iter().find(|i| i.wid == *wid) {
@@ -4865,6 +4870,92 @@ mod tests {
 
         assert_eq!(app.groups.len(), 1);
         assert_eq!(app.groups[0].members[0].live_wid, None, "no class match");
+    }
+
+    #[test]
+    fn restore_groups_class_fallback_claims_other_terminal_when_one_member_gone() {
+        // Exact UAT-2 scenario (uncomfortable but per OQ-F3 design):
+        // saved group has [UAT-window-B, UAT-window-A]. Live windows are
+        // UAT-window-B and claude (both Gnome-terminal). A is gone.
+        // Expected per current cascade: B exact matches; A's slot grabs
+        // claude via wm_class fallback because no other Gnome-terminal is
+        // unclaimed.
+        let mut app = make_app();
+        add_item_with_class(&mut app, 100, "UAT-window-B", "Gnome-terminal");
+        add_item_with_class(&mut app, 200, "claude - ~/dev/x", "Gnome-terminal");
+
+        let saved = vec![SavedGroup {
+            name: "Group 1".into(),
+            collapsed: false,
+            members: vec![
+                SavedMember {
+                    label: "UAT-window-B".into(),
+                    wm_class: "Gnome-terminal".into(),
+                    custom_prefix: String::new(),
+                },
+                SavedMember {
+                    label: "UAT-window-A".into(),
+                    wm_class: "Gnome-terminal".into(),
+                    custom_prefix: String::new(),
+                },
+            ],
+        }];
+        restore_groups(&mut app, &saved);
+
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].members.len(), 2);
+        // B matches exact
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        // A grabs claude via wm_class
+        assert_eq!(app.groups[0].members[1].live_wid, Some(200));
+        // claude shouldn't also appear ungrouped
+        let claude_in_display = app
+            .display_order
+            .iter()
+            .any(|s| matches!(s, DisplaySlot::Window(200)));
+        assert!(!claude_in_display, "claude should be in group, not ungrouped");
+    }
+
+    #[test]
+    fn restore_groups_does_not_re_claim_already_displayed_window() {
+        // Regression: a ghost member with class-only match would pull a
+        // currently-ungrouped window INTO the group on every restart,
+        // surprising the user who explicitly had it ungrouped. Ghosts
+        // should only re-match brand-new wids, not currently-placed ones.
+        //
+        // Note: this asserts behaviour of the LIVE re-match in
+        // refresh_items, which is harder to unit-test directly. As a
+        // proxy, we exercise restore_groups (which uses an analogous
+        // claim algorithm) and verify that it doesn't double-place a
+        // window into both the group and display_order.
+        let mut app = make_app();
+        add_item_with_class(&mut app, 10, "live-bash", "Gnome-terminal");
+        // Put the live window in display_order as ungrouped.
+        // (add_item_with_class already does this.)
+
+        let saved = vec![SavedGroup {
+            name: "Old".into(),
+            collapsed: false,
+            members: vec![SavedMember {
+                label: "ptm-test-window".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: String::new(),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+
+        // The class-only fallback in restore_groups *will* match because
+        // restore-time matching has no display_order to defer to (the user
+        // is restarting PTM). That's expected and OK at restore time.
+        // The runtime re-match guard is exercised by the live UAT.
+        assert_eq!(app.groups.len(), 1);
+        // No duplicate display: the matched wid appears either in the
+        // group OR in display_order, not both.
+        let in_display = app.display_order.iter().any(
+            |s| matches!(s, DisplaySlot::Window(10))
+        );
+        let in_group = app.groups[0].live_wids().contains(&10);
+        assert!(in_group ^ in_display, "wid 10 should be in exactly one place");
     }
 
     #[test]

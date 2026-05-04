@@ -88,14 +88,14 @@ Reload with `tmux source-file ~/.tmux.conf` in any attached session, or start a 
 ## Testing
 
 ```bash
-cargo test     # 205+ unit tests, no X11 display needed
+cargo test     # 220+ unit tests, no X11 display needed
 ```
 
 Tests cover state management, group operations, drag-and-drop resolution, hit testing, context menu entry generation, rename text input (selection/word motion/word delete), and persistence (atomic writes, identity-based group restoration, ghost-member preservation across PTM restarts) — all pure logic that runs without a display server.
 
 ## Architecture
 
-Single Rust binary (~6500 LOC) talking directly to X11 via [x11rb](https://github.com/psychon/x11rb). No toolkit, no framework, no webview — just rectangles, text, and event handling.
+Single Rust binary (~7200 LOC) talking directly to X11 via [x11rb](https://github.com/psychon/x11rb). No toolkit, no framework, no webview — just rectangles, text, and event handling.
 
 - **One event loop** — `wait_for_event` dispatches to context menu mode or normal mode
 - **Double-buffered rendering** — draw to pixmap, copy to window

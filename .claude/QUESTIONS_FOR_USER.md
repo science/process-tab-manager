@@ -55,6 +55,35 @@ flagging that these are tunable if the user wants different values
 
 ---
 
+## Cluster 3 (Stage G — drag fluency)
+
+### Q3: Drop-on-header now inserts at TOP of group (was: append)
+
+The Stage G classifier strictly applies the plan's hot-zone rule
+"Group header row → JoinGroup(g, 0)". Pre-Stage-G the drop-on-header
+appended. The one regression test asserting the old behaviour was
+updated to match the new semantics.
+
+If the user prefers append, we just change `at: 0` to
+`at: g.members.len()` in the classifier's GroupHeader branch.
+
+### Q4: G-4 "bouncing drops" — was the no-op-detect enough?
+
+T3.2 added "if to == sp || to == sp+1, return false (no-op)" in
+do_reorder_in_group. This is the most-likely root cause of the
+bouncing symptom (dropping at a position that resolves to source's
+own slot). Without real-use repro I can't be sure it's the only one;
+T3.0's logging instrumentation + T3.6 fix are deferred until the
+user can confirm whether the bug still happens.
+
+### Q5: Post-drop highlight is binary, not graduated alpha
+
+T3.5 v1: highlight on for 1.5 s, then off. Plan called for fade-out.
+Graduated alpha needs ~10 pre-allocated intermediate colours and a
+~33 ms wake cadence (vs current 250 ms save tick). Deferred — binary
+still communicates "your drop landed here" cleanly. Easy to upgrade
+later if the user wants smoother visuals.
+
 ## General / cross-cluster
 
 (empty)

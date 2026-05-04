@@ -96,9 +96,46 @@ was integrated into Phase 2c. No behavioural changes; existing tests cover.
   into a group. Per OQ-F3 design but worth a UX review.
 - **Q2**: Auto-save backstop interval (30 s) is tunable.
 
+## UAT-3 (Cluster 3, Stage G — drag-and-drop fluency)
+
+After Clusters 1+2 finished early, I continued into Cluster 3 since the
+user's instructions said to keep going.
+
+### What landed
+
+| Task | Status | Verification |
+|---|---|---|
+| T3.0 — G-4 logging investigation | DEFERRED | Needs reproduction in real use; can't do unattended |
+| T3.1 — DropTarget classifier | ✓ | 12 unit tests; 1 free function `classify_drop` in src/main.rs around the App impl block |
+| T3.2 — handle_drop dispatch | ✓ | Existing DnD tests still pass; G-2 regression test added; G-4 no-op detection added (drop on self → no mutation, no mark_dirty) |
+| T3.3 — indicator from classifier | ✓ | Live UAT: indicator landed at top-of-group when dropping on header (uat3_drag_mid.png) |
+| T3.4 — group outline on drag-over | ✓ | Live UAT: blue rectangle outlines the target group while drag hovers (uat3_outline_drag.png) |
+| T3.5 — post-drop highlight | ✓ | Live UAT: dropped row flashes blue for 1.5s then fades to normal (uat3_drop_highlight.png → uat3_after_fade.png) |
+| T3.6 — fix G-4 from findings | DEFERRED | T3.2's no-op detection covers the most-likely root cause; if "bouncing" persists after this, T3.6 needs T3.0 first |
+
+### Behaviour change from pre-Stage-G
+
+**Drop on group header now inserts at position 0 (top of group).**
+Previously, drop-on-header appended to the group. The single existing test
+asserting the old behaviour (`drag_window_onto_group_header_adds_to_group`)
+was updated to match the new semantics — flagged in the commit message.
+This matches the explicit hot-zone rule in MVP_PLAN.md Stage G:
+"Group header row → JoinGroup(g, 0)."
+
+### Visual fade is binary, not graduated
+
+T3.5 v1 is "highlight on for 1.5s, then off". The plan called for a
+faded alpha transition. Implementing graduated alpha needs ~10
+pre-allocated intermediate pixel colours and a faster wake cadence
+(~33 ms vs the current 250 ms save tick). Deferred — the binary
+on/off still communicates "your drop landed here" cleanly.
+
 ## Not tested in this session (by design)
 
 - Full machine reboot recovery (would kill the Claude Code session).
 - Title-drifting tmux sessions over a long period.
 - 1-day soak: requires the user actually using PTM in their normal workflow,
   per the cluster-gate definition.
+- G-4 "bouncing drops" — needs reproduction in real use, no synthetic
+  test was able to surface it (the no-op-detect in T3.2 may have already
+  fixed it, but that's an unverified hypothesis).

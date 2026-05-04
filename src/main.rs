@@ -664,22 +664,24 @@ impl App {
             .map(|g| g.name.clone())
             .unwrap_or_default();
         let cursor = text.len();
+        let selection_anchor = if text.is_empty() { None } else { Some(0) };
         self.rename = Some(RenameState {
             target: RenameTarget::Group(gid),
             text,
             cursor,
-            selection_anchor: None,
+            selection_anchor,
         });
     }
 
     fn start_session_rename(&mut self, session_name: &str) {
         let text = session_name.to_string();
         let cursor = text.len();
+        let selection_anchor = if text.is_empty() { None } else { Some(0) };
         self.rename = Some(RenameState {
             target: RenameTarget::Session(session_name.to_string()),
             text,
             cursor,
-            selection_anchor: None,
+            selection_anchor,
         });
     }
 
@@ -691,11 +693,12 @@ impl App {
             .map(|i| i.custom_prefix.clone())
             .unwrap_or_default();
         let cursor = text.len();
+        let selection_anchor = if text.is_empty() { None } else { Some(0) };
         self.rename = Some(RenameState {
             target: RenameTarget::Window(wid),
             text,
             cursor,
-            selection_anchor: None,
+            selection_anchor,
         });
     }
 
@@ -5453,6 +5456,73 @@ mod tests {
         rs.delete_word_right();
         assert_eq!(rs.text, " world");
         assert_eq!(rs.cursor, 0);
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    // ── Stage H: T1.5 — Pre-select all text on rename open ──
+
+    #[test]
+    fn start_rename_preselects_existing_name() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1); // group named "Group 1"
+
+        app.start_rename(0);
+        let rs = app.rename.as_ref().expect("rename state set");
+        assert_eq!(rs.text, "Group 1");
+        assert_eq!(rs.cursor, "Group 1".len());
+        assert_eq!(rs.selection_anchor, Some(0));
+        assert_eq!(rs.selection_range(), Some((0, "Group 1".len())));
+    }
+
+    #[test]
+    fn start_session_rename_preselects() {
+        let mut app = make_app();
+        app.start_session_rename("my-session");
+        let rs = app.rename.as_ref().unwrap();
+        assert_eq!(rs.cursor, "my-session".len());
+        assert_eq!(rs.selection_anchor, Some(0));
+    }
+
+    #[test]
+    fn start_tab_rename_with_existing_prefix_preselects() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.items[0].custom_prefix = "Browser".to_string();
+        app.start_tab_rename(1);
+        let rs = app.rename.as_ref().unwrap();
+        assert_eq!(rs.text, "Browser");
+        assert_eq!(rs.selection_anchor, Some(0));
+        assert_eq!(rs.selection_range(), Some((0, "Browser".len())));
+    }
+
+    #[test]
+    fn start_tab_rename_with_empty_prefix_no_selection() {
+        // Empty initial text → no selection (anchor stays None) so the very
+        // first typed char doesn't create a phantom selection from cursor 0
+        // to cursor 1.
+        let mut app = make_app();
+        add_item(&mut app, 1, "Firefox");
+        app.start_tab_rename(1);
+        let rs = app.rename.as_ref().unwrap();
+        assert_eq!(rs.text, "");
+        assert_eq!(rs.selection_anchor, None);
+    }
+
+    #[test]
+    fn typing_after_preselect_replaces_text() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1); // "Group 1"
+        app.start_rename(0);
+
+        // Simulate typing 'X' into the pre-selected field.
+        let rs = app.rename.as_mut().unwrap();
+        rs.insert_char('X');
+
+        assert_eq!(rs.text, "X");
+        assert_eq!(rs.cursor, 1);
+        // Important: no phantom selection of the just-typed char.
         assert_eq!(rs.selection_anchor, None);
     }
 }

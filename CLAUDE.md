@@ -6,7 +6,7 @@ Vertical sidebar for managing application windows on Linux/X11. Pure X11 via x11
 
 ```bash
 source "$HOME/.cargo/env"
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                       # 25 unit tests, no display needed
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                       # 205+ unit tests, no display needed
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo build --release             # Build dev binary
 DISPLAY=:0 /tmp/ptm-dev/release/ptm                             # Run (needs X11 desktop)
 ```
@@ -25,14 +25,14 @@ README.md
 
 ## Architecture
 
-Single-file binary (~1800 LOC) with clean separation of concerns within `main.rs`:
+Single-file binary (~6500 LOC) with clean separation of concerns within `main.rs`:
 
 - **Data model** (top): `Item`, `Group`, `DisplaySlot`, `DisplayRow`, `App` — all state management, group operations, drag-and-drop resolution
 - **EWMH helpers**: `get_client_list`, `get_active_window`, `get_window_title`, `activate_window`, `snap_to_sidebar` — thin wrappers over X11 properties
 - **Renderer**: double-buffered drawing to pixmap, copies to window. Items, group headers, ghost drag, drop indicators, hover, active highlight
 - **Context menu**: override-redirect popup with pointer grab. `build_menu_entries` / `open_context_menu` / `draw_context_menu`
 - **Event loop**: single `wait_for_event` loop with two modes: context menu (grab active) and normal
-- **Tests**: `#[cfg(test)] mod tests` at bottom — 25 tests covering all pure state logic
+- **Tests**: `#[cfg(test)] mod tests` at bottom — 205+ tests covering all pure state logic
 
 ### What's testable without X11
 

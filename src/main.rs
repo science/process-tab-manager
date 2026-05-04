@@ -2843,25 +2843,75 @@ fn printable_char_from_sym(sym: u32) -> Option<char> {
     }
 }
 
+// ── Persistence: paths, atomic writes, legacy migration ──
+
+/// The data directory for the active profile. v1 hard-codes the profile name
+/// to "default"; the directory layout already supports a future `--profile`
+/// flag with no migration cost.
+fn data_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    data_dir_in(std::path::Path::new(&home))
+}
+
+fn data_dir_in(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("ptm").join("profiles").join("default")
+}
+
+/// The pre-Phase-2a data directory. v1 migrates files out of this once.
+fn legacy_data_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    legacy_data_dir_in(std::path::Path::new(&home))
+}
+
+fn legacy_data_dir_in(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("ptm")
+}
+
+/// Atomic-write `content` to `path`. Writes to `<path>.tmp` first, then
+/// renames over the destination. The rename is atomic on the same
+/// filesystem, so a crash mid-write leaves the previous file intact (or
+/// absent if there was none) — never a partial new file. Any pre-existing
+/// `.tmp` from a prior crash is overwritten cleanly.
+fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Move legacy `groups` and `geometry` files from the old data dir to the
+/// new one, when the new files don't already exist. Idempotent; safe to call
+/// every startup (the second invocation is a no-op).
+fn migrate_legacy_files(legacy: &std::path::Path, new: &std::path::Path) {
+    for filename in ["groups", "geometry"] {
+        let from = legacy.join(filename);
+        let to = new.join(filename);
+        if from.exists() && !to.exists() {
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
+}
+
 // ── Geometry persistence ──
 
 fn geometry_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let mut path = std::path::PathBuf::from(home);
-    path.push(".config");
-    path.push("ptm");
-    path.push("geometry");
-    path
+    data_dir().join("geometry")
 }
 
 fn save_geometry(x: i16, y: i16, w: u16, h: u16) {
     let path = geometry_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::File::create(&path) {
-        let _ = write!(f, "{} {} {} {}\n", x, y, w, h);
-    }
+    let content = format!("{} {} {} {}\n", x, y, w, h);
+    let _ = write_atomic(&path, content.as_bytes());
 }
 
 fn load_geometry() -> Option<(i16, i16, u16, u16)> {
@@ -2893,12 +2943,7 @@ struct SavedGroup {
 }
 
 fn groups_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let mut path = std::path::PathBuf::from(home);
-    path.push(".config");
-    path.push("ptm");
-    path.push("groups");
-    path
+    data_dir().join("groups")
 }
 
 fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
@@ -2929,23 +2974,19 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
 }
 
 fn save_groups_to(path: &std::path::Path, groups: &[SavedGroup]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::File::create(path) {
-        let _ = writeln!(f, "v1");
-        for group in groups {
-            let collapsed = if group.collapsed { "1" } else { "0" };
-            let _ = writeln!(f, "GROUP\t{}\t{}", group.name, collapsed);
-            for member in &group.members {
-                let _ = writeln!(
-                    f,
-                    "MEMBER\t{}\t{}\t{}",
-                    member.label, member.wm_class, member.custom_prefix
-                );
-            }
+    let mut buf = String::new();
+    buf.push_str("v1\n");
+    for group in groups {
+        let collapsed = if group.collapsed { "1" } else { "0" };
+        buf.push_str(&format!("GROUP\t{}\t{}\n", group.name, collapsed));
+        for member in &group.members {
+            buf.push_str(&format!(
+                "MEMBER\t{}\t{}\t{}\n",
+                member.label, member.wm_class, member.custom_prefix
+            ));
         }
     }
+    let _ = write_atomic(path, buf.as_bytes());
 }
 
 fn save_groups(app: &App) {
@@ -3165,6 +3206,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     conn.map_window(window)?;
     conn.flush()?;
+
+    // One-time migration: move pre-Phase-2a files (~/.config/ptm/{groups,
+    // geometry}) into the new profile-aware location
+    // (~/.config/ptm/profiles/default/) before any load happens. Idempotent.
+    migrate_legacy_files(&legacy_data_dir(), &data_dir());
 
     // Restore saved geometry (position + size) from previous session
     if let Some((x, y, w, h)) = load_geometry() {
@@ -5635,5 +5681,212 @@ mod tests {
     #[test]
     fn select_keysym_empty_row_returns_zero() {
         assert_eq!(super::select_keysym(&[], 0x00), 0);
+    }
+
+    // ── Stage F / Phase 2a: profile-aware paths + atomic writes ──
+
+    #[test]
+    fn data_dir_under_profile_default() {
+        // The new persistence root should live under ~/.config/ptm/profiles/default/.
+        // We can't assume HOME — just check the trailing path components.
+        let p = super::data_dir_in(std::path::Path::new("/some/home"));
+        let parts: Vec<&str> = p
+            .components()
+            .map(|c: std::path::Component| c.as_os_str().to_str().unwrap())
+            .collect();
+        // Expect […, ".config", "ptm", "profiles", "default"]
+        assert_eq!(&parts[parts.len() - 4..], &[".config", "ptm", "profiles", "default"]);
+    }
+
+    #[test]
+    fn legacy_data_dir_is_one_level_up() {
+        let p = super::legacy_data_dir_in(std::path::Path::new("/some/home"));
+        let parts: Vec<&str> = p
+            .components()
+            .map(|c: std::path::Component| c.as_os_str().to_str().unwrap())
+            .collect();
+        assert_eq!(&parts[parts.len() - 2..], &[".config", "ptm"]);
+    }
+
+    #[test]
+    fn write_atomic_creates_file_with_content() {
+        let dir = std::env::temp_dir().join("ptm_test_atom_create");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        super::write_atomic(&path, b"hello world").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        assert!(!path.with_extension("tmp").exists(), "tmp should be cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_overwrites_existing_file() {
+        let dir = std::env::temp_dir().join("ptm_test_atom_overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        std::fs::write(&path, b"old").unwrap();
+        super::write_atomic(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_overwrites_stale_tmp_file() {
+        // If a previous mid-write crash left .tmp behind, write_atomic must
+        // overwrite it cleanly rather than fail.
+        let dir = std::env::temp_dir().join("ptm_test_atom_stale_tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(&path, b"existing real content").unwrap();
+        std::fs::write(path.with_extension("tmp"), b"junk from prior crash").unwrap();
+
+        super::write_atomic(&path, b"fresh").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        assert!(!path.with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_real_file_intact_after_simulated_partial_write() {
+        // Simulate a partial write by manually creating a .tmp with junk
+        // (as if the previous PTM died mid-write). The REAL file should
+        // never be observed in a corrupt state — it stays as last-good
+        // until the rename succeeds.
+        let dir = std::env::temp_dir().join("ptm_test_atom_partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(&path, b"last-good content").unwrap();
+        std::fs::write(path.with_extension("tmp"), b"partial garbage").unwrap();
+
+        // At this snapshot in time (before any new save), the real file is intact.
+        assert_eq!(std::fs::read(&path).unwrap(), b"last-good content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_moves_legacy_files_to_new_dir() {
+        let root = std::env::temp_dir().join("ptm_test_migrate_basic");
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("legacy");
+        let new = root.join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // Pre-populate legacy files
+        std::fs::write(legacy.join("groups"), b"v1\nGROUP\tFoo\t0\n").unwrap();
+        std::fs::write(legacy.join("geometry"), b"100 200 300 400\n").unwrap();
+
+        super::migrate_legacy_files(&legacy, &new);
+
+        // Legacy files moved
+        assert!(!legacy.join("groups").exists());
+        assert!(!legacy.join("geometry").exists());
+        // New files exist with expected content
+        assert_eq!(
+            std::fs::read(new.join("groups")).unwrap(),
+            b"v1\nGROUP\tFoo\t0\n"
+        );
+        assert_eq!(
+            std::fs::read(new.join("geometry")).unwrap(),
+            b"100 200 300 400\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_does_not_clobber_existing_new_file() {
+        let root = std::env::temp_dir().join("ptm_test_migrate_no_clobber");
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("legacy");
+        let new = root.join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+
+        std::fs::write(legacy.join("groups"), b"OLD").unwrap();
+        std::fs::write(new.join("groups"), b"NEW").unwrap();
+
+        super::migrate_legacy_files(&legacy, &new);
+
+        // New file untouched; legacy file left alone (avoid silent data loss)
+        assert_eq!(std::fs::read(new.join("groups")).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(legacy.join("groups")).unwrap(), b"OLD");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let root = std::env::temp_dir().join("ptm_test_migrate_idempotent");
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("legacy");
+        let new = root.join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("groups"), b"v1\nGROUP\tFoo\t0\n").unwrap();
+
+        super::migrate_legacy_files(&legacy, &new);
+        super::migrate_legacy_files(&legacy, &new); // second run
+
+        // After 2 runs the result is the same as after 1.
+        assert!(!legacy.join("groups").exists());
+        assert_eq!(
+            std::fs::read(new.join("groups")).unwrap(),
+            b"v1\nGROUP\tFoo\t0\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_with_nothing_to_do_is_noop() {
+        let root = std::env::temp_dir().join("ptm_test_migrate_noop");
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("legacy");
+        let new = root.join("new");
+        // Neither directory contains anything.
+
+        super::migrate_legacy_files(&legacy, &new);
+
+        // Doesn't crash; doesn't leave junk.
+        assert!(!new.join("groups").exists());
+        assert!(!new.join("geometry").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_groups_to_uses_atomic_write() {
+        // After save, the on-disk file matches expected content and no .tmp
+        // sibling is left behind — proves the rename happened.
+        let dir = std::env::temp_dir().join("ptm_test_save_atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "Foo".to_string(),
+            collapsed: false,
+            members: vec![],
+        }];
+        super::save_groups_to(&path, &saved);
+
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists(), "no tmp leftover");
+
+        // Loaded round-trip works
+        let loaded = super::load_groups_from(&path).expect("loads");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Foo");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

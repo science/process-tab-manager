@@ -1365,6 +1365,36 @@ fn indicator_y_for_target(app: &App, target: &DropTarget) -> i16 {
     }
 }
 
+/// Return the gid of the group to outline during drag, if the target is a
+/// Join/Reorder. Other DropTargets return None.
+fn target_group_for_outline(target: &DropTarget) -> Option<u32> {
+    match target {
+        DropTarget::JoinGroup { gid, .. } | DropTarget::ReorderInGroup { gid, .. } => Some(*gid),
+        _ => None,
+    }
+}
+
+/// Compute the (top, bottom) y bounds of a group's vertical extent — header
+/// row top through bottom of last visible member. Returns None if the group
+/// id isn't found in display_rows.
+fn group_outline_bounds(app: &App, gid: u32) -> Option<(i16, i16)> {
+    let hr = app
+        .display_rows
+        .iter()
+        .position(|r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == gid))?;
+    let mut last_row = hr;
+    for (i, row) in app.display_rows.iter().enumerate().skip(hr + 1) {
+        if matches!(row, DisplayRow::Window { group_id: Some(g), .. } if *g == gid) {
+            last_row = i;
+        } else {
+            break;
+        }
+    }
+    let top = app.row_y(hr);
+    let bottom = app.row_y(last_row) + ITEM_H as i16;
+    Some((top, bottom))
+}
+
 // ── EWMH helpers ──
 
 fn get_client_list(
@@ -2501,6 +2531,28 @@ impl Renderer {
                 // visual line never disagrees with the actual landing.
                 let target = classify_drop(app, drag.source_row, drag.current_y);
                 if !matches!(target, DropTarget::NoOp) {
+                    // T3.4: when the drop will Join/Reorder a group, outline
+                    // that group so the user sees the join target at a
+                    // glance (especially valuable for the lower-half /
+                    // bottom-spacing gestures that pre-Stage-G ejected).
+                    if let Some(target_gid) = target_group_for_outline(&target) {
+                        if let Some((top, bottom)) = group_outline_bounds(app, target_gid) {
+                            let ix = app.item_x();
+                            let iw = app.item_w();
+                            conn.change_gc(
+                                self.gc,
+                                &ChangeGCAux::new().foreground(self.indicator_pixel),
+                            )?;
+                            // Top edge
+                            conn.poly_fill_rectangle(pix, self.gc, &[Rectangle { x: ix, y: top, width: iw, height: 1 }])?;
+                            // Bottom edge
+                            conn.poly_fill_rectangle(pix, self.gc, &[Rectangle { x: ix, y: bottom - 1, width: iw, height: 1 }])?;
+                            // Left edge
+                            conn.poly_fill_rectangle(pix, self.gc, &[Rectangle { x: ix, y: top, width: 1, height: (bottom - top) as u16 }])?;
+                            // Right edge
+                            conn.poly_fill_rectangle(pix, self.gc, &[Rectangle { x: ix + iw as i16 - 1, y: top, width: 1, height: (bottom - top) as u16 }])?;
+                        }
+                    }
                     let indicator_y = indicator_y_for_target(app, &target);
                     conn.change_gc(
                         self.gc,

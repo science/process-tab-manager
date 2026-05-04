@@ -926,6 +926,7 @@ impl App {
 
     // ── Drag-and-drop ──
 
+    #[allow(dead_code)] // pre-Stage-G helper; superseded by classify_drop, kept for tests
     fn is_gap_in_group(&self, gap: usize, gid: u32) -> bool {
         let header_row = self
             .display_rows
@@ -971,6 +972,7 @@ impl App {
         self.display_order.len()
     }
 
+    #[allow(dead_code)] // pre-Stage-G helper; replaced by do_insert_at_slot
     fn move_slot_to(&mut self, target: &DisplaySlot, drop_gap: usize) {
         let src_pos = self.display_order.iter().position(|s| match (target, s) {
             (DisplaySlot::Window(a), DisplaySlot::Window(b)) => a == b,
@@ -990,6 +992,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)] // pre-Stage-G helper; replaced by do_reorder_in_group
     fn reorder_within_group(&mut self, gid: u32, wid: u32, drop_gap: usize) {
         let header_row = self
             .display_rows
@@ -1304,6 +1307,59 @@ fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
                 DropTarget::InsertAtEnd
             } else {
                 DropTarget::InsertBefore(pos)
+            }
+        }
+    }
+}
+
+/// Map a DropTarget back to a y-coordinate for the drag indicator line.
+/// Used by both the renderer (T3.3) and tested separately so the indicator
+/// position can never silently diverge from the action location.
+fn indicator_y_for_target(app: &App, target: &DropTarget) -> i16 {
+    let last_row_bottom = || {
+        if app.display_rows.is_empty() {
+            ITEM_Y_START
+        } else {
+            app.row_y(app.display_rows.len() - 1) + ITEM_H as i16 + (ITEM_SPACING / 2)
+        }
+    };
+    match target {
+        DropTarget::NoOp => -1,
+        DropTarget::InsertBefore(n) => {
+            if *n < app.display_rows.len() {
+                app.row_y(*n) - (ITEM_SPACING / 2)
+            } else {
+                last_row_bottom()
+            }
+        }
+        DropTarget::InsertAtEnd => last_row_bottom(),
+        DropTarget::JoinGroup { gid, at } | DropTarget::ReorderInGroup { gid, to: at } => {
+            // Find this group's header row in display_rows; the at-th
+            // member's row is hr+1+at (assuming the group is expanded —
+            // collapsed groups have no member rows so we draw at the
+            // header itself).
+            let hr = app
+                .display_rows
+                .iter()
+                .position(|r| matches!(r, DisplayRow::GroupHeader { group_id } if *group_id == *gid));
+            let hr = match hr {
+                Some(h) => h,
+                None => return last_row_bottom(),
+            };
+            let row = hr + 1 + at;
+            if row < app.display_rows.len() {
+                app.row_y(row) - (ITEM_SPACING / 2)
+            } else {
+                // Past the last member of this group → indicator below it.
+                let group = app.groups.iter().find(|g| g.id == *gid);
+                let live = group.map(|g| g.live_count()).unwrap_or(0);
+                if live == 0 {
+                    // Collapsed or empty group — indicator just below header.
+                    app.row_y(hr) + ITEM_H as i16 + (ITEM_SPACING / 2)
+                } else {
+                    let last_member_row = hr + live;
+                    app.row_y(last_member_row) + ITEM_H as i16 + (ITEM_SPACING / 2)
+                }
             }
         }
     }
@@ -2440,28 +2496,27 @@ impl Renderer {
         // Draw drag visuals
         if let Some(drag) = &app.drag {
             if drag.started {
-                let drop_idx = app.drop_index_from_y(drag.current_y);
-                let indicator_y = if drop_idx < app.display_rows.len() {
-                    app.row_y(drop_idx) - (ITEM_SPACING / 2)
-                } else if !app.display_rows.is_empty() {
-                    app.row_y(app.display_rows.len() - 1) + ITEM_H as i16 + (ITEM_SPACING / 2)
-                } else {
-                    ITEM_Y_START
-                };
-                conn.change_gc(
-                    self.gc,
-                    &ChangeGCAux::new().foreground(self.indicator_pixel),
-                )?;
-                conn.poly_fill_rectangle(
-                    pix,
-                    self.gc,
-                    &[Rectangle {
-                        x: app.item_x(),
-                        y: indicator_y,
-                        width: app.item_w(),
-                        height: 2,
-                    }],
-                )?;
+                // T3.3: indicator position is derived from the SAME
+                // DropTarget that handle_drop will fire on release, so the
+                // visual line never disagrees with the actual landing.
+                let target = classify_drop(app, drag.source_row, drag.current_y);
+                if !matches!(target, DropTarget::NoOp) {
+                    let indicator_y = indicator_y_for_target(app, &target);
+                    conn.change_gc(
+                        self.gc,
+                        &ChangeGCAux::new().foreground(self.indicator_pixel),
+                    )?;
+                    conn.poly_fill_rectangle(
+                        pix,
+                        self.gc,
+                        &[Rectangle {
+                            x: app.item_x(),
+                            y: indicator_y,
+                            width: app.item_w(),
+                            height: 2,
+                        }],
+                    )?;
+                }
 
                 // Ghost at cursor
                 if drag.source_row < app.display_rows.len() {

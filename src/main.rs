@@ -2479,8 +2479,15 @@ impl Renderer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let pix = self.pixmap;
 
-        // Clear background
-        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.bg_pixel))?;
+        // Clear background. Reset GC's `background` attribute too — image_text8
+        // draws each glyph cell with the GC's bg, and the rename overlay's
+        // selection-segment draw can leave bg = selection_bg_pixel. Without
+        // this, the next paint's text rows render with red cell backgrounds
+        // until the rename overlay redraws and resets bg.
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(self.bg_pixel).background(self.bg_pixel),
+        )?;
         conn.poly_fill_rectangle(
             pix,
             self.gc,

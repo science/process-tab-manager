@@ -19,6 +19,10 @@ const GROUP_INDENT: i16 = 16;
 const MENU_ITEM_H: u16 = 24;
 const MENU_PADDING: i16 = 4;
 const MENU_MIN_W: u16 = 180;
+const CONFIRM_MIN_W: u16 = 240;
+const CONFIRM_BUTTON_H: u16 = 26;
+const CONFIRM_BUTTON_W: u16 = 64;
+const CONFIRM_PADDING: i16 = 12;
 const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 
 // How long a pending attach claim stays live waiting for its new window to
@@ -281,6 +285,31 @@ struct ContextMenu {
     hover_index: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+enum ConfirmAction {
+    /// Run `tmux kill-session -t <name>` after the user confirms. The session
+    /// name is captured at popup-open time so it survives any later refresh.
+    KillSession(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmButton {
+    Yes,
+    No,
+}
+
+struct ConfirmPopup {
+    window: Window,
+    pixmap: Pixmap,
+    message: String,
+    action: ConfirmAction,
+    width: u16,
+    height: u16,
+    yes_rect: Rectangle,
+    no_rect: Rectangle,
+    hover_button: Option<ConfirmButton>,
+}
+
 struct DragState {
     source_row: usize,
     start_y: i16,
@@ -539,6 +568,7 @@ struct App {
     display_rows: Vec<DisplayRow>,
     next_group_id: u32,
     context_menu: Option<ContextMenu>,
+    confirm: Option<ConfirmPopup>,
     rename: Option<RenameState>,
     active_wid: Option<u32>,
     hover_row: Option<usize>,
@@ -585,6 +615,7 @@ impl App {
             display_rows: Vec::new(),
             next_group_id: 0,
             context_menu: None,
+            confirm: None,
             rename: None,
             active_wid: None,
             hover_row: None,
@@ -3392,6 +3423,225 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
     }
 }
 
+// ── Confirmation popup ──
+
+/// Pure dispatch for the confirmation popup. Always clears `app.confirm` and
+/// returns the popup's pending action iff the user accepted. Callers that own
+/// the X11 connection are responsible for tearing down the popup window /
+/// pixmap BEFORE calling (or for using `close_confirm_popup` on cancel paths
+/// where they don't need the action). Splitting the X11 cleanup out keeps
+/// this fn unit-testable without a display.
+fn dispatch_confirm(app: &mut App, accepted: bool) -> Option<ConfirmAction> {
+    let popup = app.confirm.take()?;
+    if accepted { Some(popup.action) } else { None }
+}
+
+/// Side-effecting runner. Today the only action is `KillSession`, which
+/// invokes `tmux kill-session -t <name>`. The terminal hosting that session
+/// follows tmux's last-client-exits semantics and closes on its own; the next
+/// refresh cleans up the row.
+fn execute_confirm_action(action: ConfirmAction) {
+    match action {
+        ConfirmAction::KillSession(name) => {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .status();
+        }
+    }
+}
+
+fn confirm_popup_layout(message: &str) -> (u16, u16, Rectangle, Rectangle) {
+    // Width is the larger of the message + padding and the constant min so
+    // longer session names don't get truncated awkwardly.
+    let msg_w = message.len() as i16 * CHAR_WIDTH + CONFIRM_PADDING * 2;
+    let width = (msg_w as u16).max(CONFIRM_MIN_W);
+    // Single message line + button row.
+    let height = (CONFIRM_PADDING as u16) * 3 + ITEM_H + CONFIRM_BUTTON_H;
+    let buttons_y = CONFIRM_PADDING * 2 + ITEM_H as i16;
+    let total_buttons_w = (CONFIRM_BUTTON_W * 2) as i16 + CONFIRM_PADDING;
+    let buttons_start_x = (width as i16 - total_buttons_w) / 2;
+    let yes_rect = Rectangle {
+        x: buttons_start_x,
+        y: buttons_y,
+        width: CONFIRM_BUTTON_W,
+        height: CONFIRM_BUTTON_H,
+    };
+    let no_rect = Rectangle {
+        x: buttons_start_x + CONFIRM_BUTTON_W as i16 + CONFIRM_PADDING,
+        y: buttons_y,
+        width: CONFIRM_BUTTON_W,
+        height: CONFIRM_BUTTON_H,
+    };
+    (width, height, yes_rect, no_rect)
+}
+
+fn point_in_rect(x: i16, y: i16, r: &Rectangle) -> bool {
+    x >= r.x && x < r.x + r.width as i16 && y >= r.y && y < r.y + r.height as i16
+}
+
+fn open_confirm_popup(
+    conn: &impl Connection,
+    screen: &Screen,
+    renderer: &Renderer,
+    app: &mut App,
+    message: String,
+    action: ConfirmAction,
+    root_x: i16,
+    root_y: i16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if app.confirm.is_some() {
+        close_confirm_popup(conn, app)?;
+    }
+
+    let (width, height, yes_rect, no_rect) = confirm_popup_layout(&message);
+
+    let x = root_x.min((screen.width_in_pixels as i16) - width as i16).max(0);
+    let y = root_y.min((screen.height_in_pixels as i16) - height as i16).max(0);
+
+    let win = conn.generate_id()?;
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        win,
+        screen.root,
+        x,
+        y,
+        width,
+        height,
+        1,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new()
+            .override_redirect(1u32)
+            .background_pixel(renderer.menu_bg_pixel)
+            .border_pixel(renderer.menu_border_pixel)
+            .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS),
+    )?;
+
+    let pix = conn.generate_id()?;
+    conn.create_pixmap(screen.root_depth, pix, win, width, height)?;
+
+    conn.map_window(win)?;
+
+    let _grab_reply = conn
+        .grab_pointer(
+            false,
+            win,
+            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            0u32,
+            0u32,
+            0u32,
+        )?
+        .reply()?;
+
+    // Keyboard grab so Enter / Y / Esc / N work without focus shenanigans —
+    // matches the override-redirect popup pattern we already use elsewhere.
+    let _ = conn
+        .grab_keyboard(false, win, 0u32, GrabMode::ASYNC, GrabMode::ASYNC)?
+        .reply()?;
+
+    conn.flush()?;
+
+    app.confirm = Some(ConfirmPopup {
+        window: win,
+        pixmap: pix,
+        message,
+        action,
+        width,
+        height,
+        yes_rect,
+        no_rect,
+        hover_button: None,
+    });
+
+    draw_confirm_popup(conn, renderer, app)?;
+    Ok(())
+}
+
+fn close_confirm_popup(
+    conn: &impl Connection,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(popup) = app.confirm.take() {
+        conn.ungrab_keyboard(0u32)?;
+        conn.ungrab_pointer(0u32)?;
+        conn.free_pixmap(popup.pixmap)?;
+        conn.destroy_window(popup.window)?;
+        conn.flush()?;
+    }
+    Ok(())
+}
+
+fn draw_confirm_popup(
+    conn: &impl Connection,
+    renderer: &Renderer,
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let popup = match app.confirm.as_ref() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let pix = popup.pixmap;
+    let gc = renderer.gc;
+
+    // Reset GC bg too — image_text8 paints each cell with the GC bg, and the
+    // rename overlay can leave bg = selection_bg_pixel. Without this, the
+    // popup text would render with the wrong cell background.
+    conn.change_gc(
+        gc,
+        &ChangeGCAux::new().foreground(renderer.menu_bg_pixel).background(renderer.menu_bg_pixel),
+    )?;
+    conn.poly_fill_rectangle(
+        pix,
+        gc,
+        &[Rectangle { x: 0, y: 0, width: popup.width, height: popup.height }],
+    )?;
+
+    // Message text — centred horizontally on the upper line.
+    let max_chars = ((popup.width as i16 - CONFIRM_PADDING * 2) / CHAR_WIDTH).max(0) as usize;
+    let display: String = popup.message.chars().take(max_chars).collect();
+    let text_width = display.len() as i16 * CHAR_WIDTH;
+    let text_x = (popup.width as i16 - text_width) / 2;
+    let text_y = CONFIRM_PADDING + ITEM_H as i16 / 2 + 4;
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(renderer.text_pixel))?;
+    if !display.is_empty() {
+        conn.image_text8(pix, gc, text_x, text_y, display.as_bytes())?;
+    }
+
+    // Buttons — Yes / No.
+    for (rect, label, button) in [
+        (&popup.yes_rect, "Yes", ConfirmButton::Yes),
+        (&popup.no_rect, "No", ConfirmButton::No),
+    ] {
+        let bg = if popup.hover_button == Some(button) {
+            renderer.menu_hover_pixel
+        } else {
+            renderer.item_pixel
+        };
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(bg))?;
+        conn.poly_fill_rectangle(pix, gc, &[*rect])?;
+        // 1px border so buttons are visible even without hover.
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(renderer.menu_border_pixel))?;
+        conn.poly_rectangle(pix, gc, &[Rectangle {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width.saturating_sub(1),
+            height: rect.height.saturating_sub(1),
+        }])?;
+
+        let lbl_w = label.len() as i16 * CHAR_WIDTH;
+        let lx = rect.x + (rect.width as i16 - lbl_w) / 2;
+        let ly = rect.y + (rect.height as i16 / 2) + 4;
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(renderer.text_pixel))?;
+        conn.image_text8(pix, gc, lx, ly, label.as_bytes())?;
+    }
+
+    conn.copy_area(pix, popup.window, gc, 0, 0, 0, 0, popup.width, popup.height)?;
+    conn.flush()?;
+    Ok(())
+}
+
 // ── Keyboard helpers ──
 
 fn keysym_from_keycode(
@@ -3908,7 +4158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Cheap idle tick: just check whether the dirty-flag debounce
                 // has elapsed. Skip during user gestures so a drag/rename
                 // bursting through a save tick doesn't write a half-state.
-                if app.drag.is_none() && app.rename.is_none() {
+                if app.drag.is_none() && app.rename.is_none() && app.confirm.is_none() {
                     let now = std::time::Instant::now();
                     if should_save_now(app.first_dirty_at, app.last_dirty_at, now) {
                         save_groups(&app);
@@ -3937,6 +4187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if app.drag.is_none()
                     && app.context_menu.is_none()
                     && app.rename.is_none()
+                    && app.confirm.is_none()
                 {
                     refresh_items(&conn, root, &atoms, &mut app, colormap)?;
                     renderer.redraw(&conn, &app)?;
@@ -3962,6 +4213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if app.drag.is_none()
                         && app.context_menu.is_none()
                         && app.rename.is_none()
+                        && app.confirm.is_none()
                     {
                         refresh_items(&conn, root, &atoms, &mut app, colormap)?;
                         renderer.redraw(&conn, &app)?;
@@ -3970,7 +4222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PropertyAction::UpdateActiveWindow => {
                     app.active_wid =
                         get_active_window(&conn, root, &atoms).unwrap_or(None);
-                    if app.context_menu.is_none() && app.rename.is_none() {
+                    if app.context_menu.is_none() && app.rename.is_none() && app.confirm.is_none() {
                         renderer.redraw(&conn, &app)?;
                     }
                 }
@@ -3985,6 +4237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if app.drag.is_none()
                         && app.context_menu.is_none()
                         && app.rename.is_none()
+                        && app.confirm.is_none()
                     {
                         renderer.redraw(&conn, &app)?;
                     }
@@ -4044,6 +4297,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Expose(ev) if ev.count == 0 => {
                     if Some(ev.window) == app.context_menu.as_ref().map(|m| m.window) {
                         draw_context_menu(&conn, &renderer, &app)?;
+                    }
+                    if ev.window == window {
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // ── Confirmation popup mode (pointer + keyboard grab routes here) ──
+        if app.confirm.is_some() {
+            match event {
+                Event::ButtonPress(ev) => {
+                    let popup = app.confirm.as_ref().unwrap();
+                    let in_yes = point_in_rect(ev.event_x, ev.event_y, &popup.yes_rect);
+                    let in_no = point_in_rect(ev.event_x, ev.event_y, &popup.no_rect);
+                    let in_popup = ev.event_x >= 0
+                        && ev.event_y >= 0
+                        && (ev.event_x as u16) < popup.width
+                        && (ev.event_y as u16) < popup.height;
+                    if ev.detail == 1 && in_yes {
+                        close_confirm_popup(&conn, &mut app)?;
+                        if let Some(action) = dispatch_confirm(&mut app, true) {
+                            execute_confirm_action(action);
+                        }
+                    } else if ev.detail == 1 && in_no {
+                        close_confirm_popup(&conn, &mut app)?;
+                        let _ = dispatch_confirm(&mut app, false);
+                    } else if !in_popup {
+                        // Click outside dismisses (treated as cancel).
+                        close_confirm_popup(&conn, &mut app)?;
+                        let _ = dispatch_confirm(&mut app, false);
+                    }
+                    renderer.redraw(&conn, &app)?;
+                }
+                Event::MotionNotify(ev) => {
+                    if let Some(ref mut popup) = app.confirm {
+                        let new_hover = if point_in_rect(ev.event_x, ev.event_y, &popup.yes_rect) {
+                            Some(ConfirmButton::Yes)
+                        } else if point_in_rect(ev.event_x, ev.event_y, &popup.no_rect) {
+                            Some(ConfirmButton::No)
+                        } else {
+                            None
+                        };
+                        if new_hover != popup.hover_button {
+                            popup.hover_button = new_hover;
+                            draw_confirm_popup(&conn, &renderer, &app)?;
+                        }
+                    }
+                }
+                Event::KeyPress(ev) => {
+                    let sym = keysym_from_keycode(&conn, ev.detail, ev.state)?;
+                    // Accept: Enter / KP_Enter / Y / y. Cancel: Esc / N / n.
+                    let accept = matches!(sym, 0xff0d | 0xff8d | 0x59 | 0x79);
+                    let cancel = matches!(sym, 0xff1b | 0x4e | 0x6e);
+                    if accept {
+                        close_confirm_popup(&conn, &mut app)?;
+                        if let Some(action) = dispatch_confirm(&mut app, true) {
+                            execute_confirm_action(action);
+                        }
+                        renderer.redraw(&conn, &app)?;
+                    } else if cancel {
+                        close_confirm_popup(&conn, &mut app)?;
+                        let _ = dispatch_confirm(&mut app, false);
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                Event::Expose(ev) if ev.count == 0 => {
+                    if Some(ev.window) == app.confirm.as_ref().map(|p| p.window) {
+                        draw_confirm_popup(&conn, &renderer, &app)?;
                     }
                     if ev.window == window {
                         renderer.redraw(&conn, &app)?;
@@ -7256,5 +7580,55 @@ mod tests {
         assert_eq!(loaded[0].name, "Foo");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── T4.1: confirmation popup ──
+
+    fn make_test_confirm(action: super::ConfirmAction) -> super::ConfirmPopup {
+        super::ConfirmPopup {
+            window: 0,
+            pixmap: 0,
+            message: "Kill session?".to_string(),
+            action,
+            width: 240,
+            height: 80,
+            yes_rect: super::Rectangle { x: 0, y: 0, width: 0, height: 0 },
+            no_rect: super::Rectangle { x: 0, y: 0, width: 0, height: 0 },
+            hover_button: None,
+        }
+    }
+
+    #[test]
+    fn confirm_popup_with_yes_runs_action() {
+        let mut app = make_app();
+        app.confirm = Some(make_test_confirm(
+            super::ConfirmAction::KillSession("demo".to_string()),
+        ));
+        let action = super::dispatch_confirm(&mut app, true);
+        assert!(
+            matches!(action, Some(super::ConfirmAction::KillSession(ref n)) if n == "demo"),
+            "expected KillSession(demo), got {:?}",
+            action
+        );
+        assert!(app.confirm.is_none(), "popup must be cleared after dispatch");
+    }
+
+    #[test]
+    fn confirm_popup_with_no_only_disarms() {
+        let mut app = make_app();
+        app.confirm = Some(make_test_confirm(
+            super::ConfirmAction::KillSession("demo".to_string()),
+        ));
+        let action = super::dispatch_confirm(&mut app, false);
+        assert!(action.is_none(), "rejected dispatch returns no action");
+        assert!(app.confirm.is_none(), "popup must be cleared after dispatch");
+    }
+
+    #[test]
+    fn dispatch_confirm_with_no_popup_returns_none() {
+        let mut app = make_app();
+        assert!(app.confirm.is_none());
+        let action = super::dispatch_confirm(&mut app, true);
+        assert!(action.is_none());
     }
 }

@@ -362,6 +362,7 @@ enum TopButton {
 
 struct DragState {
     source_row: usize,
+    start_x: i16,
     start_y: i16,
     current_y: i16,
     started: bool,
@@ -2220,10 +2221,27 @@ fn ensure_tmux_system_group(app: &mut App) {
 /// True if `local_x` (relative to the session row's left edge) lands inside
 /// the close-button band on the right edge. Pure — keyed only on geometry
 /// so it can be unit-tested without a renderer.
-#[allow(dead_code)] // wired into the click dispatcher in T4.8
 fn hit_test_session_close_button(local_x: i16, row_w: i16) -> bool {
     let band_left = row_w - SESSION_CLOSE_BAND_WIDTH;
     local_x >= band_left && local_x < row_w
+}
+
+/// Pure click dispatcher for a session row. Returns `Some(req)` to open the
+/// kill-confirm popup when the click landed in the close band; `None` means
+/// "fall through to the normal session-row action" (attach).
+fn dispatch_session_click(
+    name: &str,
+    group_id: Option<u32>,
+    local_x: i16,
+    row_w: i16,
+) -> Option<ConfirmRequest> {
+    if group_id.is_some() && hit_test_session_close_button(local_x, row_w) {
+        return Some(ConfirmRequest {
+            message: format!("Kill tmux session '{}'?", name),
+            action: ConfirmAction::KillSession(name.to_string()),
+        });
+    }
+    None
 }
 
 /// True if any tracked window is currently attached to `session_name`. Used
@@ -4894,6 +4912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else if let Some(row) = app.hit_test_row(ev.event_y) {
                             app.drag = Some(DragState {
                                 source_row: row,
+                                start_x: ev.event_x,
                                 start_y: ev.event_y,
                                 current_y: ev.event_y,
                                 started: false,
@@ -4941,7 +4960,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Event::ButtonRelease(br)
                                     if br.detail == 1 && br.event == window =>
                                 {
-                                    handle_release(&conn, root, &atoms, &mut app);
+                                    if let Some(req) =
+                                        handle_release(&conn, root, &atoms, &mut app)
+                                    {
+                                        open_confirm_popup(
+                                            &conn,
+                                            screen,
+                                            &renderer,
+                                            &mut app,
+                                            req.message,
+                                            req.action,
+                                            br.root_x,
+                                            br.root_y,
+                                        )?;
+                                    }
                                     needs_redraw = true;
                                 }
                                 Event::Expose(ex) if ex.count == 0 => {
@@ -5003,7 +5035,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::ButtonRelease(ev) if ev.detail == 1 && ev.event == window => {
-                handle_release(&conn, root, &atoms, &mut app);
+                if let Some(req) = handle_release(&conn, root, &atoms, &mut app) {
+                    open_confirm_popup(
+                        &conn,
+                        screen,
+                        &renderer,
+                        &mut app,
+                        req.message,
+                        req.action,
+                        ev.root_x,
+                        ev.root_y,
+                    )?;
+                }
                 renderer.redraw(&conn, &app)?;
             }
             _ => {}
@@ -5013,32 +5056,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_release(conn: &impl Connection, root: Window, atoms: &Atoms, app: &mut App) {
-    if let Some(drag) = app.drag.take() {
-        if drag.started {
-            app.handle_drop(drag.source_row, drag.current_y);
-        } else {
-            // Click (no drag)
-            if drag.source_row < app.display_rows.len() {
-                let row = app.display_rows[drag.source_row].clone();
-                match row {
-                    DisplayRow::GroupHeader { group_id } => {
-                        app.toggle_collapse(group_id);
-                    }
-                    DisplayRow::Window { wid, .. } => {
-                        let _ = activate_window(conn, root, wid, atoms);
-                        app.active_wid = Some(wid);
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
-                    }
-                    DisplayRow::Session { name, .. } => {
-                        if !is_attach_pending_for(&app.pending_attach, &name) {
-                            app.pending_attach = Some((name.clone(), std::time::Instant::now()));
-                            spawn_attach_terminal(&name);
-                        }
-                    }
-                }
+fn handle_release(
+    conn: &impl Connection,
+    root: Window,
+    atoms: &Atoms,
+    app: &mut App,
+) -> Option<ConfirmRequest> {
+    let drag = app.drag.take()?;
+    if drag.started {
+        app.handle_drop(drag.source_row, drag.current_y);
+        return None;
+    }
+    // Click (no drag)
+    if drag.source_row >= app.display_rows.len() {
+        return None;
+    }
+    let row = app.display_rows[drag.source_row].clone();
+    match row {
+        DisplayRow::GroupHeader { group_id } => {
+            app.toggle_collapse(group_id);
+            None
+        }
+        DisplayRow::Window { wid, .. } => {
+            let _ = activate_window(conn, root, wid, atoms);
+            app.active_wid = Some(wid);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = snap_to_sidebar(conn, root, app.our_wid, wid, atoms);
+            None
+        }
+        DisplayRow::Session { name, group_id } => {
+            // Compute click x relative to the row's left edge so the close
+            // band hit-test agrees with the rendered glyph position.
+            let row_left = if group_id.is_some() {
+                app.item_x() + GROUP_INDENT
+            } else {
+                app.item_x()
+            };
+            let row_w = if group_id.is_some() {
+                (app.item_w() as i16 - GROUP_INDENT) as i16
+            } else {
+                app.item_w() as i16
+            };
+            let local_x = drag.start_x - row_left;
+            if let Some(req) =
+                dispatch_session_click(&name, group_id, local_x, row_w)
+            {
+                return Some(req);
             }
+            if !is_attach_pending_for(&app.pending_attach, &name) {
+                app.pending_attach = Some((name.clone(), std::time::Instant::now()));
+                spawn_attach_terminal(&name);
+            }
+            None
         }
     }
 }
@@ -8672,6 +8741,39 @@ mod tests {
     fn hit_test_session_close_button_at_left_edge() {
         let row_w: i16 = 220;
         assert!(!super::hit_test_session_close_button(0, row_w));
+    }
+
+    // ── T4.8: single-click [x] dispatch ──
+
+    #[test]
+    fn click_close_band_on_grouped_session_returns_kill_request() {
+        let row_w: i16 = 220;
+        let local_x = row_w - 4; // inside the close band
+        let req = super::dispatch_session_click("demo", Some(0), local_x, row_w)
+            .expect("expected kill request");
+        assert!(
+            matches!(req.action, super::ConfirmAction::KillSession(ref n) if n == "demo"),
+            "expected KillSession(demo), got {:?}",
+            req.action
+        );
+        assert!(req.message.contains("demo"));
+    }
+
+    #[test]
+    fn click_session_body_returns_no_request() {
+        let row_w: i16 = 220;
+        let local_x = 50; // far from the close band
+        assert!(super::dispatch_session_click("demo", Some(0), local_x, row_w).is_none());
+    }
+
+    #[test]
+    fn click_close_band_on_ungrouped_session_returns_no_request() {
+        // Defensive: sessions live inside the system group from T4.4 onward.
+        // If a stray Session row ever appears outside a group, the close band
+        // must not trigger — fall through to the normal click path.
+        let row_w: i16 = 220;
+        let local_x = row_w - 4;
+        assert!(super::dispatch_session_click("demo", None, local_x, row_w).is_none());
     }
 
     #[test]

@@ -200,7 +200,6 @@ impl Item {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupKind {
     Normal,
-    #[allow(dead_code)] // wired up in T4.4 / T4.5
     TmuxSystem,
 }
 
@@ -208,7 +207,6 @@ struct Group {
     id: u32,
     name: String,
     collapsed: bool,
-    #[allow(dead_code)] // read in T4.4 (renderer) / T4.6 (drag classifier)
     kind: GroupKind,
     /// Members in display order. For `Normal` groups each member carries an
     /// identity tuple (label, wm_class) for cross-restart matching plus an
@@ -2054,6 +2052,40 @@ fn refresh_items(
     app.items = new_items;
     app.build_display_rows();
     Ok(())
+}
+
+/// True if `tmux -V` runs and exits 0 — i.e., the binary is on PATH. We don't
+/// probe whether the server is running because we want the "+ New tmux" button
+/// (T4.5b) to keep showing even after the user kills their last session — that
+/// is exactly when they'd want to make a new one.
+fn is_tmux_available() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Append a TmuxSystem group to `app` if none exists. Idempotent — safe to
+/// call every startup. Default state: collapsed=true, empty members (the
+/// next refresh syncs them from `tmux list-sessions`). Does NOT mark dirty:
+/// auto-create is pure derivation, the actual persistable state (position,
+/// collapse) only changes via explicit user actions which already mark dirty.
+fn ensure_tmux_system_group(app: &mut App) {
+    if app.groups.iter().any(|g| g.kind == GroupKind::TmuxSystem) {
+        return;
+    }
+    let gid = app.next_group_id;
+    app.next_group_id += 1;
+    app.groups.push(Group {
+        id: gid,
+        name: "Tmux Sessions".to_string(),
+        collapsed: true,
+        kind: GroupKind::TmuxSystem,
+        members: Vec::new(),
+    });
+    app.display_order.push(DisplaySlot::Group(gid));
+    app.build_display_rows();
 }
 
 /// True if any tracked window is currently attached to `session_name`. Used
@@ -3938,7 +3970,6 @@ struct SavedMember {
 struct SavedGroup {
     name: String,
     collapsed: bool,
-    #[allow(dead_code)] // restore_groups starts using this in T4.5
     kind: GroupKind,
     members: Vec<SavedMember>,
 }
@@ -3981,7 +4012,14 @@ fn save_groups_to(path: &std::path::Path, groups: &[SavedGroup]) {
     buf.push_str("v1\n");
     for group in groups {
         let collapsed = if group.collapsed { "1" } else { "0" };
-        buf.push_str(&format!("GROUP\t{}\t{}\n", group.name, collapsed));
+        let kind = match group.kind {
+            GroupKind::Normal => "normal",
+            GroupKind::TmuxSystem => "tmux_system",
+        };
+        // Always emit 4-field GROUP so on-disk format stays predictable.
+        // Loader (T4.4a) tolerates the legacy 3-field shape, which is what
+        // makes downgrade safe.
+        buf.push_str(&format!("GROUP\t{}\t{}\t{}\n", group.name, collapsed, kind));
         for member in &group.members {
             buf.push_str(&format!(
                 "MEMBER\t{}\t{}\t{}\n",
@@ -4120,7 +4158,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
             id: gid,
             name: sg.name.clone(),
             collapsed: sg.collapsed,
-            kind: GroupKind::Normal,
+            kind: sg.kind,
             members,
         });
     }
@@ -4264,6 +4302,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(saved) = load_groups() {
         restore_groups(&mut app, &saved);
+    }
+
+    // Auto-create the TmuxSystem group on first run when tmux is installed.
+    // Idempotent — subsequent runs find the restored group and short-circuit.
+    // Re-run refresh so derived members populate before the first paint.
+    if is_tmux_available() {
+        ensure_tmux_system_group(&mut app);
+        refresh_items(&conn, root, &atoms, &mut app, colormap)?;
     }
 
     // Background thread that pokes the main loop every 5 s so tmux state
@@ -8117,6 +8163,119 @@ mod tests {
     fn is_session_attached_returns_false_for_orphan() {
         let app = make_app();
         assert!(!super::is_session_attached(&app, "ghost"));
+    }
+
+    // ── T4.5: ensure_tmux_system_group + writer extension ──
+
+    #[test]
+    fn ensure_tmux_system_group_creates_when_absent() {
+        let mut app = make_app();
+        super::ensure_tmux_system_group(&mut app);
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(app.groups[0].kind, super::GroupKind::TmuxSystem);
+        assert!(app.groups[0].collapsed, "default collapsed");
+        assert!(app.groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn ensure_tmux_system_group_idempotent() {
+        let mut app = make_app();
+        super::ensure_tmux_system_group(&mut app);
+        super::ensure_tmux_system_group(&mut app);
+        assert_eq!(
+            app.groups
+                .iter()
+                .filter(|g| g.kind == super::GroupKind::TmuxSystem)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_tmux_system_group_appends_to_display_order() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win");
+        super::ensure_tmux_system_group(&mut app);
+        // Order: ungrouped window first, system group appended.
+        assert!(matches!(app.display_order.last(), Some(DisplaySlot::Group(_))));
+    }
+
+    #[test]
+    fn ensure_tmux_system_group_does_not_mark_dirty() {
+        let mut app = make_app();
+        app.clear_dirty();
+        super::ensure_tmux_system_group(&mut app);
+        assert!(!app.is_dirty(), "auto-create must be invisible to persistence");
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_system_group_kind() {
+        let dir = std::env::temp_dir().join("ptm_test_rt_kind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![
+            SavedGroup {
+                name: "Work".into(),
+                collapsed: false,
+                kind: super::GroupKind::Normal,
+                members: vec![],
+            },
+            SavedGroup {
+                name: "Tmux Sessions".into(),
+                collapsed: true,
+                kind: super::GroupKind::TmuxSystem,
+                members: vec![],
+            },
+        ];
+        super::save_groups_to(&path, &saved);
+        let loaded = super::load_groups_from(&path).expect("loads");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].kind, super::GroupKind::Normal);
+        assert_eq!(loaded[1].kind, super::GroupKind::TmuxSystem);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_system_group_collapse_state() {
+        let dir = std::env::temp_dir().join("ptm_test_rt_collapse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "Tmux Sessions".into(),
+            collapsed: false,
+            kind: super::GroupKind::TmuxSystem,
+            members: vec![],
+        }];
+        super::save_groups_to(&path, &saved);
+        let loaded = super::load_groups_from(&path).expect("loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].collapsed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_emits_4_field_group_line() {
+        // Belt-and-braces: verify the on-disk byte sequence so we catch
+        // accidental field reorder / format drift.
+        let dir = std::env::temp_dir().join("ptm_test_writer_format");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "Foo".into(),
+            collapsed: true,
+            kind: super::GroupKind::TmuxSystem,
+            members: vec![],
+        }];
+        super::save_groups_to(&path, &saved);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "v1\nGROUP\tFoo\t1\ttmux_system\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

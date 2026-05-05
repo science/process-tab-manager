@@ -261,7 +261,6 @@ impl Group {
 enum DisplaySlot {
     Window(u32),
     Group(u32),
-    Session(String), // orphan tmux session — exists but has no attached window
 }
 
 #[derive(Clone, Debug)]
@@ -699,20 +698,31 @@ impl App {
                     self.display_rows.push(DisplayRow::GroupHeader { group_id: *gid });
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
                         if !group.collapsed {
-                            for member_wid in group.live_wids() {
-                                self.display_rows.push(DisplayRow::Window {
-                                    wid: member_wid,
-                                    group_id: Some(*gid),
-                                });
+                            match group.kind {
+                                GroupKind::Normal => {
+                                    for member_wid in group.live_wids() {
+                                        self.display_rows.push(DisplayRow::Window {
+                                            wid: member_wid,
+                                            group_id: Some(*gid),
+                                        });
+                                    }
+                                }
+                                GroupKind::TmuxSystem => {
+                                    // Members of a TmuxSystem group hold session
+                                    // names in `label` (see GroupMember docs).
+                                    // Render every member as a Session row, regardless
+                                    // of attached/orphan state — that detail is
+                                    // computed at draw time from app.items.
+                                    for member in &group.members {
+                                        self.display_rows.push(DisplayRow::Session {
+                                            name: member.label.clone(),
+                                            group_id: Some(*gid),
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                DisplaySlot::Session(name) => {
-                    self.display_rows.push(DisplayRow::Session {
-                        name: name.clone(),
-                        group_id: None,
-                    });
                 }
             }
         }
@@ -953,12 +963,16 @@ impl App {
                         .map(|s| s.success())
                         .unwrap_or(false);
                     if ok {
-                        // Rewrite the slot in-place so the row keeps its
-                        // position in display_order across the next refresh.
-                        for slot in &mut self.display_order {
-                            if let DisplaySlot::Session(n) = slot {
-                                if *n == old {
-                                    *n = new_name.clone();
+                        // Sessions live as members of the TmuxSystem group;
+                        // rewrite the matching member's label in place so the
+                        // row keeps its position until the next refresh
+                        // re-derives membership from list_tmux_sessions.
+                        for group in &mut self.groups {
+                            if group.kind == GroupKind::TmuxSystem {
+                                for member in &mut group.members {
+                                    if member.label == old {
+                                        member.label = new_name.clone();
+                                    }
                                 }
                             }
                         }
@@ -1028,14 +1042,16 @@ impl App {
                 DisplaySlot::Window(_) => {
                     row_count += 1;
                 }
-                DisplaySlot::Session(_) => {
-                    row_count += 1;
-                }
                 DisplaySlot::Group(gid) => {
                     row_count += 1;
                     if let Some(group) = self.groups.iter().find(|g| g.id == *gid) {
                         if !group.collapsed {
-                            row_count += group.live_count();
+                            // Normal groups list live windows; TmuxSystem
+                            // groups list one row per session-name member.
+                            row_count += match group.kind {
+                                GroupKind::Normal => group.live_count(),
+                                GroupKind::TmuxSystem => group.members.len(),
+                            };
                         }
                     }
                 }
@@ -1049,7 +1065,6 @@ impl App {
         let src_pos = self.display_order.iter().position(|s| match (target, s) {
             (DisplaySlot::Window(a), DisplaySlot::Window(b)) => a == b,
             (DisplaySlot::Group(a), DisplaySlot::Group(b)) => a == b,
-            (DisplaySlot::Session(a), DisplaySlot::Session(b)) => a == b,
             _ => false,
         });
         if let Some(sp) = src_pos {
@@ -1223,16 +1238,10 @@ impl App {
                 }
                 (DisplaySlot::Group(*group_id), pos)
             }
-            DisplayRow::Session { name, .. } => {
-                let nm = name.clone();
-                let pos = self.display_order.iter().position(
-                    |s| matches!(s, DisplaySlot::Session(n) if *n == nm),
-                );
-                if let Some(p) = pos {
-                    self.display_order.remove(p);
-                }
-                (DisplaySlot::Session(nm), pos)
-            }
+            // Session rows are always inside the TmuxSystem group; classify_drop
+            // returns NoOp for session sources (T4.6) so this fn is never
+            // called with one. Treat unexpectedly arriving here as no-op.
+            DisplayRow::Session { .. } => return false,
         };
         // Adjust dst_slot if source was in display_order before the dst.
         let insert_at = match dst_slot {
@@ -1994,31 +2003,27 @@ fn refresh_items(
     // prune our HashSet so a wid that's later re-used gets a fresh subscribe.)
     app.subscribed_wids.retain(|w| live_wids.contains(w));
 
-    // Orphan tmux sessions — sessions that exist but have zero attached
-    // clients according to tmux itself. We ask tmux rather than checking
-    // our own item.session attributions, because attribution fails on
-    // gnome-terminal (the PID collision is unresolvable) and falling back
-    // to "attributed by PTM" would leave a bogus orphan row visible for
-    // every attached-but-unattributed session.
-    let sessions_with_clients: HashSet<String> =
-        tmux_clients.values().cloned().collect();
-    let live_sessions = list_tmux_sessions();
-    let live_session_names: HashSet<String> = live_sessions
-        .iter()
-        .map(|(n, _)| n.clone())
+    // Tmux sessions: surface ALL live sessions (attached + orphan) inside
+    // the TmuxSystem group, if one exists. The group itself is auto-created
+    // at startup (T4.5); refresh_items only syncs membership against the
+    // current `tmux list-sessions` output. The visual attached-vs-orphan
+    // distinction is computed at draw time from app.items.
+    let live_session_names: Vec<String> = list_tmux_sessions()
+        .into_iter()
+        .map(|(n, _)| n)
         .collect();
-    let orphan_session_names: HashSet<String> = live_session_names
-        .difference(&sessions_with_clients)
-        .cloned()
-        .collect();
+    if let Some(group) = app
+        .groups
+        .iter_mut()
+        .find(|g| g.kind == GroupKind::TmuxSystem)
+    {
+        sync_system_group_members(group, &live_session_names);
+    }
 
-    // Remove dead entries from display_order. Sessions are kept iff they
-    // still exist in tmux AND aren't currently attached to a tracked window
-    // (attached sessions are represented by the window row, not a Session row).
+    // Remove dead entries from display_order.
     app.display_order.retain(|slot| match slot {
         DisplaySlot::Window(wid) => live_wids.contains(wid),
         DisplaySlot::Group(gid) => app.groups.iter().any(|g| g.id == *gid),
-        DisplaySlot::Session(name) => orphan_session_names.contains(name),
     });
 
     // Collect wids already tracked (live members of groups + ungrouped
@@ -2043,31 +2048,41 @@ fn refresh_items(
         }
     }
 
-    // Add new orphan sessions we haven't seen before, appended at the bottom.
-    let known_session_names: HashSet<String> = app
-        .display_order
-        .iter()
-        .filter_map(|s| {
-            if let DisplaySlot::Session(n) = s {
-                Some(n.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    for name in &orphan_session_names {
-        if !known_session_names.contains(name) {
-            app.display_order
-                .push(DisplaySlot::Session(name.clone()));
-        }
-    }
-
     // Update active window
     app.active_wid = get_active_window(conn, root, atoms).unwrap_or(None);
 
     app.items = new_items;
     app.build_display_rows();
     Ok(())
+}
+
+/// True if any tracked window is currently attached to `session_name`. Used
+/// at draw time to decide between filled-circle (attached) and hollow-ring
+/// (orphan) markers on session rows. Pure — no X11 or tmux calls.
+fn is_session_attached(app: &App, session_name: &str) -> bool {
+    app.items
+        .iter()
+        .any(|i| i.session.as_deref() == Some(session_name))
+}
+
+/// Idempotent membership sync for the TmuxSystem group: drop members whose
+/// session vanished, preserve order of survivors, append new sessions at the
+/// end. Pure — no X11 or tmux calls; the caller passes the live name list.
+fn sync_system_group_members(group: &mut Group, live_sessions: &[String]) {
+    use std::collections::HashSet;
+    let live_set: HashSet<&str> = live_sessions.iter().map(String::as_str).collect();
+    group.members.retain(|m| live_set.contains(m.label.as_str()));
+    let existing: HashSet<String> = group.members.iter().map(|m| m.label.clone()).collect();
+    for name in live_sessions {
+        if !existing.contains(name) {
+            group.members.push(GroupMember {
+                label: name.clone(),
+                wm_class: String::new(),
+                custom_prefix: String::new(),
+                live_wid: None,
+            });
+        }
+    }
 }
 
 // ── tmux session detection ──
@@ -2589,7 +2604,18 @@ impl Renderer {
                     } else {
                         (ix, iw)
                     };
-                    self.draw_session_row(conn, pix, x, y, w, ITEM_H as u16, name, hovered)?;
+                    let attached = is_session_attached(app, name);
+                    self.draw_session_row(
+                        conn,
+                        pix,
+                        x,
+                        y,
+                        w,
+                        ITEM_H as u16,
+                        name,
+                        hovered,
+                        attached,
+                    )?;
                 }
             }
         }
@@ -2689,7 +2715,18 @@ impl Renderer {
                                 (ix, iw)
                             };
                             // Ghost reuses the session-row drawing; hovered=false, no special ghost style.
-                            self.draw_session_row(conn, pix, x, ghost_y, w, ITEM_H as u16, name, false)?;
+                            let attached = is_session_attached(app, name);
+                            self.draw_session_row(
+                                conn,
+                                pix,
+                                x,
+                                ghost_y,
+                                w,
+                                ITEM_H as u16,
+                                name,
+                                false,
+                                attached,
+                            )?;
                         }
                     }
                 }
@@ -2845,6 +2882,7 @@ impl Renderer {
         h: u16,
         name: &str,
         hovered: bool,
+        attached: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Background
         let bg = if hovered {
@@ -2859,7 +2897,8 @@ impl Renderer {
             &[Rectangle { x, y, width: w, height: h }],
         )?;
 
-        // Grey left-edge stripe so orphan sessions read as "not a window".
+        // Grey left-edge stripe so session rows read distinctly from
+        // window rows even when the marker dot is dim.
         conn.change_gc(
             self.gc,
             &ChangeGCAux::new().foreground(self.text_dim_pixel),
@@ -2881,7 +2920,8 @@ impl Renderer {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
 
-        // Hollow ring on the right: "session exists but no attached terminal".
+        // Marker on the right edge: filled circle when an attached terminal
+        // exists for this session, hollow ring when it's an orphan.
         let marker_size: u16 = 6;
         let marker_x = x + w as i16 - marker_size as i16 - 6;
         let marker_y = y + (h as i16 - marker_size as i16) / 2;
@@ -2889,18 +2929,19 @@ impl Renderer {
             self.gc,
             &ChangeGCAux::new().foreground(self.session_marker_pixel),
         )?;
-        conn.poly_arc(
-            drawable,
-            self.gc,
-            &[Arc {
-                x: marker_x,
-                y: marker_y,
-                width: marker_size,
-                height: marker_size,
-                angle1: 0,
-                angle2: 360 * 64,
-            }],
-        )?;
+        let arc = [Arc {
+            x: marker_x,
+            y: marker_y,
+            width: marker_size,
+            height: marker_size,
+            angle1: 0,
+            angle2: 360 * 64,
+        }];
+        if attached {
+            conn.poly_fill_arc(drawable, self.gc, &arc)?;
+        } else {
+            conn.poly_arc(drawable, self.gc, &arc)?;
+        }
 
         Ok(())
     }
@@ -3472,10 +3513,15 @@ fn execute_menu_action(
                     let _ = std::process::Command::new("tmux")
                         .args(["kill-session", "-t", name])
                         .status();
+                    // Sessions live as members of the TmuxSystem group;
+                    // optimistically drop the matching member so the row
+                    // disappears before the next 5s tmux poll catches up.
                     let target = name.clone();
-                    app.display_order.retain(|s| {
-                        !matches!(s, DisplaySlot::Session(n) if *n == target)
-                    });
+                    for group in &mut app.groups {
+                        if group.kind == GroupKind::TmuxSystem {
+                            group.members.retain(|m| m.label != target);
+                        }
+                    }
                     app.build_display_rows();
                 }
                 DisplayRow::Window { .. } => {
@@ -3892,6 +3938,7 @@ struct SavedMember {
 struct SavedGroup {
     name: String,
     collapsed: bool,
+    #[allow(dead_code)] // restore_groups starts using this in T4.5
     kind: GroupKind,
     members: Vec<SavedMember>,
 }
@@ -6521,9 +6568,34 @@ mod tests {
 
     // ── Session context menu + inline rename ──
 
+    /// Test helper: ensure a TmuxSystem group exists, append a session
+    /// member with the given name, and rebuild rows. Sessions live only
+    /// inside that group from T4.4 onward, so this replaces the old
+    /// "push DisplaySlot::Session" pattern.
     fn push_session(app: &mut App, name: &str) {
-        app.display_order
-            .push(DisplaySlot::Session(name.to_string()));
+        let gid = match app.groups.iter().find(|g| g.kind == super::GroupKind::TmuxSystem) {
+            Some(g) => g.id,
+            None => {
+                let gid = app.next_group_id;
+                app.next_group_id += 1;
+                app.groups.push(super::Group {
+                    id: gid,
+                    name: "Tmux Sessions".to_string(),
+                    collapsed: false,
+                    kind: super::GroupKind::TmuxSystem,
+                    members: Vec::new(),
+                });
+                app.display_order.push(DisplaySlot::Group(gid));
+                gid
+            }
+        };
+        let group = app.groups.iter_mut().find(|g| g.id == gid).unwrap();
+        group.members.push(super::GroupMember {
+            label: name.to_string(),
+            wm_class: String::new(),
+            custom_prefix: String::new(),
+            live_wid: None,
+        });
         app.build_display_rows();
     }
 
@@ -6531,7 +6603,8 @@ mod tests {
     fn menu_for_session_has_attach_rename_kill() {
         let mut app = make_app();
         push_session(&mut app, "demo");
-        let entries = build_menu_entries(&app, 0);
+        // Row 0 is now the TmuxSystem GroupHeader; row 1 is the session.
+        let entries = build_menu_entries(&app, 1);
         assert_eq!(entries.len(), 3);
         assert!(matches!(entries[0].action, MenuAction::AttachSession));
         assert!(matches!(entries[1].action, MenuAction::RenameSession));
@@ -6558,8 +6631,13 @@ mod tests {
             rs.text = "renamed".to_string();
         }
         app.cancel_rename();
+        // The TmuxSystem group is still in display_order; the session
+        // member's name is preserved.
         assert_eq!(app.display_order.len(), 1);
-        assert!(matches!(&app.display_order[0], DisplaySlot::Session(n) if n == "demo"));
+        assert!(matches!(&app.display_order[0], DisplaySlot::Group(_)));
+        let group = app.groups.iter().find(|g| g.kind == super::GroupKind::TmuxSystem).unwrap();
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].label, "demo");
     }
 
     // ── Header button hit-test ──
@@ -7256,22 +7334,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classify_drop_session_source_just_inserts() {
-        let mut app = make_app();
-        add_item(&mut app, 1, "A");
-        app.display_order.push(DisplaySlot::Session("foo".to_string()));
-        app.build_display_rows();
-        // [Window(1, None), Session("foo")]
-        // Drag the session onto window 1 — top half.
-        let y = app.row_y(0) + 2;
-        // Sessions just reorder via drop_index_from_y — equivalent to
-        // InsertBefore at the top-half-of-row-0 gap.
-        assert!(matches!(
-            super::classify_drop(&app, 1, y),
-            super::DropTarget::InsertBefore(0)
-        ));
-    }
+    // Session-source drag-reorder no longer applies — sessions live as
+    // members of the auto-managed TmuxSystem group from T4.4 onward and
+    // are not user-reorderable. T4.6 adds the explicit NoOp test.
 
     #[test]
     fn classify_drop_collapsed_group_header_still_joins() {
@@ -7906,20 +7971,172 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── T4.4: TmuxSystem group derivation + rendering ──
+
+    fn make_system_group(app: &mut App, sessions: &[&str]) -> u32 {
+        let gid = app.next_group_id;
+        app.next_group_id += 1;
+        let members = sessions
+            .iter()
+            .map(|s| super::GroupMember {
+                label: s.to_string(),
+                wm_class: String::new(),
+                custom_prefix: String::new(),
+                live_wid: None,
+            })
+            .collect();
+        app.groups.push(super::Group {
+            id: gid,
+            name: "Tmux Sessions".to_string(),
+            collapsed: false,
+            kind: super::GroupKind::TmuxSystem,
+            members,
+        });
+        app.display_order.push(DisplaySlot::Group(gid));
+        gid
+    }
+
+    #[test]
+    fn sync_system_group_appends_new_sessions() {
+        let mut group = super::Group {
+            id: 0,
+            name: "T".into(),
+            collapsed: false,
+            kind: super::GroupKind::TmuxSystem,
+            members: Vec::new(),
+        };
+        super::sync_system_group_members(
+            &mut group,
+            &["a".into(), "b".into()],
+        );
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(group.members[0].label, "a");
+        assert_eq!(group.members[0].wm_class, "");
+        assert_eq!(group.members[0].live_wid, None);
+        assert_eq!(group.members[1].label, "b");
+    }
+
+    #[test]
+    fn sync_system_group_drops_vanished_sessions() {
+        let mut group = super::Group {
+            id: 0,
+            name: "T".into(),
+            collapsed: false,
+            kind: super::GroupKind::TmuxSystem,
+            members: vec![
+                super::GroupMember {
+                    label: "a".into(),
+                    wm_class: String::new(),
+                    custom_prefix: String::new(),
+                    live_wid: None,
+                },
+                super::GroupMember {
+                    label: "b".into(),
+                    wm_class: String::new(),
+                    custom_prefix: String::new(),
+                    live_wid: None,
+                },
+            ],
+        };
+        super::sync_system_group_members(&mut group, &["a".into()]);
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].label, "a");
+    }
+
+    #[test]
+    fn sync_system_group_preserves_order_when_appending() {
+        let mut group = super::Group {
+            id: 0,
+            name: "T".into(),
+            collapsed: false,
+            kind: super::GroupKind::TmuxSystem,
+            members: vec![
+                super::GroupMember {
+                    label: "a".into(),
+                    wm_class: String::new(),
+                    custom_prefix: String::new(),
+                    live_wid: None,
+                },
+                super::GroupMember {
+                    label: "b".into(),
+                    wm_class: String::new(),
+                    custom_prefix: String::new(),
+                    live_wid: None,
+                },
+            ],
+        };
+        super::sync_system_group_members(
+            &mut group,
+            &["a".into(), "b".into(), "c".into()],
+        );
+        assert_eq!(
+            group.members.iter().map(|m| m.label.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn build_display_rows_renders_system_group_as_session_rows() {
+        let mut app = make_app();
+        make_system_group(&mut app, &["a", "b"]);
+        add_item(&mut app, 1, "win"); // ungrouped window
+        app.build_display_rows();
+
+        assert_eq!(app.display_rows.len(), 4);
+        assert!(matches!(&app.display_rows[0], DisplayRow::GroupHeader { .. }));
+        assert!(
+            matches!(&app.display_rows[1], DisplayRow::Session { name, group_id: Some(_) } if name == "a"),
+            "row 1 should be Session(a) inside system group"
+        );
+        assert!(
+            matches!(&app.display_rows[2], DisplayRow::Session { name, group_id: Some(_) } if name == "b"),
+            "row 2 should be Session(b) inside system group"
+        );
+        assert!(matches!(&app.display_rows[3], DisplayRow::Window { wid: 1, group_id: None }));
+    }
+
+    #[test]
+    fn build_display_rows_collapsed_system_group_hides_sessions() {
+        let mut app = make_app();
+        let gid = make_system_group(&mut app, &["a", "b"]);
+        // Collapse the system group.
+        app.groups.iter_mut().find(|g| g.id == gid).unwrap().collapsed = true;
+        app.build_display_rows();
+        assert_eq!(app.display_rows.len(), 1);
+        assert!(matches!(&app.display_rows[0], DisplayRow::GroupHeader { .. }));
+    }
+
+    #[test]
+    fn is_session_attached_returns_true_for_attached_item() {
+        let mut app = make_app();
+        add_attached_item(&mut app, 1, "term", "demo");
+        assert!(super::is_session_attached(&app, "demo"));
+    }
+
+    #[test]
+    fn is_session_attached_returns_false_for_orphan() {
+        let app = make_app();
+        assert!(!super::is_session_attached(&app, "ghost"));
+    }
+
     #[test]
     fn kill_session_from_orphan_session_dispatch_returns_no_confirm() {
         let mut app = make_app();
         push_session(&mut app, "ghost");
-        let req = super::execute_menu_action(&mut app, super::MenuAction::KillSession, 0);
+        // Row 0 is the system group header; row 1 is the session.
+        let req = super::execute_menu_action(&mut app, super::MenuAction::KillSession, 1);
         // Orphan path keeps direct invocation (no popup) — but in tests the
         // tmux command may or may not actually exist; what we verify is that
-        // no ConfirmRequest comes back and the slot is dropped optimistically.
+        // no ConfirmRequest comes back and the member is dropped optimistically.
         assert!(req.is_none(), "orphan session path returns no confirm");
-        // Optimistic slot removal happened.
+        let group = app
+            .groups
+            .iter()
+            .find(|g| g.kind == super::GroupKind::TmuxSystem)
+            .expect("system group present");
         assert!(
-            !app.display_order
-                .iter()
-                .any(|s| matches!(s, DisplaySlot::Session(n) if n == "ghost"))
+            !group.members.iter().any(|m| m.label == "ghost"),
+            "expected member 'ghost' to be optimistically removed"
         );
     }
 }

@@ -1362,12 +1362,17 @@ fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
         _ => None,
     };
 
-    // Header / Session source: simple gap-based reorder. (OQ-G3's
-    // group-on-group dropping is deferred.)
-    if matches!(
-        source,
-        DisplayRow::GroupHeader { .. } | DisplayRow::Session { .. }
-    ) {
+    // Session-row drag is never user-actionable: members of the TmuxSystem
+    // group are derived from `tmux list-sessions` every refresh, so
+    // user-driven reordering would be silently overwritten.
+    if matches!(source, DisplayRow::Session { .. }) {
+        return DropTarget::NoOp;
+    }
+
+    // Header source: simple gap-based reorder. (OQ-G3's group-on-group
+    // dropping is deferred.) Applies to both Normal and TmuxSystem groups —
+    // the system group itself moves like any other group.
+    if matches!(source, DisplayRow::GroupHeader { .. }) {
         let gap = app.drop_index_from_y(current_y);
         if gap >= app.display_rows.len() {
             return DropTarget::InsertAtEnd;
@@ -1410,6 +1415,11 @@ fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
 
     match target_row {
         DisplayRow::GroupHeader { group_id } => {
+            if is_target_system_group(app, *group_id) {
+                // Window can't be dropped onto the system group — its
+                // members are derived, not user-added.
+                return DropTarget::NoOp;
+            }
             // Whole header row → JoinGroup(g, 0).
             DropTarget::JoinGroup { gid: *group_id, at: 0 }
         }
@@ -1440,10 +1450,25 @@ fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
                 }
             }
         }
+        DisplayRow::Session { group_id: Some(target_gid), .. } => {
+            // Session rows live inside the TmuxSystem group — drops onto
+            // them implicitly target that group, which doesn't accept
+            // window members. Defensive NoOp (also covers a future variant
+            // where Session rows somehow land outside the system group).
+            if is_target_system_group(app, *target_gid) {
+                return DropTarget::NoOp;
+            }
+            let pos = if upper_half { t } else { t + 1 };
+            if pos >= app.display_rows.len() {
+                DropTarget::InsertAtEnd
+            } else {
+                DropTarget::InsertBefore(pos)
+            }
+        }
         DisplayRow::Window {
             group_id: None, ..
         }
-        | DisplayRow::Session { .. } => {
+        | DisplayRow::Session { group_id: None, .. } => {
             let pos = if upper_half { t } else { t + 1 };
             if pos >= app.display_rows.len() {
                 DropTarget::InsertAtEnd
@@ -1452,6 +1477,13 @@ fn classify_drop(app: &App, source_row: usize, current_y: i16) -> DropTarget {
             }
         }
     }
+}
+
+fn is_target_system_group(app: &App, gid: u32) -> bool {
+    app.groups
+        .iter()
+        .find(|g| g.id == gid)
+        .map_or(false, |g| g.kind == GroupKind::TmuxSystem)
 }
 
 /// Map a DropTarget back to a y-coordinate for the drag indicator line.
@@ -3372,17 +3404,19 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
     }
     let attached_session = window_session_for_row(app, row);
     match &app.display_rows[row] {
-        DisplayRow::GroupHeader { .. } => {
-            vec![
-                MenuEntry {
-                    label: "Rename Group".to_string(),
-                    action: MenuAction::RenameGroup,
-                },
-                MenuEntry {
+        DisplayRow::GroupHeader { group_id } => {
+            let mut entries = vec![MenuEntry {
+                label: "Rename Group".to_string(),
+                action: MenuAction::RenameGroup,
+            }];
+            // System groups can't be deleted from the UI — they're auto-managed.
+            if !is_target_system_group(app, *group_id) {
+                entries.push(MenuEntry {
                     label: "Delete Group".to_string(),
                     action: MenuAction::DeleteGroup,
-                },
-            ]
+                });
+            }
+            entries
         }
         DisplayRow::Window {
             group_id: Some(_), ..
@@ -8176,6 +8210,7 @@ mod tests {
             members,
         });
         app.display_order.push(DisplaySlot::Group(gid));
+        app.build_display_rows();
         gid
     }
 
@@ -8477,6 +8512,121 @@ mod tests {
         assert!(app.hit_test_top_buttons(100, HEADER_H as i16 + 5).is_none());
         // Above the row.
         assert!(app.hit_test_top_buttons(100, -1).is_none());
+    }
+
+    // ── T4.6: drag classifier denies system group as drop target ──
+
+    #[test]
+    fn classify_drop_window_into_system_group_header_is_noop() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win"); // ungrouped window source (row 0)
+        make_system_group(&mut app, &[]); // empty system group (row 1)
+        app.build_display_rows();
+        // [Window(1), GroupHeader(system)]
+        let header_y = app.row_y(1) + 2;
+        assert_eq!(
+            super::classify_drop(&app, 0, header_y),
+            super::DropTarget::NoOp
+        );
+    }
+
+    #[test]
+    fn classify_drop_window_into_system_group_body_is_noop() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win"); // row 0
+        make_system_group(&mut app, &["a", "b"]); // header + 2 sessions = rows 1..3
+        app.build_display_rows();
+        // [Window(1), GroupHeader, Session(a), Session(b)]
+        // Drop window onto session row 'a'.
+        let body_y = app.row_y(2) + 2;
+        assert_eq!(
+            super::classify_drop(&app, 0, body_y),
+            super::DropTarget::NoOp
+        );
+        // And onto 'b' (lower half too).
+        let body_y_b = app.row_y(3) + (ITEM_H as i16) - 2;
+        assert_eq!(
+            super::classify_drop(&app, 0, body_y_b),
+            super::DropTarget::NoOp
+        );
+    }
+
+    #[test]
+    fn classify_drop_session_source_is_noop() {
+        let mut app = make_app();
+        make_system_group(&mut app, &["a", "b"]);
+        add_item(&mut app, 1, "win");
+        app.build_display_rows();
+        // [GroupHeader, Session(a), Session(b), Window(1)]
+        // Try dragging session 'a' (row 1) anywhere — should NoOp.
+        let target_y = app.row_y(3) + 2;
+        assert_eq!(
+            super::classify_drop(&app, 1, target_y),
+            super::DropTarget::NoOp
+        );
+    }
+
+    #[test]
+    fn classify_drop_system_group_header_as_source_reorders_normally() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win"); // row 0
+        make_system_group(&mut app, &["a"]); // rows 1, 2
+        app.build_display_rows();
+        // [Window(1), GroupHeader, Session(a)]
+        // Drag header (row 1) above row 0 → InsertBefore(0).
+        let above = app.row_y(0) - 5;
+        assert_eq!(
+            super::classify_drop(&app, 1, above),
+            super::DropTarget::InsertBefore(0)
+        );
+    }
+
+    #[test]
+    fn is_target_system_group_returns_true_for_system() {
+        let mut app = make_app();
+        let gid = make_system_group(&mut app, &[]);
+        assert!(super::is_target_system_group(&app, gid));
+    }
+
+    #[test]
+    fn is_target_system_group_returns_false_for_normal() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win");
+        let gid = app.create_group(1);
+        assert!(!super::is_target_system_group(&app, gid));
+    }
+
+    #[test]
+    fn is_target_system_group_returns_false_for_unknown_gid() {
+        let app = make_app();
+        assert!(!super::is_target_system_group(&app, 9999));
+    }
+
+    #[test]
+    fn menu_for_system_group_header_excludes_delete_group() {
+        let mut app = make_app();
+        make_system_group(&mut app, &[]);
+        let entries = super::build_menu_entries(&app, 0);
+        assert!(
+            entries.iter().any(|e| matches!(e.action, super::MenuAction::RenameGroup)),
+            "Rename Group must remain"
+        );
+        assert!(
+            !entries.iter().any(|e| matches!(e.action, super::MenuAction::DeleteGroup)),
+            "Delete Group must be suppressed for the system group"
+        );
+    }
+
+    #[test]
+    fn menu_for_normal_group_header_includes_delete_group() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win");
+        app.create_group(1);
+        let entries = super::build_menu_entries(&app, 0);
+        assert!(
+            entries.iter().any(|e| matches!(e.action, super::MenuAction::DeleteGroup)),
+            "normal group keeps Delete Group entry"
+        );
     }
 
     #[test]

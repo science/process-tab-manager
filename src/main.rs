@@ -276,9 +276,7 @@ struct ContextMenu {
     pixmap: Pixmap,
     entries: Vec<MenuEntry>,
     target_row: usize,
-    #[allow(dead_code)]
     x: i16,
-    #[allow(dead_code)]
     y: i16,
     width: u16,
     height: u16,
@@ -3139,10 +3137,23 @@ impl Renderer {
 
 // ── Context menu ──
 
+/// Session name attached to the window at `row`, if any. Used both by
+/// build_menu_entries (decide whether to show "Kill tmux session") and by
+/// execute_menu_action (extract the name when dispatching the popup).
+fn window_session_for_row(app: &App, row: usize) -> Option<String> {
+    if let Some(DisplayRow::Window { wid, .. }) = app.display_rows.get(row) {
+        if let Some(item) = app.find_item(*wid) {
+            return item.session.clone();
+        }
+    }
+    None
+}
+
 fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
     if row >= app.display_rows.len() {
         return vec![];
     }
+    let attached_session = window_session_for_row(app, row);
     match &app.display_rows[row] {
         DisplayRow::GroupHeader { .. } => {
             vec![
@@ -3159,7 +3170,7 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
         DisplayRow::Window {
             group_id: Some(_), ..
         } => {
-            vec![
+            let mut entries = vec![
                 MenuEntry {
                     label: "Rename Tab".to_string(),
                     action: MenuAction::RenameTab,
@@ -3168,7 +3179,14 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
                     label: "Remove from Group".to_string(),
                     action: MenuAction::RemoveFromGroup,
                 },
-            ]
+            ];
+            if attached_session.is_some() {
+                entries.push(MenuEntry {
+                    label: "Kill tmux session".to_string(),
+                    action: MenuAction::KillSession,
+                });
+            }
+            entries
         }
         DisplayRow::Window {
             group_id: None, ..
@@ -3187,6 +3205,12 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
                 entries.push(MenuEntry {
                     label: format!("Add to {}", group.name),
                     action: MenuAction::AddToGroup(group.id),
+                });
+            }
+            if attached_session.is_some() {
+                entries.push(MenuEntry {
+                    label: "Kill tmux session".to_string(),
+                    action: MenuAction::KillSession,
                 });
             }
             entries
@@ -3355,9 +3379,21 @@ fn draw_context_menu(
     Ok(())
 }
 
-fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
+/// Returned by `execute_menu_action` when the action wants to open a
+/// confirmation popup as a follow-up. Caller (event loop) materializes it via
+/// `open_confirm_popup` so that fn stays X11-free for tests.
+struct ConfirmRequest {
+    message: String,
+    action: ConfirmAction,
+}
+
+fn execute_menu_action(
+    app: &mut App,
+    action: MenuAction,
+    target_row: usize,
+) -> Option<ConfirmRequest> {
     if target_row >= app.display_rows.len() {
-        return;
+        return None;
     }
     match action {
         MenuAction::CreateGroup => {
@@ -3408,19 +3444,34 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
             }
         }
         MenuAction::KillSession => {
-            if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
-                let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", name])
-                    .status();
-                // Optimistically drop the slot; next refresh will re-confirm.
-                let target = name.clone();
-                app.display_order.retain(|s| {
-                    !matches!(s, DisplaySlot::Session(n) if *n == target)
-                });
-                app.build_display_rows();
+            // Two paths: orphan session row (existing direct invocation —
+            // popup feels excessive for already-detached sessions) versus
+            // attached terminal row (open confirm popup; killing an attached
+            // session also kills the terminal so confirmation is warranted).
+            match &app.display_rows[target_row] {
+                DisplayRow::Session { name, .. } => {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["kill-session", "-t", name])
+                        .status();
+                    let target = name.clone();
+                    app.display_order.retain(|s| {
+                        !matches!(s, DisplaySlot::Session(n) if *n == target)
+                    });
+                    app.build_display_rows();
+                }
+                DisplayRow::Window { .. } => {
+                    if let Some(session) = window_session_for_row(app, target_row) {
+                        return Some(ConfirmRequest {
+                            message: format!("Kill tmux session '{}'?", session),
+                            action: ConfirmAction::KillSession(session),
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
+    None
 }
 
 // ── Confirmation popup ──
@@ -4261,8 +4312,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if idx < menu.entries.len() {
                             let action = menu.entries[idx].action.clone();
                             let target_row = menu.target_row;
+                            let menu_x = menu.x;
+                            let menu_y = menu.y;
                             close_context_menu(&conn, &mut app)?;
-                            execute_menu_action(&mut app, action, target_row);
+                            let follow_up =
+                                execute_menu_action(&mut app, action, target_row);
+                            if let Some(req) = follow_up {
+                                open_confirm_popup(
+                                    &conn,
+                                    screen,
+                                    &renderer,
+                                    &mut app,
+                                    req.message,
+                                    req.action,
+                                    menu_x,
+                                    menu_y,
+                                )?;
+                            }
                         } else {
                             close_context_menu(&conn, &mut app)?;
                         }
@@ -7540,7 +7606,7 @@ mod tests {
         add_item(&mut app, 1, "term");
         app.build_display_rows();
 
-        super::execute_menu_action(&mut app, super::MenuAction::CreateGroup, 0);
+        let _ = super::execute_menu_action(&mut app, super::MenuAction::CreateGroup, 0);
 
         let rs = app.rename.as_ref().expect("rename should be active after CreateGroup");
         let gid = match rs.target {
@@ -7580,6 +7646,19 @@ mod tests {
         assert_eq!(loaded[0].name, "Foo");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn add_attached_item(app: &mut App, wid: u32, label: &str, session: &str) {
+        app.items.push(Item {
+            wid,
+            label: label.to_string(),
+            wm_class: "test".to_string(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: Some(session.to_string()),
+        });
+        app.display_order.push(DisplaySlot::Window(wid));
+        app.build_display_rows();
     }
 
     // ── T4.1: confirmation popup ──
@@ -7630,5 +7709,92 @@ mod tests {
         assert!(app.confirm.is_none());
         let action = super::dispatch_confirm(&mut app, true);
         assert!(action.is_none());
+    }
+
+    // ── T4.2: kill tmux session from attached terminal row ──
+
+    #[test]
+    fn menu_for_attached_terminal_includes_kill_session() {
+        let mut app = make_app();
+        add_attached_item(&mut app, 1, "term", "demo");
+        let entries = super::build_menu_entries(&app, 0);
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Kill tmux session"),
+            "expected 'Kill tmux session' in {:?}",
+            labels
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.action, super::MenuAction::KillSession)),
+            "expected KillSession action"
+        );
+    }
+
+    #[test]
+    fn menu_for_unattached_terminal_excludes_kill_session() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "term"); // session: None
+        app.build_display_rows();
+        let entries = super::build_menu_entries(&app, 0);
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.action, super::MenuAction::KillSession)),
+            "unattached window must not show KillSession"
+        );
+    }
+
+    #[test]
+    fn menu_for_grouped_attached_terminal_includes_kill_session() {
+        let mut app = make_app();
+        add_attached_item(&mut app, 1, "term", "demo");
+        app.create_group(1);
+        // Row 0 = header, row 1 = the grouped attached window.
+        let entries = super::build_menu_entries(&app, 1);
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.action, super::MenuAction::KillSession)),
+            "grouped attached terminal must show KillSession"
+        );
+    }
+
+    #[test]
+    fn kill_session_from_window_dispatch_returns_confirm_request() {
+        let mut app = make_app();
+        add_attached_item(&mut app, 1, "term", "demo");
+        let req = super::execute_menu_action(&mut app, super::MenuAction::KillSession, 0)
+            .expect("expected ConfirmRequest follow-up");
+        assert!(
+            matches!(req.action, super::ConfirmAction::KillSession(ref n) if n == "demo"),
+            "expected KillSession(demo), got {:?}",
+            req.action
+        );
+        assert!(
+            req.message.contains("demo"),
+            "expected message to mention session name, got {:?}",
+            req.message
+        );
+        // App state is not yet mutated — popup hasn't materialized.
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn kill_session_from_orphan_session_dispatch_returns_no_confirm() {
+        let mut app = make_app();
+        push_session(&mut app, "ghost");
+        let req = super::execute_menu_action(&mut app, super::MenuAction::KillSession, 0);
+        // Orphan path keeps direct invocation (no popup) — but in tests the
+        // tmux command may or may not actually exist; what we verify is that
+        // no ConfirmRequest comes back and the slot is dropped optimistically.
+        assert!(req.is_none(), "orphan session path returns no confirm");
+        // Optimistic slot removal happened.
+        assert!(
+            !app.display_order
+                .iter()
+                .any(|s| matches!(s, DisplaySlot::Session(n) if n == "ghost"))
+        );
     }
 }

@@ -709,7 +709,7 @@ impl App {
 
     // ── Group operations ──
 
-    fn create_group(&mut self, wid: u32) {
+    fn create_group(&mut self, wid: u32) -> u32 {
         let gid = self.next_group_id;
         self.next_group_id += 1;
         let name = format!("Group {}", gid + 1);
@@ -728,6 +728,7 @@ impl App {
         }
         self.build_display_rows();
         self.mark_dirty();
+        gid
     }
 
     fn add_to_group(&mut self, gid: u32, wid: u32) {
@@ -3323,7 +3324,11 @@ fn execute_menu_action(app: &mut App, action: MenuAction, target_row: usize) {
     match action {
         MenuAction::CreateGroup => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
-                app.create_group(*wid);
+                let wid = *wid;
+                let gid = app.create_group(wid);
+                // Drop straight into rename so a single keystroke replaces
+                // the default "Group N" name; Enter accepts the default.
+                app.start_rename(gid);
             }
         }
         MenuAction::AddToGroup(gid) => {
@@ -7189,6 +7194,34 @@ mod tests {
         assert!(app.first_dirty_at.is_none());
         assert!(app.last_dirty_at.is_none());
         assert!(!app.is_dirty());
+    }
+
+    // ── T1.7: auto-rename on new group create ──
+
+    #[test]
+    fn create_group_via_menu_immediately_starts_rename_with_text_preselected() {
+        // UX: when the user makes a new group via right-click → "New Group",
+        // they almost always want to name it. Skip the second right-click +
+        // "Rename Group" by entering rename mode immediately, with the
+        // default name pre-selected so a single keystroke replaces it.
+        // Pressing Enter without typing accepts "Group N".
+        let mut app = make_app();
+        add_item(&mut app, 1, "term");
+        app.build_display_rows();
+
+        super::execute_menu_action(&mut app, super::MenuAction::CreateGroup, 0);
+
+        let rs = app.rename.as_ref().expect("rename should be active after CreateGroup");
+        let gid = match rs.target {
+            super::RenameTarget::Group(g) => g,
+            _ => panic!("expected Group rename target, got {:?}", "non-group"),
+        };
+        // Should target the just-created group
+        assert!(app.groups.iter().any(|g| g.id == gid), "rename targets a real group");
+        // Default name pre-populated, cursor at end, full text selected
+        assert_eq!(rs.text, "Group 1");
+        assert_eq!(rs.cursor, rs.text.len());
+        assert_eq!(rs.selection_anchor, Some(0));
     }
 
     #[test]

@@ -3892,6 +3892,7 @@ struct SavedMember {
 struct SavedGroup {
     name: String,
     collapsed: bool,
+    kind: GroupKind,
     members: Vec<SavedMember>,
 }
 
@@ -3919,6 +3920,7 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
                 saved.push(SavedGroup {
                     name: group.name.clone(),
                     collapsed: group.collapsed,
+                    kind: group.kind,
                     members,
                 });
             }
@@ -3959,7 +3961,10 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
         let parts: Vec<&str> = line.split('\t').collect();
         match parts.first() {
             Some(&"GROUP") => {
-                if parts.len() != 3 {
+                // 3-field GROUP lines remain valid (downgrade-friendly); the
+                // optional 4th field carries `kind`. Reject any other arity
+                // so corrupt files fail loudly rather than partially-loading.
+                if !matches!(parts.len(), 3 | 4) {
                     return None;
                 }
                 let collapsed = match parts[2] {
@@ -3967,9 +3972,22 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     "0" => false,
                     _ => return None,
                 };
+                let kind = if parts.len() == 4 {
+                    match parts[3] {
+                        "normal" => GroupKind::Normal,
+                        "tmux_system" => GroupKind::TmuxSystem,
+                        // Unknown kind = corrupt or future-version data.
+                        // Fail the whole load rather than silently fall back —
+                        // partial-loads are how data gets quietly mangled.
+                        _ => return None,
+                    }
+                } else {
+                    GroupKind::Normal
+                };
                 groups.push(SavedGroup {
                     name: parts[1].to_string(),
                     collapsed,
+                    kind,
                     members: Vec::new(),
                 });
             }
@@ -5437,6 +5455,7 @@ mod tests {
             SavedGroup {
                 name: "Browsers".to_string(),
                 collapsed: true,
+                kind: GroupKind::Normal,
                 members: vec![
                     SavedMember {
                         label: "Firefox".to_string(),
@@ -5453,6 +5472,7 @@ mod tests {
             SavedGroup {
                 name: "Terminals".to_string(),
                 collapsed: false,
+                kind: GroupKind::Normal,
                 members: vec![SavedMember {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal-server".to_string(),
@@ -5555,6 +5575,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Browsers".to_string(),
             collapsed: true,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "Firefox".to_string(),
                 wm_class: "Navigator".to_string(),
@@ -5583,6 +5604,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Dev".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![
                 SavedMember {
                     label: "Firefox".to_string(),
@@ -5622,6 +5644,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Gone".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "Terminal".to_string(),
                 wm_class: "gnome-terminal".to_string(),
@@ -5687,6 +5710,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Mixed".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![
                 SavedMember {
                     label: "Firefox".into(),
@@ -5725,6 +5749,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Terms".into(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "claude - process-tab-manager".into(),
                 wm_class: "Gnome-terminal".into(),
@@ -5751,6 +5776,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Terms".into(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "different".into(),
                 wm_class: "Gnome-terminal".into(), // not Firefox
@@ -5778,6 +5804,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Group 1".into(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![
                 SavedMember {
                     label: "UAT-window-B".into(),
@@ -5827,6 +5854,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Old".into(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "ptm-test-window".into(),
                 wm_class: "Gnome-terminal".into(),
@@ -5886,6 +5914,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Terms".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "Terminal".to_string(),
                 wm_class: "xterm".to_string(),
@@ -5908,6 +5937,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Dev".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![
                 SavedMember {
                     label: "Firefox".to_string(),
@@ -7534,6 +7564,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "G".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![SavedMember {
                 label: "Foo".to_string(),
                 wm_class: "FooClass".to_string(),
@@ -7655,6 +7686,7 @@ mod tests {
         let saved = vec![SavedGroup {
             name: "Foo".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![],
         }];
         super::save_groups_to(&path, &saved);
@@ -7811,6 +7843,67 @@ mod tests {
         add_item(&mut app, 1, "A");
         app.create_group(1);
         assert_eq!(app.groups[0].kind, super::GroupKind::Normal);
+    }
+
+    // ── T4.4a: loader tolerance for 4-field GROUP line ──
+
+    fn write_groups_file(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_groups_3_field_group_line_treated_as_normal() {
+        let dir = std::env::temp_dir().join("ptm_test_load_3field");
+        let path = write_groups_file(&dir, "v1\nGROUP\tWork\t0\nMEMBER\tA\tcls\t\n");
+        let loaded = super::load_groups_from(&path).expect("loader accepts 3-field");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Work");
+        assert!(!loaded[0].collapsed);
+        assert_eq!(loaded[0].kind, super::GroupKind::Normal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_4_field_group_line_with_tmux_system_kind() {
+        let dir = std::env::temp_dir().join("ptm_test_load_4field_tmux");
+        let path = write_groups_file(&dir, "v1\nGROUP\tTmux Sessions\t1\ttmux_system\n");
+        let loaded = super::load_groups_from(&path).expect("loader accepts 4-field");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Tmux Sessions");
+        assert!(loaded[0].collapsed);
+        assert_eq!(loaded[0].kind, super::GroupKind::TmuxSystem);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_4_field_group_line_with_normal_kind() {
+        let dir = std::env::temp_dir().join("ptm_test_load_4field_normal");
+        let path = write_groups_file(&dir, "v1\nGROUP\tWork\t0\tnormal\n");
+        let loaded = super::load_groups_from(&path).expect("loader accepts 4-field normal");
+        assert_eq!(loaded[0].kind, super::GroupKind::Normal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_4_field_with_unknown_kind_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_load_4field_bad");
+        let path = write_groups_file(&dir, "v1\nGROUP\tFoo\t0\tweird\n");
+        let loaded = super::load_groups_from(&path);
+        assert!(loaded.is_none(), "unknown kind must reject the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_5_field_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_load_5field");
+        let path = write_groups_file(&dir, "v1\nGROUP\tFoo\t0\tnormal\textra\n");
+        let loaded = super::load_groups_from(&path);
+        assert!(loaded.is_none(), "5-field GROUP must reject");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

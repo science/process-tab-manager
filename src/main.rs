@@ -25,6 +25,13 @@ const CONFIRM_BUTTON_W: u16 = 64;
 const CONFIRM_PADDING: i16 = 12;
 const TOP_BUTTON_GAP: i16 = 4;
 const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
+/// Width of the right-edge band on session rows that responds to a click as
+/// "close this session". The renderer paints "x" at the start of this band
+/// and the marker dot at its right edge.
+const SESSION_CLOSE_BAND_WIDTH: i16 = 16;
+/// Total horizontal space reserved on session rows for the close glyph and
+/// marker dot together — used by label truncation.
+const SESSION_RIGHT_EDGE_RESERVE: i16 = SESSION_CLOSE_BAND_WIDTH + 8;
 
 // How long a pending attach claim stays live waiting for its new window to
 // appear before giving up. Cheap upper bound — typical gnome-terminal launch
@@ -2210,6 +2217,15 @@ fn ensure_tmux_system_group(app: &mut App) {
     app.build_display_rows();
 }
 
+/// True if `local_x` (relative to the session row's left edge) lands inside
+/// the close-button band on the right edge. Pure — keyed only on geometry
+/// so it can be unit-tested without a renderer.
+#[allow(dead_code)] // wired into the click dispatcher in T4.8
+fn hit_test_session_close_button(local_x: i16, row_w: i16) -> bool {
+    let band_left = row_w - SESSION_CLOSE_BAND_WIDTH;
+    local_x >= band_left && local_x < row_w
+}
+
 /// True if any tracked window is currently attached to `session_name`. Used
 /// at draw time to decide between filled-circle (attached) and hollow-ring
 /// (orphan) markers on session rows. Pure — no X11 or tmux calls.
@@ -3098,8 +3114,10 @@ impl Renderer {
             &[Rectangle { x, y, width: 3, height: h }],
         )?;
 
-        // Label (reserve the right-edge marker area so text doesn't overlap).
-        let marker_reserve: i16 = 14;
+        // Reserve right-edge space for both the marker and the [x] glyph so
+        // long session names truncate cleanly. Layout (right → left):
+        //   [marker dot][gap][x glyph][gap]<text>
+        let marker_reserve: i16 = SESSION_RIGHT_EDGE_RESERVE;
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = x + 8;
         let text_y = y + (h as i16 / 2) + 4;
@@ -3109,10 +3127,17 @@ impl Renderer {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
 
+        // [x] close glyph — sits between the label and the marker. The
+        // hit-test (hit_test_session_close_button) keys on `local_x` only,
+        // so positioning here must agree with that band's right edge.
+        let x_glyph_x = x + w as i16 - SESSION_CLOSE_BAND_WIDTH;
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_dim_pixel))?;
+        conn.image_text8(drawable, self.gc, x_glyph_x, text_y, b"x")?;
+
         // Marker on the right edge: filled circle when an attached terminal
         // exists for this session, hollow ring when it's an orphan.
         let marker_size: u16 = 6;
-        let marker_x = x + w as i16 - marker_size as i16 - 6;
+        let marker_x = x + w as i16 - marker_size as i16 - 4;
         let marker_y = y + (h as i16 - marker_size as i16) / 2;
         conn.change_gc(
             self.gc,
@@ -8615,6 +8640,46 @@ mod tests {
             !entries.iter().any(|e| matches!(e.action, super::MenuAction::DeleteGroup)),
             "Delete Group must be suppressed for the system group"
         );
+    }
+
+    // ── T4.7: [x] glyph hit-test ──
+
+    #[test]
+    fn hit_test_session_close_button_inside_band() {
+        let row_w: i16 = 220;
+        // Just inside the right edge.
+        assert!(super::hit_test_session_close_button(row_w - 1, row_w));
+        // Middle of band.
+        assert!(super::hit_test_session_close_button(
+            row_w - super::SESSION_CLOSE_BAND_WIDTH / 2,
+            row_w,
+        ));
+    }
+
+    #[test]
+    fn hit_test_session_close_button_outside_band() {
+        let row_w: i16 = 220;
+        // Far left.
+        assert!(!super::hit_test_session_close_button(8, row_w));
+        // Just left of the band.
+        assert!(!super::hit_test_session_close_button(
+            row_w - super::SESSION_CLOSE_BAND_WIDTH - 1,
+            row_w,
+        ));
+    }
+
+    #[test]
+    fn hit_test_session_close_button_at_left_edge() {
+        let row_w: i16 = 220;
+        assert!(!super::hit_test_session_close_button(0, row_w));
+    }
+
+    #[test]
+    fn hit_test_session_close_button_past_right_edge() {
+        let row_w: i16 = 220;
+        // Just past the row — out of bounds, not a click.
+        assert!(!super::hit_test_session_close_button(row_w, row_w));
+        assert!(!super::hit_test_session_close_button(row_w + 5, row_w));
     }
 
     #[test]

@@ -1,9 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=Process Tab Manager
+GenericName=Window Tab Bar
 Comment=Vertical sidebar for managing application windows
 Exec=%INSTALL_DIR%/ptm
-Icon=%ICONS_DIR%/ptm.svg
+Icon=ptm
 Terminal=false
-Categories=System;Utility;
-Keywords=window;tab;manager;sidebar;x11;
+Categories=Utility;
+Keywords=window;tab;manager;sidebar;tabs;x11;workspace;windows;ptm;
+StartupWMClass=ptm
+StartupNotify=false

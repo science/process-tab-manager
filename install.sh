@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and install Process Tab Manager into ~/.local/bin via symlinks.
+# Build and install Process Tab Manager into ~/.local/ via symlinks.
 # Idempotent: skips if symlink already correct.
 set -euo pipefail
 
@@ -37,25 +37,74 @@ else
     echo "Linked $dst -> $src"
 fi
 
-# Install icon
-ICONS_DIR="$HOME/.local/share/icons"
-mkdir -p "$ICONS_DIR"
+# Install icon into the freedesktop hicolor theme so Icon=ptm in the
+# .desktop file resolves by name (the standard pattern). We also keep the
+# legacy ~/.local/share/icons/ptm.svg path for any tools that bypass the
+# theme.
+THEME_ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+mkdir -p "$THEME_ICON_DIR"
 src="$SCRIPT_DIR/ptm.svg"
-dst="$ICONS_DIR/ptm.svg"
+dst="$THEME_ICON_DIR/ptm.svg"
 if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
-    echo "Icon symlink already correct"
+    echo "Icon (theme) symlink already correct"
+else
+    ln -sf "$src" "$dst"
+    echo "Linked $dst -> $src"
+fi
+LEGACY_ICONS_DIR="$HOME/.local/share/icons"
+dst="$LEGACY_ICONS_DIR/ptm.svg"
+if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+    echo "Icon (legacy) symlink already correct"
 else
     ln -sf "$src" "$dst"
     echo "Linked $dst -> $src"
 fi
 
-# Generate desktop entry with resolved paths
+# Refresh the icon cache so DEs that consult it (GTK-based menus) pick up
+# the new ptm icon without needing a full re-login.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    # -t = update mtime even if no changes; -f = force; -q = quiet on success.
+    gtk-update-icon-cache -t -f -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+fi
+
+# Generate desktop entry with the bin path resolved. (Icon stays as the
+# bare name "ptm" — themed lookup; INSTALL_DIR is interpolated for Exec.)
 APPS_DIR="$HOME/.local/share/applications"
 mkdir -p "$APPS_DIR"
 dst="$APPS_DIR/ptm.desktop"
 rm -f "$dst"
-sed -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" -e "s|%ICONS_DIR%|$ICONS_DIR|g" \
+sed -e "s|%INSTALL_DIR%|$INSTALL_DIR|g" \
     "$SCRIPT_DIR/ptm.desktop" > "$dst"
+# Some launchers (Nautilus, GNOME Files) require executable bit on
+# .desktop files in user dirs. Cinnamon/MATE generally don't, but it
+# doesn't hurt and aligns with the freedesktop convention.
+chmod +x "$dst"
 echo "Installed $dst"
 
-echo "Done. Launch 'Process Tab Manager' from the app menu."
+# Tell the freedesktop database about the new entry. Without this, some
+# panel launchers' "Add to panel..." dialogs won't list the app even
+# though the menu does.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+fi
+
+# Optional: validate the installed entry. Non-fatal — just warn so the
+# user gets early feedback if something looks off.
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    if ! desktop-file-validate "$dst"; then
+        echo "warning: desktop-file-validate flagged issues with $dst"
+    fi
+fi
+
+echo
+echo "Done."
+echo
+echo "PTM should now appear in your application menu under 'Utility' and"
+echo "be searchable as 'Process Tab Manager' or 'ptm'."
+echo
+echo "If your desktop environment is Cinnamon and PTM doesn't appear yet,"
+echo "the panel menu sometimes caches its app list. Either:"
+echo "  - Right-click the menu icon → 'Reload menu', OR"
+echo "  - Log out and back in."
+echo
+echo "On GNOME the menu picks up new entries automatically."

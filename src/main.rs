@@ -194,17 +194,35 @@ impl Item {
     }
 }
 
+/// Distinguishes user-created groups from the auto-managed "Tmux Sessions"
+/// system group. A `TmuxSystem` group can't be deleted from the UI and its
+/// members are derived from `list_tmux_sessions()` rather than user actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupKind {
+    Normal,
+    #[allow(dead_code)] // wired up in T4.4 / T4.5
+    TmuxSystem,
+}
+
 struct Group {
     id: u32,
     name: String,
     collapsed: bool,
-    /// Members in display order. Each member carries an identity tuple
-    /// (label, wm_class) for cross-restart matching plus an optional
-    /// `live_wid`. A member with `live_wid: None` is a "ghost" — saved on
-    /// disk but not currently mapped to an X11 window. Ghost members are
-    /// preserved across PTM lifecycle events so groups don't get wiped
-    /// when their windows briefly disappear (Phase 2c / Stage F fix for
-    /// FM-2 in MVP_PLAN.md).
+    #[allow(dead_code)] // read in T4.4 (renderer) / T4.6 (drag classifier)
+    kind: GroupKind,
+    /// Members in display order. For `Normal` groups each member carries an
+    /// identity tuple (label, wm_class) for cross-restart matching plus an
+    /// optional `live_wid`. A member with `live_wid: None` is a "ghost" —
+    /// saved on disk but not currently mapped to an X11 window. Ghost
+    /// members are preserved across PTM lifecycle events so groups don't get
+    /// wiped when their windows briefly disappear (Phase 2c / Stage F fix
+    /// for FM-2 in MVP_PLAN.md).
+    ///
+    /// For `TmuxSystem` groups, members reuse the same struct with this
+    /// convention: `label = session_name`, `wm_class = ""`, `live_wid = None`.
+    /// The session-name slot is derived every refresh from
+    /// `list_tmux_sessions()`, so persistence of these members is incidental
+    /// (the next refresh fully reconstructs them).
     members: Vec<GroupMember>,
 }
 
@@ -747,6 +765,7 @@ impl App {
             id: gid,
             name,
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![member],
         });
         for slot in &mut self.display_order {
@@ -4036,6 +4055,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
             id: gid,
             name: sg.name.clone(),
             collapsed: sg.collapsed,
+            kind: GroupKind::Normal,
             members,
         });
     }
@@ -5631,6 +5651,7 @@ mod tests {
             id: 0,
             name: "G".to_string(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![
                 GroupMember {
                     label: "A".into(),
@@ -5839,6 +5860,7 @@ mod tests {
             id: gid,
             name: "Persistent".into(),
             collapsed: false,
+            kind: GroupKind::Normal,
             members: vec![GroupMember {
                 label: "Vim".into(),
                 wm_class: "vim".into(),
@@ -7779,6 +7801,16 @@ mod tests {
         );
         // App state is not yet mutated — popup hasn't materialized.
         assert!(app.confirm.is_none());
+    }
+
+    // ── T4.3: GroupKind ──
+
+    #[test]
+    fn group_default_kind_is_normal() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "A");
+        app.create_group(1);
+        assert_eq!(app.groups[0].kind, super::GroupKind::Normal);
     }
 
     #[test]

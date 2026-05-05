@@ -648,19 +648,20 @@ Five issues, broken into focused tasks. Order matters — investigate G-4 early 
 Three parts per Stage I scope (Parts 1–3). Order: popup helper first (Part 1 needs it, Part 3 might too); system-group second (foundation for Part 3); [x] last.
 
 **Part 1 — One-step kill (~50 LOC):**
-- **T4.1** — confirmation popup helper (override-redirect window with Y/N). Reusable for Part 3 and beyond.
-- **T4.2** — "Kill tmux session" menu entry on attached terminal rows (`Item.session.is_some()`). Reuses existing kill-session command path.
+- [x] **T4.1** — confirmation popup helper (override-redirect window with Y/N). Reusable for Part 3 and beyond.
+- [x] **T4.2** — "Kill tmux session" menu entry on attached terminal rows (`Item.session.is_some()`). Reuses existing kill-session command path.
 
 **Part 2 — Tmux Sessions group (~150 LOC):**
-- **T4.3** — design decision (in code review): `Group::kind` field vs `GroupMember` discriminator. Pick the one with smaller blast radius. Document the decision in the commit.
-- **T4.4** — implement system-group rendering: derive members from `list_tmux_sessions()` on every refresh; merge with attached attribution from `Item.session`. Tests cover the synthesis logic.
-- **T4.5** — auto-create the group on first run if tmux is detected. Persist position + collapse state via Stage F's normal group persistence.
-- **T4.6** — disable drag-into for system groups (drag-out still allowed for the system group itself, like a normal group).
+- [x] **T4.3** — picked `Group::kind` field (smaller blast radius vs `GroupMember` discriminator). `GroupMember` reused for system-group session entries via the documented label-as-session-name convention.
+- [x] **T4.4a** — loader tolerance for 4-field GROUP line (shipped alone for downgrade safety).
+- [x] **T4.4** — implement system-group rendering: derive members from `list_tmux_sessions()` on every refresh; attached/orphan distinction computed at draw time from `Item.session`. `DisplaySlot::Session` deleted; sessions live only inside the system group.
+- [x] **T4.5** — auto-create the group on first run if tmux is detected. Persist position + collapse state. Writer always emits 4-field format.
+- [x] **T4.5b** — "+ New tmux" header button (creation parity with discovery; visible only when tmux is installed).
+- [x] **T4.6** — disable drag-into for system groups; session-row sources also become NoOp (members are derived). Delete Group menu entry suppressed for system group.
 
-**Part 3 — `[x]` close affordance (~80 LOC):**
-- **T4.7** — render `[x]` glyph on session rows in the system group (right edge). Add hit-test for it.
-- **T4.8** — implement double-click-to-arm UX: first click sets `armed_close: Option<(u32 /* row id */, Instant)>` on App; second click within 3 s confirms; any other click or expiry disarms.
-- **T4.9** — confirm action runs `tmux kill-session -t <name>`. For attached sessions, the terminal closes naturally.
+**Part 3 — `[x]` close affordance (~50 LOC after OQ-I3c):**
+- [x] **T4.7** — render `[x]` glyph on session rows (right edge). Add hit-test for it.
+- [x] **T4.8** — single-click `[x]` opens the T4.1 confirm popup (per OQ-I3c). The actual `tmux kill-session` runs inside `execute_confirm_action` — no separate T4.9 commit needed.
 
 **UAT-4 (full cluster gate):**
 - Attach via PTM → right-click terminal row → Kill tmux session → confirm popup → terminal closes and session gone (Part 1).

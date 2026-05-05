@@ -23,6 +23,7 @@ const CONFIRM_MIN_W: u16 = 240;
 const CONFIRM_BUTTON_H: u16 = 26;
 const CONFIRM_BUTTON_W: u16 = 64;
 const CONFIRM_PADDING: i16 = 12;
+const TOP_BUTTON_GAP: i16 = 4;
 const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 
 // How long a pending attach claim stays live waiting for its new window to
@@ -120,6 +121,25 @@ impl Atoms {
 // destroyed outside PTM) get picked up — tmux doesn't fire X11 events of
 // its own, so without this poll the sidebar would only update when some
 // other X activity happens to trigger a refresh.
+/// Send a wake-atom ClientMessage to ourselves so the main loop processes
+/// the wake on its next iteration. Used right after spawning a new tmux
+/// session so the system group picks it up without waiting for the next
+/// 5-second poll. Errors are swallowed — failure here is purely cosmetic
+/// (the next periodic poll catches up).
+fn poke_self(conn: &impl Connection, window: Window, wake_atom: Atom) {
+    let data = ClientMessageData::from([0u32; 5]);
+    let ev = ClientMessageEvent {
+        response_type: 33,
+        format: 32,
+        sequence: 0,
+        window,
+        type_: wake_atom,
+        data,
+    };
+    let _ = conn.send_event(false, window, EventMask::NO_EVENT, ev);
+    let _ = conn.flush();
+}
+
 fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::Duration) {
     std::thread::spawn(move || {
         // Give the main loop a moment to reach wait_for_event before we start
@@ -321,6 +341,16 @@ struct ConfirmPopup {
     yes_rect: Rectangle,
     no_rect: Rectangle,
     hover_button: Option<ConfirmButton>,
+}
+
+/// Identity for the buttons in the header row above the item list. When tmux
+/// isn't installed the top row holds a single full-width "+ New terminal";
+/// when tmux is available it splits into left "+ New terminal" and right
+/// "+ New tmux".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopButton {
+    NewTerminal,
+    NewTmux,
 }
 
 struct DragState {
@@ -585,7 +615,11 @@ struct App {
     rename: Option<RenameState>,
     active_wid: Option<u32>,
     hover_row: Option<usize>,
-    header_hovered: bool,
+    top_button_hover: Option<TopButton>,
+    /// Whether `tmux -V` succeeds. Probed once at startup; cached here so
+    /// the renderer / hit-test path doesn't fork tmux on every paint. Drives
+    /// visibility of the "+ New tmux" button.
+    tmux_available: bool,
     drag: Option<DragState>,
     x: i16,
     y: i16,
@@ -632,7 +666,8 @@ impl App {
             rename: None,
             active_wid: None,
             hover_row: None,
-            header_hovered: false,
+            top_button_hover: None,
+            tmux_available: false,
             drag: None,
             x: 0,
             y: 0,
@@ -660,6 +695,25 @@ impl App {
 
     fn hit_test_header_button(&self, y: i16) -> bool {
         y >= 0 && y < HEADER_H as i16
+    }
+
+    /// Returns which top button (if any) is at point (x, y) in window coords.
+    /// `None` means outside the header row, or in the gap between the two
+    /// buttons. Resolves the layout from the cached `tmux_available` flag.
+    fn hit_test_top_buttons(&self, x: i16, y: i16) -> Option<TopButton> {
+        if !self.hit_test_header_button(y) {
+            return None;
+        }
+        let (left, right_opt) = top_buttons_layout(self.tmux_available, self.width);
+        if point_in_rect(x, y, &left) {
+            return Some(TopButton::NewTerminal);
+        }
+        if let Some(right) = right_opt {
+            if point_in_rect(x, y, &right) {
+                return Some(TopButton::NewTmux);
+            }
+        }
+        None
     }
 
     /// Mark persistence-relevant state as dirty. Idempotent within a single
@@ -2054,6 +2108,42 @@ fn refresh_items(
     Ok(())
 }
 
+/// Layout for the top-row buttons. Returns the left button's rect and the
+/// right button's rect (None when tmux isn't installed — left button takes
+/// the full width). Pure: width comes in as a parameter so tests can pin
+/// behavior without constructing an App.
+fn top_buttons_layout(tmux_available: bool, width: u16) -> (Rectangle, Option<Rectangle>) {
+    let y: i16 = 4;
+    let total_w = (width as i16 - ITEM_MARGIN * 2).max(20);
+    let h = HEADER_H;
+    if !tmux_available {
+        let left = Rectangle {
+            x: ITEM_MARGIN,
+            y,
+            width: total_w as u16,
+            height: h,
+        };
+        return (left, None);
+    }
+    let half = (total_w - TOP_BUTTON_GAP) / 2;
+    let left = Rectangle {
+        x: ITEM_MARGIN,
+        y,
+        width: half as u16,
+        height: h,
+    };
+    // Right button absorbs the remainder so the rounding error from `/2` lands
+    // in the right rect rather than leaving a 1px sliver.
+    let right_w = total_w - half - TOP_BUTTON_GAP;
+    let right = Rectangle {
+        x: ITEM_MARGIN + half + TOP_BUTTON_GAP,
+        y,
+        width: right_w as u16,
+        height: h,
+    };
+    (left, Some(right))
+}
+
 /// True if `tmux -V` runs and exits 0 — i.e., the binary is on PATH. We don't
 /// probe whether the server is running because we want the "+ New tmux" button
 /// (T4.5b) to keep showing even after the user kills their last session — that
@@ -2403,6 +2493,25 @@ fn spawn_attach_terminal(session_name: &str) {
         .spawn();
 }
 
+/// Create a fresh tmux session with an auto-generated name and open a
+/// terminal attached to it. `tmux new-session -d -P -F '#{session_name}'`
+/// prints the assigned name on stdout — we capture it and pass it to the
+/// existing attach path.
+fn spawn_new_tmux_session() {
+    let out = match std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-P", "-F", "#{session_name}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    spawn_attach_terminal(&name);
+}
+
 // ── Property-change classification (pure, testable) ──
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2595,7 +2704,7 @@ impl Renderer {
         )?;
 
         // Draw the "+ New terminal" header button above the item list.
-        self.draw_new_terminal_button(conn, pix, app)?;
+        self.draw_top_buttons(conn, pix, app)?;
 
         let dragged_row = app
             .drag
@@ -2770,37 +2879,53 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_new_terminal_button(
+    fn draw_top_buttons(
         &self,
         conn: &impl Connection,
         drawable: Drawable,
         app: &App,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let x = ITEM_MARGIN;
-        let y: i16 = 4;
-        let w = (app.width as i16 - ITEM_MARGIN * 2).max(20) as u16;
-        let h = HEADER_H;
+        let (left, right_opt) = top_buttons_layout(app.tmux_available, app.width);
+        self.draw_top_button(
+            conn,
+            drawable,
+            &left,
+            "+ New terminal",
+            app.top_button_hover == Some(TopButton::NewTerminal),
+        )?;
+        if let Some(right) = right_opt {
+            self.draw_top_button(
+                conn,
+                drawable,
+                &right,
+                "+ New tmux",
+                app.top_button_hover == Some(TopButton::NewTmux),
+            )?;
+        }
+        Ok(())
+    }
 
-        let bg = if app.header_hovered {
+    fn draw_top_button(
+        &self,
+        conn: &impl Connection,
+        drawable: Drawable,
+        rect: &Rectangle,
+        label: &str,
+        hovered: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bg = if hovered {
             self.item_hover_pixel
         } else {
             self.item_pixel
         };
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(bg))?;
-        conn.poly_fill_rectangle(
-            drawable,
-            self.gc,
-            &[Rectangle { x, y, width: w, height: h }],
-        )?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[*rect])?;
 
-        // Label centred horizontally.
-        let label = "+ New terminal";
         let label_width = label.len() as i16 * CHAR_WIDTH;
-        let text_x = x + (w as i16 - label_width) / 2;
-        let text_y = y + (h as i16 / 2) + 4;
+        let text_x = rect.x + (rect.width as i16 - label_width) / 2;
+        let text_y = rect.y + (rect.height as i16 / 2) + 4;
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         conn.image_text8(drawable, self.gc, text_x, text_y, label.as_bytes())?;
-
         Ok(())
     }
 
@@ -4304,10 +4429,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         restore_groups(&mut app, &saved);
     }
 
+    // Probe tmux once at startup; cache for the renderer / hit-test path.
+    app.tmux_available = is_tmux_available();
+
     // Auto-create the TmuxSystem group on first run when tmux is installed.
     // Idempotent — subsequent runs find the restored group and short-circuit.
     // Re-run refresh so derived members populate before the first paint.
-    if is_tmux_available() {
+    if app.tmux_available {
         ensure_tmux_system_group(&mut app);
         refresh_items(&conn, root, &atoms, &mut app, colormap)?;
     }
@@ -4693,8 +4821,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::ButtonPress(ev) if ev.event == window => {
                 match ev.detail {
                     1 => {
-                        if app.hit_test_header_button(ev.event_y) {
-                            spawn_default_terminal();
+                        if let Some(button) = app.hit_test_top_buttons(ev.event_x, ev.event_y) {
+                            match button {
+                                TopButton::NewTerminal => spawn_default_terminal(),
+                                TopButton::NewTmux => {
+                                    spawn_new_tmux_session();
+                                    // Wake the main loop so the new session
+                                    // shows up immediately rather than waiting
+                                    // for the next 5s tmux poll.
+                                    poke_self(&conn, window, atoms.ptm_wake);
+                                }
+                            }
                         } else if let Some(row) = app.hit_test_row(ev.event_y) {
                             app.drag = Some(DragState {
                                 source_row: row,
@@ -4759,26 +4896,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     // Hover tracking (no drag active)
                     let new_hover = app.hit_test_row(ev.event_y);
-                    let new_header = app.hit_test_header_button(ev.event_y);
+                    let new_button = app.hit_test_top_buttons(ev.event_x, ev.event_y);
                     if new_hover != app.hover_row {
                         app.hover_row = new_hover;
                         needs_redraw = true;
                     }
-                    if new_header != app.header_hovered {
-                        app.header_hovered = new_header;
+                    if new_button != app.top_button_hover {
+                        app.top_button_hover = new_button;
                         needs_redraw = true;
                     }
                     // Drain queued motion for hover too
                     while let Some(queued) = conn.poll_for_event()? {
                         if let Event::MotionNotify(mn) = queued {
                             let h = app.hit_test_row(mn.event_y);
-                            let hb = app.hit_test_header_button(mn.event_y);
+                            let hb = app.hit_test_top_buttons(mn.event_x, mn.event_y);
                             if h != app.hover_row {
                                 app.hover_row = h;
                                 needs_redraw = true;
                             }
-                            if hb != app.header_hovered {
-                                app.header_hovered = hb;
+                            if hb != app.top_button_hover {
+                                app.top_button_hover = hb;
                                 needs_redraw = true;
                             }
                         } else {
@@ -4799,9 +4936,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::LeaveNotify(_) => {
-                let was_hovering = app.hover_row.is_some() || app.header_hovered;
+                let was_hovering = app.hover_row.is_some() || app.top_button_hover.is_some();
                 app.hover_row = None;
-                app.header_hovered = false;
+                app.top_button_hover = None;
                 if was_hovering {
                     renderer.redraw(&conn, &app)?;
                 }
@@ -8255,6 +8392,103 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(!loaded[0].collapsed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── T4.5b: + New tmux header button ──
+
+    #[test]
+    fn top_buttons_layout_one_button_when_tmux_unavailable() {
+        let (left, right_opt) = super::top_buttons_layout(false, 250);
+        assert!(right_opt.is_none(), "no right button when tmux unavailable");
+        assert_eq!(left.x, ITEM_MARGIN);
+        // Full width minus margins.
+        assert_eq!(left.width as i16, 250 - ITEM_MARGIN * 2);
+    }
+
+    #[test]
+    fn top_buttons_layout_two_buttons_when_tmux_available() {
+        let (left, right_opt) = super::top_buttons_layout(true, 250);
+        let right = right_opt.expect("expected right button when tmux available");
+        // Side-by-side, separated by TOP_BUTTON_GAP.
+        assert_eq!(right.x, left.x + left.width as i16 + super::TOP_BUTTON_GAP);
+        // Widths within 1px (rounding lands in right rect).
+        let diff = (left.width as i32 - right.width as i32).abs();
+        assert!(diff <= 1, "widths must differ by at most 1px (got {} vs {})", left.width, right.width);
+        // Both inside the available area.
+        assert!(
+            left.x + left.width as i16 + super::TOP_BUTTON_GAP + right.width as i16
+                <= 250 - ITEM_MARGIN
+        );
+    }
+
+    #[test]
+    fn hit_test_top_buttons_routes_left_to_new_terminal() {
+        let mut app = make_app();
+        app.tmux_available = true;
+        app.width = 250;
+        let (left, _) = super::top_buttons_layout(true, 250);
+        let center_x = left.x + (left.width as i16 / 2);
+        let center_y = left.y + (left.height as i16 / 2);
+        assert_eq!(
+            app.hit_test_top_buttons(center_x, center_y),
+            Some(super::TopButton::NewTerminal)
+        );
+    }
+
+    #[test]
+    fn hit_test_top_buttons_routes_right_to_new_tmux() {
+        let mut app = make_app();
+        app.tmux_available = true;
+        app.width = 250;
+        let (_, right_opt) = super::top_buttons_layout(true, 250);
+        let right = right_opt.unwrap();
+        let center_x = right.x + (right.width as i16 / 2);
+        let center_y = right.y + (right.height as i16 / 2);
+        assert_eq!(
+            app.hit_test_top_buttons(center_x, center_y),
+            Some(super::TopButton::NewTmux)
+        );
+    }
+
+    #[test]
+    fn hit_test_top_buttons_unavailable_falls_back_to_full_width() {
+        let mut app = make_app();
+        app.tmux_available = false;
+        app.width = 250;
+        // Click anywhere in the header band — should always be NewTerminal,
+        // never NewTmux.
+        for x in [ITEM_MARGIN + 5, 100, 200, 250 - ITEM_MARGIN - 1] {
+            let result = app.hit_test_top_buttons(x, 5);
+            assert_eq!(
+                result,
+                Some(super::TopButton::NewTerminal),
+                "x={} should hit NewTerminal",
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn hit_test_top_buttons_outside_row_returns_none() {
+        let mut app = make_app();
+        app.tmux_available = true;
+        app.width = 250;
+        // Below the header row.
+        assert!(app.hit_test_top_buttons(100, HEADER_H as i16 + 5).is_none());
+        // Above the row.
+        assert!(app.hit_test_top_buttons(100, -1).is_none());
+    }
+
+    #[test]
+    fn hit_test_top_buttons_in_gap_returns_none() {
+        let mut app = make_app();
+        app.tmux_available = true;
+        app.width = 250;
+        let (left, _) = super::top_buttons_layout(true, 250);
+        // The gap is between the two buttons.
+        let gap_x = left.x + left.width as i16 + 1;
+        let gap_y = left.y + (left.height as i16 / 2);
+        assert!(app.hit_test_top_buttons(gap_x, gap_y).is_none());
     }
 
     #[test]

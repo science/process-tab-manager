@@ -2035,6 +2035,17 @@ fn refresh_items(
         });
     }
 
+    // Polled once per refresh and used by three downstream paths:
+    //   1. carry_over_session_bindings — drop bindings whose session died
+    //   2. walk_to_window_owner block — (no direct use; see #1)
+    //   3. sync_system_group_members — populate the Tmux Sessions group rows
+    let live_session_names: Vec<String> = list_tmux_sessions()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let live_session_set: HashSet<String> =
+        live_session_names.iter().cloned().collect();
+
     // Pending-spawn takes priority over the ancestor walk. If the user
     // just clicked an orphan row or hit a `+ New *` button, we know the
     // next new window is ours — much more reliable than walking through
@@ -2052,6 +2063,14 @@ fn refresh_items(
             pre_assigned.insert(name.clone());
         }
     }
+
+    // Carry forward any session bindings from the prior refresh's items.
+    // Necessary because walk_to_window_owner returns None for users on
+    // gnome-terminal (every window shares gnome-terminal-server's PID),
+    // so the only path that ever sets item.session for them is the
+    // one-shot claim_pending_spawn — and without carry-over, the marker
+    // disappeared on the very next refresh.
+    carry_over_session_bindings(&app.items, &mut new_items, &live_session_set);
 
     // Assign tmux sessions by walking UP from each tmux client's PID until
     // we hit a pid that's a tracked window's _NET_WM_PID. This is the
@@ -2148,10 +2167,6 @@ fn refresh_items(
     // at startup (T4.5); refresh_items only syncs membership against the
     // current `tmux list-sessions` output. The visual attached-vs-orphan
     // distinction is computed at draw time from app.items.
-    let live_session_names: Vec<String> = list_tmux_sessions()
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
     if let Some(group) = app
         .groups
         .iter_mut()
@@ -2535,11 +2550,20 @@ fn carry_over_session_bindings(
     new_items: &mut [Item],
     live_sessions: &HashSet<String>,
 ) {
-    // Stub: real implementation lands in the next commit. Tests added in
-    // this commit assert against the no-op behavior to mark the bug RED.
-    let _ = prior_items;
-    let _ = new_items;
-    let _ = live_sessions;
+    let prior: HashMap<u32, &str> = prior_items
+        .iter()
+        .filter_map(|i| i.session.as_deref().map(|s| (i.wid, s)))
+        .collect();
+    for item in new_items.iter_mut() {
+        if item.session.is_some() {
+            continue;
+        }
+        if let Some(name) = prior.get(&item.wid) {
+            if live_sessions.contains(*name) {
+                item.session = Some((*name).to_string());
+            }
+        }
+    }
 }
 
 // ── Terminal launch ──

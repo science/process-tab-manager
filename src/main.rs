@@ -3744,19 +3744,8 @@ fn execute_menu_action(
             // session also kills the terminal so confirmation is warranted).
             match &app.display_rows[target_row] {
                 DisplayRow::Session { name, .. } => {
-                    let _ = std::process::Command::new("tmux")
-                        .args(["kill-session", "-t", name])
-                        .status();
-                    // Sessions live as members of the TmuxSystem group;
-                    // optimistically drop the matching member so the row
-                    // disappears before the next 5s tmux poll catches up.
                     let target = name.clone();
-                    for group in &mut app.groups {
-                        if group.kind == GroupKind::TmuxSystem {
-                            group.members.retain(|m| m.label != target);
-                        }
-                    }
-                    app.build_display_rows();
+                    kill_tmux_session(app, &target);
                 }
                 DisplayRow::Window { .. } => {
                     if let Some(session) = window_session_for_row(app, target_row) {
@@ -3786,17 +3775,34 @@ fn dispatch_confirm(app: &mut App, accepted: bool) -> Option<ConfirmAction> {
     if accepted { Some(popup.action) } else { None }
 }
 
-/// Side-effecting runner. Today the only action is `KillSession`, which
-/// invokes `tmux kill-session -t <name>`. The terminal hosting that session
-/// follows tmux's last-client-exits semantics and closes on its own; the next
-/// refresh cleans up the row.
-fn execute_confirm_action(action: ConfirmAction) {
-    match action {
-        ConfirmAction::KillSession(name) => {
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &name])
-                .status();
+/// Kill a tmux session by name and optimistically prune the matching
+/// member from any TmuxSystem group, rebuilding `display_rows` so the UI
+/// reflects the kill before the next ~5s tmux poll. The kill command's
+/// status is ignored — if it failed (e.g. session already gone), the
+/// next refresh will re-add the member from `tmux list-sessions`, so the
+/// optimistic prune is self-healing. Used by both the right-click →
+/// Kill Session orphan path and the `[x]` popup-accept path; without
+/// the latter, orphan rows linger because killing a detached session
+/// produces no `_NET_CLIENT_LIST` event to drive a refresh.
+fn kill_tmux_session(app: &mut App, name: &str) {
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", name])
+        .status();
+    for group in &mut app.groups {
+        if group.kind == GroupKind::TmuxSystem {
+            group.members.retain(|m| m.label != name);
         }
+    }
+    app.build_display_rows();
+}
+
+/// Side-effecting runner for confirmation popup actions. Today the only
+/// action is `KillSession`, which routes through `kill_tmux_session` so
+/// the row disappears immediately on accept (whether the session was
+/// orphan or attached).
+fn execute_confirm_action(app: &mut App, action: ConfirmAction) {
+    match action {
+        ConfirmAction::KillSession(name) => kill_tmux_session(app, &name),
     }
 }
 
@@ -4723,7 +4729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if ev.detail == 1 && in_yes {
                         close_confirm_popup(&conn, &mut app)?;
                         if let Some(action) = dispatch_confirm(&mut app, true) {
-                            execute_confirm_action(action);
+                            execute_confirm_action(&mut app, action);
                         }
                     } else if ev.detail == 1 && in_no {
                         close_confirm_popup(&conn, &mut app)?;
@@ -4758,7 +4764,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if accept {
                         close_confirm_popup(&conn, &mut app)?;
                         if let Some(action) = dispatch_confirm(&mut app, true) {
-                            execute_confirm_action(action);
+                            execute_confirm_action(&mut app, action);
                         }
                         renderer.redraw(&conn, &app)?;
                     } else if cancel {
@@ -8847,6 +8853,36 @@ mod tests {
         assert!(
             !group.members.iter().any(|m| m.label == "ghost"),
             "expected member 'ghost' to be optimistically removed"
+        );
+    }
+
+    #[test]
+    fn execute_confirm_kill_optimistically_removes_session_member() {
+        let mut app = make_app();
+        push_session(&mut app, "ghost");
+        assert!(
+            app.display_rows.iter().any(|r| matches!(
+                r,
+                super::DisplayRow::Session { name, .. } if name == "ghost"
+            )),
+            "pre-condition: 'ghost' row should exist before kill"
+        );
+        super::execute_confirm_action(&mut app, super::ConfirmAction::KillSession("ghost".to_string()));
+        let group = app
+            .groups
+            .iter()
+            .find(|g| g.kind == super::GroupKind::TmuxSystem)
+            .expect("system group present");
+        assert!(
+            !group.members.iter().any(|m| m.label == "ghost"),
+            "expected member 'ghost' to be optimistically removed after popup-accept kill"
+        );
+        assert!(
+            !app.display_rows.iter().any(|r| matches!(
+                r,
+                super::DisplayRow::Session { name, .. } if name == "ghost"
+            )),
+            "expected display row for 'ghost' to be gone after popup-accept kill"
         );
     }
 }

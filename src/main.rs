@@ -2516,6 +2516,32 @@ fn claim_pending_spawn(
     Some(PendingClaim { wid: claimed_wid, attach_session })
 }
 
+/// Copy `item.session` forward from the prior refresh's items into the
+/// freshly-built `new_items`. Caller passes the live tmux session-name set
+/// so a binding pointing at a session that died (or was renamed) gets
+/// dropped rather than ghosting forward.
+///
+/// This closes the gnome-terminal gap: `walk_to_window_owner` returns None
+/// when the tmux client's owning ancestor PID has multiple X windows
+/// attached (every gnome-terminal window shares `gnome-terminal-server`'s
+/// PID), so once `claim_pending_spawn`'s one-shot binding is consumed,
+/// subsequent refreshes had no way to keep the attribution. Carry-over is
+/// the missing path.
+///
+/// Skips items whose `session` is already `Some(_)` so a fresh
+/// `claim_pending_spawn` win takes precedence over carrying.
+fn carry_over_session_bindings(
+    prior_items: &[Item],
+    new_items: &mut [Item],
+    live_sessions: &HashSet<String>,
+) {
+    // Stub: real implementation lands in the next commit. Tests added in
+    // this commit assert against the no-op behavior to mark the bug RED.
+    let _ = prior_items;
+    let _ = new_items;
+    let _ = live_sessions;
+}
+
 // ── Terminal launch ──
 //
 // PTM delegates terminal configuration to the system: whatever the user has
@@ -6846,6 +6872,76 @@ mod tests {
         assert!(claim.is_none());
         assert!(items[0].session.is_none());
         assert!(pending.is_none());
+    }
+
+    // ── Session-binding carry-over ──
+    //
+    // Under gnome-terminal the steady-state attribution path
+    // (walk_to_window_owner) returns None because every terminal window
+    // shares gnome-terminal-server's PID. claim_pending_spawn binds the
+    // session once on the spawn refresh, then clears. Without carry-over,
+    // the next refresh strands the marker. carry_over_session_bindings is
+    // the path that preserves the binding while still pruning stale ones.
+
+    fn mk_item_with_session(wid: u32, session: Option<&str>) -> Item {
+        Item {
+            wid,
+            label: format!("w{}", wid),
+            wm_class: String::new(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: session.map(String::from),
+        }
+    }
+
+    fn live_session_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn carry_over_preserves_live_session_binding() {
+        let prior = vec![mk_item_with_session(100, Some("0"))];
+        let mut new_items = vec![mk_item_with_session(100, None)];
+        let live = live_session_set(&["0"]);
+        super::carry_over_session_bindings(&prior, &mut new_items, &live);
+        assert_eq!(new_items[0].session.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn carry_over_drops_session_no_longer_in_tmux() {
+        let prior = vec![mk_item_with_session(100, Some("0"))];
+        let mut new_items = vec![mk_item_with_session(100, None)];
+        let live = live_session_set(&[]);
+        super::carry_over_session_bindings(&prior, &mut new_items, &live);
+        assert!(
+            new_items[0].session.is_none(),
+            "killed session should not ghost forward"
+        );
+    }
+
+    #[test]
+    fn carry_over_does_not_overwrite_claim_pending_spawn() {
+        let prior = vec![mk_item_with_session(100, Some("0"))];
+        let mut new_items = vec![mk_item_with_session(100, Some("X"))];
+        let live = live_session_set(&["0", "X"]);
+        super::carry_over_session_bindings(&prior, &mut new_items, &live);
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("X"),
+            "claim_pending_spawn's authoritative binding must win"
+        );
+    }
+
+    #[test]
+    fn carry_over_skips_unmatched_wid() {
+        let prior = vec![mk_item_with_session(100, Some("0"))];
+        let mut new_items = vec![mk_item_with_session(200, None)];
+        let live = live_session_set(&["0"]);
+        super::carry_over_session_bindings(&prior, &mut new_items, &live);
+        assert!(
+            new_items[0].session.is_none(),
+            "different wid must not inherit prior wid's session"
+        );
     }
 
     // ── Terminal detection ──

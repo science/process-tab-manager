@@ -2486,26 +2486,29 @@ fn session_origin_for_name<'a>(
     sessions: &[(String, String, bool)],
     origins: &'a HashMap<String, String>,
 ) -> &'a str {
-    // STUB: passthrough. Implemented in a later commit.
-    let _ = sessions;
-    let _ = origins;
+    if let Some((id, _, _)) = sessions.iter().find(|(_, n, _)| n == name) {
+        if let Some(orig) = origins.get(id) {
+            return orig.as_str();
+        }
+    }
     name
 }
 
 /// Format a session row's display label given its current name and origin.
 /// Origin == current → just the name. Renamed → "name (origin)".
 fn format_session_row_label(name: &str, origin: &str) -> String {
-    // STUB: returns name only. Implemented in a later commit.
-    let _ = origin;
-    name.to_string()
+    if origin == name {
+        name.to_string()
+    } else {
+        format!("{} ({})", name, origin)
+    }
 }
 
 /// Render text for the green marker on attached-terminal window rows.
 /// Origin truncated to 2 chars; ASCII-only since the renderer uses
 /// `image_text8` (Latin-1).
 fn marker_glyph_for_origin(origin: &str) -> String {
-    // STUB: returns origin verbatim. Implemented in a later commit.
-    origin.to_string()
+    origin.chars().take(2).collect()
 }
 
 fn parse_proc_status_ppid(s: &str) -> Option<u32> {

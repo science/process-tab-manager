@@ -276,6 +276,18 @@ impl Group {
         self.members.iter().filter(|m| m.live_wid.is_some()).count()
     }
 
+    /// Count rendered next to the group name in headers. Normal groups
+    /// surface their live (non-ghost) member count; TmuxSystem session
+    /// members carry their session name in `label` and have `live_wid:
+    /// None` by design (sessions aren't X11 windows), so we fall back to
+    /// the raw member count there.
+    fn display_count(&self) -> usize {
+        match self.kind {
+            GroupKind::Normal => self.live_count(),
+            GroupKind::TmuxSystem => self.members.len(),
+        }
+    }
+
     /// Index in `members` of the member currently bound to `wid`, if any.
     fn position_of_live_wid(&self, wid: u32) -> Option<usize> {
         self.members.iter().position(|m| m.live_wid == Some(wid))
@@ -3259,7 +3271,7 @@ impl Renderer {
 
         // Member count (dimmed) when collapsed
         if group.collapsed {
-            let count_text = format!("({})", group.live_count());
+            let count_text = format!("({})", group.display_count());
             let name_width = (display.len() as i16 + 1) * CHAR_WIDTH;
             conn.change_gc(
                 self.gc,
@@ -3299,7 +3311,7 @@ impl Renderer {
             }],
         )?;
         if let Some(group) = app.groups.iter().find(|g| g.id == group_id) {
-            let text = format!("{} (+{})", group.name, group.live_count());
+            let text = format!("{} (+{})", group.name, group.display_count());
             conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
             conn.image_text8(
                 drawable,
@@ -8446,11 +8458,10 @@ mod tests {
         assert!(matches!(&app.display_rows[0], DisplayRow::GroupHeader { .. }));
     }
 
-    /// User-visible bug: collapsed Tmux Sessions group label always reads
-    /// "(0)" no matter how many sessions are present. The header label is
-    /// rendered as `format!("({})", group.live_count())` (see the group
-    /// header draw call); this test pins what `live_count()` is expected
-    /// to return for a TmuxSystem group with N session members.
+    /// Collapsed group header label is rendered as
+    /// `format!("({})", group.display_count())`. For TmuxSystem groups the
+    /// count must reflect the number of session members (sessions aren't
+    /// windows, so `live_count()` would always be 0 here).
     #[test]
     fn collapsed_tmux_system_group_count_equals_session_count() {
         let mut app = make_app();
@@ -8461,11 +8472,28 @@ mod tests {
             .find(|g| g.kind == super::GroupKind::TmuxSystem)
             .expect("system group present");
         assert_eq!(
-            group.live_count(),
+            group.display_count(),
             3,
             "collapsed Tmux Sessions header should report 3 sessions, got {}",
-            group.live_count()
+            group.display_count()
         );
+    }
+
+    /// Sanity: Normal groups still report the live (non-ghost) count, so
+    /// the existing `live_count()` semantics for windows-in-group is
+    /// preserved through the helper.
+    #[test]
+    fn display_count_for_normal_group_equals_live_count() {
+        let mut app = make_app();
+        add_item(&mut app, 1, "win-a");
+        add_item(&mut app, 2, "win-b");
+        // create_group seeds the group with one wid; add_to_group adds the
+        // second so we end up with a Normal group of two live members.
+        let gid = app.create_group(1);
+        app.add_to_group(gid, 2);
+        let group = app.groups.iter().find(|g| g.id == gid).expect("group");
+        assert_eq!(group.live_count(), 2);
+        assert_eq!(group.display_count(), 2);
     }
 
     #[test]

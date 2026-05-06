@@ -680,6 +680,12 @@ struct App {
     // detection can't reliably do this — terminals that fork through a
     // shared server pid (gnome-terminal, konsole) hide their parent.
     pending_spawn: Option<PendingSpawn>,
+    /// Maps each tmux `#{session_id}` (e.g. "$0") to the session's ORIGINAL
+    /// name as observed at first sighting. Survives user-initiated renames
+    /// so the UI can keep showing the origin (typically a small integer)
+    /// alongside the new label. Pruned when sessions disappear; rebuilt
+    /// from scratch every PTM start (not persisted).
+    session_origins: HashMap<String, String>,
     /// Set on the FIRST mutation in a dirty epoch; preserved across
     /// subsequent mutations. Used by the 30-second backstop to bound the
     /// worst-case data loss when a long burst of edits would otherwise
@@ -723,6 +729,7 @@ impl App {
             our_wid,
             subscribed_wids: HashSet::new(),
             pending_spawn: None,
+            session_origins: HashMap::new(),
             first_dirty_at: None,
             last_dirty_at: None,
             last_drop_highlight: None,
@@ -2036,10 +2043,12 @@ fn refresh_items(
     //   1. carry_over_session_bindings — drop bindings whose session died
     //   2. walk_to_window_owner block — (no direct use; see #1)
     //   3. sync_system_group_members — populate the Tmux Sessions group rows
-    let live_session_names: Vec<String> = list_tmux_sessions()
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    //   4. session-origin tracking — preserves the name a session was first
+    //      seen with so the UI can keep showing it after a rename
+    let live_sessions = list_tmux_sessions();
+    update_session_origins(&mut app.session_origins, &live_sessions);
+    let live_session_names: Vec<String> =
+        live_sessions.iter().map(|(_, n, _)| n.clone()).collect();
     let live_session_set: HashSet<String> =
         live_session_names.iter().cloned().collect();
 
@@ -2388,37 +2397,51 @@ fn list_tmux_clients() -> HashMap<u32, String> {
     }
 }
 
-// Parse `tmux list-sessions -F '#{session_name} #{session_attached}'` output
-// into (name, attached_count>0) pairs. Sessions whose first token after the
-// name isn't a number are silently dropped.
-fn parse_tmux_list_sessions(stdout: &str) -> Vec<(String, bool)> {
+// Parse `tmux list-sessions -F '#{session_id} #{session_name} #{session_attached}'`
+// output into (id, name, attached_count>0) tuples. The id always starts with
+// `$` and is whitespace-free; the attached count is the trailing token; the
+// name is whatever sits between, even when it contains spaces. Lines whose
+// first token is not a `$`-prefixed id, or whose final token is not numeric,
+// are silently dropped.
+fn parse_tmux_list_sessions(stdout: &str) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        // Split on the LAST whitespace so session names with spaces survive.
-        if let Some(idx) = line.rfind(char::is_whitespace) {
-            let name = line[..idx].trim();
-            let attached_str = line[idx + 1..].trim();
-            if name.is_empty() {
-                continue;
-            }
-            if let Ok(n) = attached_str.parse::<u32>() {
-                out.push((name.to_string(), n > 0));
-            }
+        // Split off the id at the first whitespace.
+        let Some(id_end) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let id = &line[..id_end];
+        if !id.starts_with('$') {
+            continue;
+        }
+        let rest = line[id_end + 1..].trim_start();
+        // Split off the attached count at the last whitespace; the middle
+        // is the name (preserving any internal spaces).
+        let Some(name_end) = rest.rfind(char::is_whitespace) else {
+            continue;
+        };
+        let name = rest[..name_end].trim();
+        let attached_str = rest[name_end + 1..].trim();
+        if name.is_empty() {
+            continue;
+        }
+        if let Ok(n) = attached_str.parse::<u32>() {
+            out.push((id.to_string(), name.to_string(), n > 0));
         }
     }
     out
 }
 
-fn list_tmux_sessions() -> Vec<(String, bool)> {
+fn list_tmux_sessions() -> Vec<(String, String, bool)> {
     match std::process::Command::new("tmux")
         .args([
             "list-sessions",
             "-F",
-            "#{session_name} #{session_attached}",
+            "#{session_id} #{session_name} #{session_attached}",
         ])
         .output()
     {
@@ -2447,9 +2470,11 @@ fn update_session_origins(
     origins: &mut HashMap<String, String>,
     sessions: &[(String, String, bool)],
 ) {
-    // STUB: implemented in a later commit.
-    let _ = origins;
-    let _ = sessions;
+    let live_ids: HashSet<&str> = sessions.iter().map(|s| s.0.as_str()).collect();
+    origins.retain(|id, _| live_ids.contains(id.as_str()));
+    for (id, name, _) in sessions {
+        origins.entry(id.clone()).or_insert_with(|| name.clone());
+    }
 }
 
 /// Resolve the origin name for a session given its CURRENT name. Returns
@@ -6589,57 +6614,88 @@ mod tests {
 
     #[test]
     fn parse_tmux_list_sessions_single_attached() {
-        let input = "demo 1\n";
+        let input = "$0 demo 1\n";
         let v = parse_tmux_list_sessions(input);
-        assert_eq!(v, vec![("demo".to_string(), true)]);
+        assert_eq!(v, vec![("$0".to_string(), "demo".to_string(), true)]);
     }
 
     #[test]
     fn parse_tmux_list_sessions_single_orphan() {
-        let input = "demo 0\n";
+        let input = "$0 demo 0\n";
         let v = parse_tmux_list_sessions(input);
-        assert_eq!(v, vec![("demo".to_string(), false)]);
+        assert_eq!(v, vec![("$0".to_string(), "demo".to_string(), false)]);
     }
 
     #[test]
     fn parse_tmux_list_sessions_mixed() {
-        let input = "work 2\norphan 0\ndev 1\n";
+        let input = "$0 work 2\n$1 orphan 0\n$2 dev 1\n";
         let v = parse_tmux_list_sessions(input);
         assert_eq!(
             v,
             vec![
-                ("work".to_string(), true),
-                ("orphan".to_string(), false),
-                ("dev".to_string(), true),
+                ("$0".to_string(), "work".to_string(), true),
+                ("$1".to_string(), "orphan".to_string(), false),
+                ("$2".to_string(), "dev".to_string(), true),
             ]
         );
     }
 
     #[test]
     fn parse_tmux_list_sessions_preserves_spaces_in_name() {
-        // Session names with spaces — split on the LAST whitespace so the
-        // trailing attached-count stays separable.
-        let input = "my cool session 0\n";
+        // Session names with spaces — id is the first whitespace-bounded
+        // token, attached count is the trailing token, name is everything
+        // in between.
+        let input = "$3 my cool session 0\n";
         let v = parse_tmux_list_sessions(input);
-        assert_eq!(v, vec![("my cool session".to_string(), false)]);
+        assert_eq!(
+            v,
+            vec![("$3".to_string(), "my cool session".to_string(), false)]
+        );
     }
 
     #[test]
     fn parse_tmux_list_sessions_skips_malformed() {
         // Trailing token isn't a number → drop.
-        let input = "bad notanumber\ngood 1\n";
+        let input = "$0 bad notanumber\n$1 good 1\n";
         let v = parse_tmux_list_sessions(input);
-        assert_eq!(v, vec![("good".to_string(), true)]);
+        assert_eq!(v, vec![("$1".to_string(), "good".to_string(), true)]);
     }
 
     #[test]
     fn parse_tmux_list_sessions_skips_blank_lines() {
-        let input = "\n\na 0\n\nb 1\n\n";
+        let input = "\n\n$0 a 0\n\n$1 b 1\n\n";
         let v = parse_tmux_list_sessions(input);
         assert_eq!(
             v,
-            vec![("a".to_string(), false), ("b".to_string(), true)]
+            vec![
+                ("$0".to_string(), "a".to_string(), false),
+                ("$1".to_string(), "b".to_string(), true),
+            ]
         );
+    }
+
+    // ── new (3-field format) coverage ──
+
+    #[test]
+    fn parse_tmux_list_sessions_parses_id_name_attached() {
+        // The plan calls this out as test #8: the parser must lift the
+        // session_id off the front and still preserve embedded spaces in
+        // the name.
+        let input = "$5 hello world 1\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(
+            v,
+            vec![("$5".to_string(), "hello world".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn parse_tmux_list_sessions_skips_malformed_session_id() {
+        // The plan calls this out as test #9: lines whose first token is
+        // not a `$`-prefixed id are dropped, even if the rest looks valid.
+        let input = "noprefix demo 0\n$0 ok 1\n";
+        let v = parse_tmux_list_sessions(input);
+        assert_eq!(v, vec![("$0".to_string(), "ok".to_string(), true)]);
     }
 
     // ── /proc/<pid>/status parsing ──

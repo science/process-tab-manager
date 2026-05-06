@@ -26,12 +26,9 @@ const CONFIRM_PADDING: i16 = 12;
 const TOP_BUTTON_GAP: i16 = 4;
 const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 /// Width of the right-edge band on session rows that responds to a click as
-/// "close this session". The renderer paints "x" at the start of this band
-/// and the marker dot at its right edge.
+/// "close this session". The renderer paints "x" inside this band; label
+/// truncation uses this same width as its right-edge reserve.
 const SESSION_CLOSE_BAND_WIDTH: i16 = 16;
-/// Total horizontal space reserved on session rows for the close glyph and
-/// marker dot together — used by label truncation.
-const SESSION_RIGHT_EDGE_RESERVE: i16 = SESSION_CLOSE_BAND_WIDTH + 8;
 
 // How long a pending attach claim stays live waiting for its new window to
 // appear before giving up. Cheap upper bound — typical gnome-terminal launch
@@ -2315,9 +2312,12 @@ fn dispatch_session_click(
     None
 }
 
-/// True if any tracked window is currently attached to `session_name`. Used
-/// at draw time to decide between filled-circle (attached) and hollow-ring
-/// (orphan) markers on session rows. Pure — no X11 or tmux calls.
+/// True if any tracked window is currently attached to `session_name`.
+/// Pure — no X11 or tmux calls. Currently has no production callers (Bug B
+/// removed the marker that branched on it); kept under `#[allow(dead_code)]`
+/// because the predicate is small, well-tested, and likely to revive if a
+/// future feature wants to differentiate attached vs orphan sessions.
+#[allow(dead_code)]
 fn is_session_attached(app: &App, session_name: &str) -> bool {
     app.items
         .iter()
@@ -2918,7 +2918,6 @@ impl Renderer {
                     } else {
                         (ix, iw)
                     };
-                    let attached = is_session_attached(app, name);
                     self.draw_session_row(
                         conn,
                         pix,
@@ -2928,7 +2927,6 @@ impl Renderer {
                         ITEM_H as u16,
                         name,
                         hovered,
-                        attached,
                     )?;
                 }
             }
@@ -3029,7 +3027,6 @@ impl Renderer {
                                 (ix, iw)
                             };
                             // Ghost reuses the session-row drawing; hovered=false, no special ghost style.
-                            let attached = is_session_attached(app, name);
                             self.draw_session_row(
                                 conn,
                                 pix,
@@ -3039,7 +3036,6 @@ impl Renderer {
                                 ITEM_H as u16,
                                 name,
                                 false,
-                                attached,
                             )?;
                         }
                     }
@@ -3212,7 +3208,6 @@ impl Renderer {
         h: u16,
         name: &str,
         hovered: bool,
-        attached: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Background
         let bg = if hovered {
@@ -3228,7 +3223,7 @@ impl Renderer {
         )?;
 
         // Grey left-edge stripe so session rows read distinctly from
-        // window rows even when the marker dot is dim.
+        // window rows.
         conn.change_gc(
             self.gc,
             &ChangeGCAux::new().foreground(self.text_dim_pixel),
@@ -3239,10 +3234,9 @@ impl Renderer {
             &[Rectangle { x, y, width: 3, height: h }],
         )?;
 
-        // Reserve right-edge space for both the marker and the [x] glyph so
-        // long session names truncate cleanly. Layout (right → left):
-        //   [marker dot][gap][x glyph][gap]<text>
-        let marker_reserve: i16 = SESSION_RIGHT_EDGE_RESERVE;
+        // Reserve right-edge space for the [x] glyph so long session names
+        // truncate cleanly. Layout (right → left): [x glyph][gap]<text>.
+        let marker_reserve: i16 = SESSION_CLOSE_BAND_WIDTH;
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
         let text_x = x + 8;
         let text_y = y + (h as i16 / 2) + 4;
@@ -3252,35 +3246,12 @@ impl Renderer {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
 
-        // [x] close glyph — sits between the label and the marker. The
-        // hit-test (hit_test_session_close_button) keys on `local_x` only,
-        // so positioning here must agree with that band's right edge.
+        // [x] close glyph at the right edge. Hit-test
+        // (hit_test_session_close_button) keys on `local_x` only, so
+        // positioning here must agree with the close band's right edge.
         let x_glyph_x = x + w as i16 - SESSION_CLOSE_BAND_WIDTH;
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_dim_pixel))?;
         conn.image_text8(drawable, self.gc, x_glyph_x, text_y, b"x")?;
-
-        // Marker on the right edge: filled circle when an attached terminal
-        // exists for this session, hollow ring when it's an orphan.
-        let marker_size: u16 = 6;
-        let marker_x = x + w as i16 - marker_size as i16 - 4;
-        let marker_y = y + (h as i16 - marker_size as i16) / 2;
-        conn.change_gc(
-            self.gc,
-            &ChangeGCAux::new().foreground(self.session_marker_pixel),
-        )?;
-        let arc = [Arc {
-            x: marker_x,
-            y: marker_y,
-            width: marker_size,
-            height: marker_size,
-            angle1: 0,
-            angle2: 360 * 64,
-        }];
-        if attached {
-            conn.poly_fill_arc(drawable, self.gc, &arc)?;
-        } else {
-            conn.poly_arc(drawable, self.gc, &arc)?;
-        }
 
         Ok(())
     }

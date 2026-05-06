@@ -3001,7 +3001,19 @@ impl Renderer {
                         } else {
                             (ix, iw)
                         };
-                        self.draw_item(conn, pix, x, y, w, ITEM_H as u16, item, false, hovered, is_active, drop_hi)?;
+                        let attach_glyph = item.session.as_ref().map(|name| {
+                            let origin = session_origin_for_name(
+                                name,
+                                &app.live_sessions,
+                                &app.session_origins,
+                            );
+                            marker_glyph_for_origin(origin)
+                        });
+                        self.draw_item(
+                            conn, pix, x, y, w, ITEM_H as u16, item,
+                            false, hovered, is_active, drop_hi,
+                            attach_glyph.as_deref(),
+                        )?;
                     }
                 }
                 DisplayRow::Session { name, group_id } => {
@@ -3113,8 +3125,18 @@ impl Renderer {
                                 } else {
                                     (ix, iw)
                                 };
+                                let attach_glyph = item.session.as_ref().map(|name| {
+                                    let origin = session_origin_for_name(
+                                        name,
+                                        &app.live_sessions,
+                                        &app.session_origins,
+                                    );
+                                    marker_glyph_for_origin(origin)
+                                });
                                 self.draw_item(
-                                    conn, pix, x, ghost_y, w, ITEM_H as u16, item, true, false, false, false,
+                                    conn, pix, x, ghost_y, w, ITEM_H as u16, item,
+                                    true, false, false, false,
+                                    attach_glyph.as_deref(),
                                 )?;
                             }
                         }
@@ -3217,6 +3239,7 @@ impl Renderer {
         hovered: bool,
         is_active: bool,
         drop_highlighted: bool,
+        attach_glyph: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Drop-highlight (T3.5) overrides hover/active so the user can't
         // miss the post-drop flash, but ghost (drag preview) still wins
@@ -3263,8 +3286,9 @@ impl Renderer {
         )?;
 
         // Reserve right-side space for the session marker if present,
-        // so the label truncates cleanly instead of overlapping the dot.
-        let marker_reserve: i16 = if item.session.is_some() { 14 } else { 0 };
+        // so the label truncates cleanly instead of overlapping the glyph.
+        // 22 px = 2 chars × 8 px + 6 px right-edge padding.
+        let marker_reserve: i16 = if attach_glyph.is_some() { 22 } else { 0 };
 
         // Label
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(self.text_pixel))?;
@@ -3277,28 +3301,21 @@ impl Renderer {
             conn.image_text8(drawable, self.gc, text_x, text_y, display.as_bytes())?;
         }
 
-        // Session marker: small filled circle on the right edge when this
-        // window is attached to a tmux session.
-        if item.session.is_some() {
-            let marker_size: u16 = 6;
-            let marker_x = x + w as i16 - marker_size as i16 - 6;
-            let marker_y = y + (h as i16 - marker_size as i16) / 2;
-            conn.change_gc(
-                self.gc,
-                &ChangeGCAux::new().foreground(self.session_marker_pixel),
-            )?;
-            conn.poly_fill_arc(
-                drawable,
-                self.gc,
-                &[Arc {
-                    x: marker_x,
-                    y: marker_y,
-                    width: marker_size,
-                    height: marker_size,
-                    angle1: 0,
-                    angle2: 360 * 64,
-                }],
-            )?;
+        // Session marker: text glyph showing the tmux session's origin name
+        // (typically a small integer like "0" or "1") so the user can tell
+        // at a glance which session a given terminal is attached to.
+        // Drawn right-aligned with 6 px padding from the right edge.
+        if let Some(glyph) = attach_glyph {
+            if !glyph.is_empty() {
+                let glyph_bytes = glyph.as_bytes();
+                let glyph_width = glyph_bytes.len() as i16 * CHAR_WIDTH;
+                let glyph_x = x + w as i16 - glyph_width - 6;
+                conn.change_gc(
+                    self.gc,
+                    &ChangeGCAux::new().foreground(self.session_marker_pixel),
+                )?;
+                conn.image_text8(drawable, self.gc, glyph_x, text_y, glyph_bytes)?;
+            }
         }
 
         Ok(())

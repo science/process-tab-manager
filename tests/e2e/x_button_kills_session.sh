@@ -15,12 +15,15 @@ SESSION="ptm_e2e_$$_ghost"
 PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
 HOME_DIR=$(mktemp -d -t ptm-e2e-home.XXXXXX)
 SHOTS=$(mktemp -d -t ptm-e2e-shots.XXXXXX)
+# Per-test isolated tmux server socket so leftover sessions from other
+# scripts (or earlier failed runs) can't contaminate row layout.
+export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-tmux.XXXXXX)
 
 cleanup() {
     [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
-    rm -rf "$HOME_DIR"
+    tmux kill-server 2>/dev/null || true
+    rm -rf "$HOME_DIR" "$TMUX_TMPDIR"
     wait 2>/dev/null || true
 }
 trap cleanup EXIT

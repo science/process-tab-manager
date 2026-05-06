@@ -344,6 +344,33 @@ enum ConfirmAction {
     KillSession(String),
 }
 
+/// What `pending_spawn` is waiting for. Whichever variant is set, the next
+/// newly-detected wid (claimed by `claim_pending_spawn` from refresh_items)
+/// is snapped to the sidebar anchor. The Attach variant additionally binds
+/// the wid to its tmux session in `Item::session`.
+#[derive(Clone, Debug)]
+enum PendingSpawnKind {
+    /// Spawned terminal is expected to attach to this tmux session.
+    Attach(String),
+    /// Plain terminal launch (no tmux). Snap-only; no session binding.
+    Terminal,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSpawn {
+    kind: PendingSpawnKind,
+    spawned_at: std::time::Instant,
+}
+
+/// Successful claim from `claim_pending_spawn`. The caller snaps the wid
+/// and, when present, treats `attach_session` as already pre-assigned in
+/// the ancestor-walk loop (mirrors the previous `claim_pending_attach`
+/// HashSet<String> return).
+struct PendingClaim {
+    wid: u32,
+    attach_session: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfirmButton {
     Yes,
@@ -647,12 +674,15 @@ struct App {
     height: u16,
     our_wid: u32,
     subscribed_wids: HashSet<u32>,
-    // When a user clicks an orphan session row, PTM spawns a terminal that
-    // will attach to that session. Process-tree-based marker detection can
-    // fail for terminals that fork through a shared server pid (gnome-
-    // terminal, konsole), so we instead watch for the next newly-appearing
-    // window and claim it for the pending session.
-    pending_attach: Option<(String, std::time::Instant)>,
+    // PTM tracks "we just spawned a window, please claim and snap it" via
+    // pending_spawn. Set when the user clicks an orphan session row, when
+    // either of the `+ New *` buttons fire, or any other ptm-initiated
+    // window spawn. The next newly-appearing wid (per refresh_items'
+    // delta) is snapped to the sidebar anchor; for Attach kinds the wid
+    // is also bound to its tmux session. Process-tree-based marker
+    // detection can't reliably do this — terminals that fork through a
+    // shared server pid (gnome-terminal, konsole) hide their parent.
+    pending_spawn: Option<PendingSpawn>,
     /// Set on the FIRST mutation in a dirty epoch; preserved across
     /// subsequent mutations. Used by the 30-second backstop to bound the
     /// worst-case data loss when a long burst of edits would otherwise
@@ -695,7 +725,7 @@ impl App {
             height: WIN_H,
             our_wid,
             subscribed_wids: HashSet::new(),
-            pending_attach: None,
+            pending_spawn: None,
             first_dirty_at: None,
             last_dirty_at: None,
             last_drop_highlight: None,
@@ -2005,17 +2035,23 @@ fn refresh_items(
         });
     }
 
-    // Pending-attach takes priority over the ancestor walk. If the user
-    // just clicked an orphan row, we know which session to expect on the
-    // next new window — much more reliable than walking through a
-    // gnome-terminal-server pid collision.
-    let pre_assigned = claim_pending_attach(
-        &mut app.pending_attach,
+    // Pending-spawn takes priority over the ancestor walk. If the user
+    // just clicked an orphan row or hit a `+ New *` button, we know the
+    // next new window is ours — much more reliable than walking through
+    // a gnome-terminal-server pid collision.
+    let claim = claim_pending_spawn(
+        &mut app.pending_spawn,
         &prior_wids,
         &mut new_items,
         PENDING_ATTACH_TIMEOUT,
         std::time::Instant::now(),
     );
+    let mut pre_assigned: HashSet<String> = HashSet::new();
+    if let Some(c) = &claim {
+        if let Some(name) = &c.attach_session {
+            pre_assigned.insert(name.clone());
+        }
+    }
 
     // Assign tmux sessions by walking UP from each tmux client's PID until
     // we hit a pid that's a tracked window's _NET_WM_PID. This is the
@@ -2157,6 +2193,14 @@ fn refresh_items(
 
     app.items = new_items;
     app.build_display_rows();
+
+    // Snap a freshly-claimed spawn to the sidebar anchor. Mirrors the
+    // click-to-activate snap path; errors are swallowed (the window
+    // appears, just unpositioned) the same way that path does it.
+    if let Some(c) = claim {
+        let _ = snap_to_sidebar(conn, root, app.our_wid, c.wid, atoms);
+    }
+
     Ok(())
 }
 
@@ -2419,15 +2463,17 @@ fn walk_to_window_owner(
 // click spawns another terminal while we wait for the first spawn's
 // window to register.
 fn is_attach_pending_for(
-    pending: &Option<(String, std::time::Instant)>,
+    pending: &Option<PendingSpawn>,
     session_name: &str,
 ) -> bool {
-    matches!(pending, Some((n, _)) if n == session_name)
+    matches!(pending, Some(PendingSpawn { kind: PendingSpawnKind::Attach(n), .. }) if n == session_name)
 }
 
-// Consume a pending attach: if a new wid has appeared since the previous
-// refresh, assign the pending session to it. Returns the set of sessions
-// that were pre-assigned so the ancestor-walk loop can skip them.
+// Consume a pending spawn: if exactly one new wid has appeared since the
+// previous refresh, claim it. For Attach kinds the wid is bound to its
+// tmux session in `Item::session`; for Terminal kinds nothing is bound
+// (the caller still snaps the wid). Returns Some(PendingClaim) when a
+// claim is made, None otherwise.
 //
 // "Exactly one new wid" is the safe case — we know which window is ours.
 // Zero new wids → window hasn't appeared yet, keep waiting. Multiple new
@@ -2435,20 +2481,17 @@ fn is_attach_pending_for(
 // keep waiting. Either way, the pending entry stays until it times out.
 //
 // Pure: `now` is injected so tests can simulate timeout without sleeping.
-fn claim_pending_attach(
-    pending: &mut Option<(String, std::time::Instant)>,
+fn claim_pending_spawn(
+    pending: &mut Option<PendingSpawn>,
     prior_wids: &HashSet<u32>,
     new_items: &mut [Item],
     timeout: std::time::Duration,
     now: std::time::Instant,
-) -> HashSet<String> {
-    let mut pre_assigned = HashSet::new();
-    let Some((session_name, spawn_time)) = pending.as_ref() else {
-        return pre_assigned;
-    };
-    if now.saturating_duration_since(*spawn_time) > timeout {
+) -> Option<PendingClaim> {
+    let spawn = pending.as_ref()?;
+    if now.saturating_duration_since(spawn.spawned_at) > timeout {
         *pending = None;
-        return pre_assigned;
+        return None;
     }
     let new_wids: Vec<u32> = new_items
         .iter()
@@ -2456,16 +2499,21 @@ fn claim_pending_attach(
         .filter(|w| !prior_wids.contains(w))
         .collect();
     if new_wids.len() != 1 {
-        return pre_assigned;
+        return None;
     }
     let claimed_wid = new_wids[0];
-    let session = session_name.clone();
-    if let Some(item) = new_items.iter_mut().find(|i| i.wid == claimed_wid) {
-        item.session = Some(session.clone());
-        pre_assigned.insert(session);
-    }
+    let attach_session = match &spawn.kind {
+        PendingSpawnKind::Attach(name) => {
+            let session = name.clone();
+            if let Some(item) = new_items.iter_mut().find(|i| i.wid == claimed_wid) {
+                item.session = Some(session.clone());
+            }
+            Some(session)
+        }
+        PendingSpawnKind::Terminal => None,
+    };
     *pending = None;
-    pre_assigned
+    Some(PendingClaim { wid: claimed_wid, attach_session })
 }
 
 // ── Terminal launch ──
@@ -2571,23 +2619,20 @@ fn spawn_attach_terminal(session_name: &str) {
         .spawn();
 }
 
-/// Create a fresh tmux session with an auto-generated name and open a
-/// terminal attached to it. `tmux new-session -d -P -F '#{session_name}'`
-/// prints the assigned name on stdout — we capture it and pass it to the
-/// existing attach path.
-fn spawn_new_tmux_session() {
-    let out = match std::process::Command::new("tmux")
+/// Create a fresh tmux session with an auto-generated name (detached) and
+/// return the assigned name. `tmux new-session -d -P -F '#{session_name}'`
+/// prints the assigned name on stdout. Caller is responsible for any
+/// follow-up (pending_spawn registration, then `spawn_attach_terminal`).
+fn create_new_tmux_session() -> Option<String> {
+    let out = std::process::Command::new("tmux")
         .args(["new-session", "-d", "-P", "-F", "#{session_name}"])
         .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return,
-    };
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() {
-        return;
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    spawn_attach_terminal(&name);
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 // ── Property-change classification (pure, testable) ──
@@ -3738,8 +3783,11 @@ fn execute_menu_action(
         }
         MenuAction::AttachSession => {
             if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
-                if !is_attach_pending_for(&app.pending_attach, name) {
-                    app.pending_attach = Some((name.clone(), std::time::Instant::now()));
+                if !is_attach_pending_for(&app.pending_spawn, name) {
+                    app.pending_spawn = Some(PendingSpawn {
+                        kind: PendingSpawnKind::Attach(name.clone()),
+                        spawned_at: std::time::Instant::now(),
+                    });
                     spawn_attach_terminal(name);
                 }
             }
@@ -4919,9 +4967,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     1 => {
                         if let Some(button) = app.hit_test_top_buttons(ev.event_x, ev.event_y) {
                             match button {
-                                TopButton::NewTerminal => spawn_default_terminal(),
+                                TopButton::NewTerminal => {
+                                    // Register a Terminal pending_spawn BEFORE
+                                    // forking so the next refresh's wid-delta
+                                    // grabs and snaps the new window.
+                                    app.pending_spawn = Some(PendingSpawn {
+                                        kind: PendingSpawnKind::Terminal,
+                                        spawned_at: std::time::Instant::now(),
+                                    });
+                                    spawn_default_terminal();
+                                }
                                 TopButton::NewTmux => {
-                                    spawn_new_tmux_session();
+                                    if let Some(name) = create_new_tmux_session() {
+                                        // Register Attach BEFORE the terminal
+                                        // forks so the resulting window is
+                                        // bound to its session AND snapped.
+                                        app.pending_spawn = Some(PendingSpawn {
+                                            kind: PendingSpawnKind::Attach(name.clone()),
+                                            spawned_at: std::time::Instant::now(),
+                                        });
+                                        spawn_attach_terminal(&name);
+                                    }
                                     // Wake the main loop so the new session
                                     // shows up immediately rather than waiting
                                     // for the next 5s tmux poll.
@@ -5122,8 +5188,11 @@ fn handle_release(
             {
                 return Some(req);
             }
-            if !is_attach_pending_for(&app.pending_attach, &name) {
-                app.pending_attach = Some((name.clone(), std::time::Instant::now()));
+            if !is_attach_pending_for(&app.pending_spawn, &name) {
+                app.pending_spawn = Some(PendingSpawn {
+                    kind: PendingSpawnKind::Attach(name.clone()),
+                    spawned_at: std::time::Instant::now(),
+                });
                 spawn_attach_terminal(&name);
             }
             None
@@ -6613,7 +6682,7 @@ mod tests {
         assert_eq!(walk_to_window_owner(605774, &pid_to_wid, read, 10), None);
     }
 
-    // ── Pending-attach claim ──
+    // ── Pending-spawn claim ──
 
     fn mk_item(wid: u32) -> Item {
         Item {
@@ -6626,110 +6695,155 @@ mod tests {
         }
     }
 
+    fn pending_attach(name: &str, when: std::time::Instant) -> Option<super::PendingSpawn> {
+        Some(super::PendingSpawn {
+            kind: super::PendingSpawnKind::Attach(name.to_string()),
+            spawned_at: when,
+        })
+    }
+
+    fn pending_terminal(when: std::time::Instant) -> Option<super::PendingSpawn> {
+        Some(super::PendingSpawn {
+            kind: super::PendingSpawnKind::Terminal,
+            spawned_at: when,
+        })
+    }
+
     #[test]
-    fn pending_attach_claims_sole_new_wid() {
+    fn pending_spawn_attach_claims_sole_new_wid_and_binds_session() {
         let now = std::time::Instant::now();
-        let mut pending = Some(("demo".to_string(), now));
+        let mut pending = pending_attach("demo", now);
         let prior: HashSet<u32> = [1, 2].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
-        let pre = claim_pending_attach(
+        let claim = claim_pending_spawn(
             &mut pending,
             &prior,
             &mut items,
             std::time::Duration::from_secs(5),
             now,
         );
+        let claim = claim.expect("expected claim");
+        assert_eq!(claim.wid, 3);
+        assert_eq!(claim.attach_session.as_deref(), Some("demo"));
         assert_eq!(items[2].session.as_deref(), Some("demo"));
         assert!(items[0].session.is_none());
         assert!(items[1].session.is_none());
         assert!(pending.is_none(), "claim should clear pending");
-        assert!(pre.contains("demo"));
     }
 
     #[test]
-    fn pending_attach_defers_when_no_new_wid() {
+    fn pending_spawn_terminal_claims_sole_new_wid_without_session_binding() {
         let now = std::time::Instant::now();
-        let mut pending = Some(("demo".to_string(), now));
-        let prior: HashSet<u32> = [1, 2].iter().copied().collect();
-        let mut items = vec![mk_item(1), mk_item(2)];
-        let pre = claim_pending_attach(
+        let mut pending = pending_terminal(now);
+        let prior: HashSet<u32> = [1].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(7)];
+        let claim = claim_pending_spawn(
             &mut pending,
             &prior,
             &mut items,
             std::time::Duration::from_secs(5),
             now,
         );
-        assert!(pre.is_empty());
+        let claim = claim.expect("expected claim");
+        assert_eq!(claim.wid, 7);
+        assert!(claim.attach_session.is_none(), "Terminal kind binds no session");
+        assert!(items[1].session.is_none(), "Terminal kind must not set item.session");
+        assert!(pending.is_none(), "claim should clear pending");
+    }
+
+    #[test]
+    fn pending_spawn_defers_when_no_new_wid() {
+        let now = std::time::Instant::now();
+        let mut pending = pending_attach("demo", now);
+        let prior: HashSet<u32> = [1, 2].iter().copied().collect();
+        let mut items = vec![mk_item(1), mk_item(2)];
+        let claim = claim_pending_spawn(
+            &mut pending,
+            &prior,
+            &mut items,
+            std::time::Duration::from_secs(5),
+            now,
+        );
+        assert!(claim.is_none());
         assert!(pending.is_some(), "pending stays until window appears or timeout");
     }
 
     #[test]
-    fn pending_attach_defers_when_multiple_new_wids() {
-        // User clicked attach but also happened to open an unrelated window
+    fn pending_spawn_defers_when_multiple_new_wids() {
+        // User triggered a spawn but also happened to open an unrelated window
         // in the same refresh window. We can't tell which is which — wait.
         let now = std::time::Instant::now();
-        let mut pending = Some(("demo".to_string(), now));
+        let mut pending = pending_attach("demo", now);
         let prior: HashSet<u32> = [1].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
-        let pre = claim_pending_attach(
+        let claim = claim_pending_spawn(
             &mut pending,
             &prior,
             &mut items,
             std::time::Duration::from_secs(5),
             now,
         );
-        assert!(pre.is_empty());
+        assert!(claim.is_none());
         assert!(items[1].session.is_none());
         assert!(items[2].session.is_none());
         assert!(pending.is_some());
     }
 
     #[test]
-    fn pending_attach_times_out() {
+    fn pending_spawn_times_out() {
         let spawn = std::time::Instant::now();
         let later = spawn + std::time::Duration::from_secs(10);
-        let mut pending = Some(("demo".to_string(), spawn));
+        let mut pending = pending_attach("demo", spawn);
         let prior: HashSet<u32> = [1].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2)];
-        let pre = claim_pending_attach(
+        let claim = claim_pending_spawn(
             &mut pending,
             &prior,
             &mut items,
             std::time::Duration::from_secs(5),
             later,
         );
-        assert!(pre.is_empty());
+        assert!(claim.is_none());
         assert!(items[1].session.is_none());
         assert!(pending.is_none(), "timed-out pending should be cleared");
     }
 
     #[test]
     fn is_attach_pending_for_matches_same_session() {
-        let pending = Some(("demo".to_string(), std::time::Instant::now()));
+        let pending = pending_attach("demo", std::time::Instant::now());
         assert!(is_attach_pending_for(&pending, "demo"));
         assert!(!is_attach_pending_for(&pending, "other"));
     }
 
     #[test]
-    fn is_attach_pending_for_none() {
-        let pending: Option<(String, std::time::Instant)> = None;
+    fn is_attach_pending_for_terminal_kind_does_not_match_any_session() {
+        // Terminal pending is for "+ New terminal" — it never represents a
+        // session attach, so the orphan-row debounce should treat it as not
+        // pending (the user can still click an orphan to attach).
+        let pending = pending_terminal(std::time::Instant::now());
         assert!(!is_attach_pending_for(&pending, "demo"));
     }
 
     #[test]
-    fn pending_attach_none_is_noop() {
+    fn is_attach_pending_for_none() {
+        let pending: Option<super::PendingSpawn> = None;
+        assert!(!is_attach_pending_for(&pending, "demo"));
+    }
+
+    #[test]
+    fn pending_spawn_none_is_noop() {
         let now = std::time::Instant::now();
-        let mut pending: Option<(String, std::time::Instant)> = None;
+        let mut pending: Option<super::PendingSpawn> = None;
         let prior: HashSet<u32> = HashSet::new();
         let mut items = vec![mk_item(1)];
-        let pre = claim_pending_attach(
+        let claim = claim_pending_spawn(
             &mut pending,
             &prior,
             &mut items,
             std::time::Duration::from_secs(5),
             now,
         );
-        assert!(pre.is_empty());
+        assert!(claim.is_none());
         assert!(items[0].session.is_none());
         assert!(pending.is_none());
     }

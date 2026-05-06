@@ -12,19 +12,21 @@
 set -uo pipefail
 
 DISPLAY_NUM=":99"
-SESSION_PREFIX="ptm_e2e_spawn_$$"
 PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
 HOME_DIR=$(mktemp -d -t ptm-e2e-home.XXXXXX)
 SHOTS=$(mktemp -d -t ptm-e2e-shots.XXXXXX)
+# Per-test isolated tmux server socket — `+ New tmux` autonames sessions
+# (0, 1, 2…) and we don't want those to outlive the test or leak into
+# the user's real tmux server.
+export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-tmux.XXXXXX)
 
 cleanup() {
     [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
+    [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
     pkill -f "$DISPLAY_NUM.*xterm" 2>/dev/null || true
-    # Kill any tmux sessions we created (best-effort).
-    tmux ls 2>/dev/null | grep "^$SESSION_PREFIX" | cut -d: -f1 \
-        | xargs -I {} tmux kill-session -t {} 2>/dev/null || true
-    rm -rf "$HOME_DIR"
+    tmux kill-server 2>/dev/null || true
+    rm -rf "$HOME_DIR" "$TMUX_TMPDIR"
     wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -32,7 +34,7 @@ trap cleanup EXIT
 if [[ ! -x "$PTM" ]]; then
     echo "FAIL: ptm binary not found at $PTM"; exit 2
 fi
-for tool in Xvfb xdotool tmux xterm xdpyinfo scrot; do
+for tool in Xvfb xdotool tmux xterm xdpyinfo scrot openbox; do
     command -v "$tool" >/dev/null || { echo "FAIL: missing $tool"; exit 2; }
 done
 
@@ -44,6 +46,16 @@ for i in {1..20}; do
 done
 DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 || { echo "FAIL: Xvfb did not become responsive"; exit 2; }
 export DISPLAY="$DISPLAY_NUM"
+
+# ptm reads `_NET_CLIENT_LIST` to enumerate windows; that property is only
+# maintained by an EWMH window manager. Run openbox so the property is
+# real; openbox decorates so we use window-relative xdotool clicks
+# (mousemove --window) to address ptm's content area regardless of the
+# frame offset. snap_to_sidebar's move_window goes through the WM as a
+# ConfigureRequest, which openbox honours.
+openbox --sm-disable >/dev/null 2>&1 &
+WM_PID=$!
+sleep 0.4
 
 # Use xterm so we don't depend on gnome-terminal/DBus and the test stays
 # deterministic. ptm reads PTM_TERMINAL_CMD when launching the attached
@@ -76,16 +88,15 @@ scrot "$SHOTS/01-before-click.png"
 INITIAL_WIDS=$(xdotool search "" 2>/dev/null | sort -u)
 echo "[diag] windows before click: $(echo "$INITIAL_WIDS" | wc -l)"
 
-# Click "+ New tmux" — right half of the top header row.
-# Layout (constants from src/main.rs:10-26):
+# Click "+ New tmux" — right half of the top header row, addressed
+# via window-relative mousemove so the openbox frame offset doesn't
+# matter. Layout (constants from src/main.rs:10-26):
 #   WIN_W=250, ITEM_MARGIN=8, TOP_BUTTON_GAP=4
 #   total_w = 250 - 16 = 234; half = (234 - 4)/2 = 115
 #   right_button_x = 8 + 115 + 4 = 127, right_button_w = 115
 #   centre x = 127 + 115/2 = 184; centre y = 4 + ITEM_H/2 = 4 + 14 = 18
-NEW_TMUX_X=$((PTM_X + 184))
-NEW_TMUX_Y=$((PTM_Y + 18))
-echo "[act ] click '+ New tmux' at ${NEW_TMUX_X},${NEW_TMUX_Y}"
-xdotool mousemove "$NEW_TMUX_X" "$NEW_TMUX_Y"; sleep 0.1
+echo "[act ] click '+ New tmux' at window-relative 184,18"
+xdotool mousemove --window "$WID" --sync 184 18; sleep 0.1
 xdotool click 1
 
 # Wait for an xterm to appear (give tmux + xterm spawn time).
@@ -105,9 +116,12 @@ if [[ -z "$TERM_WID" ]]; then
     done
     exit 1
 fi
+echo "[diag] xterm appeared as wid=$TERM_WID"
 
-# Give the spawn pipeline a moment to finish any post-map repositioning.
-sleep 0.4
+# openbox maintains _NET_CLIENT_LIST when xterm maps; ptm reacts via its
+# PropertyNotify subscription on root, runs refresh_items, claims the
+# new wid via pending_spawn, and snaps it.
+sleep 0.8
 scrot "$SHOTS/02-after-spawn.png"
 
 eval "$(xdotool getwindowgeometry --shell "$TERM_WID")"

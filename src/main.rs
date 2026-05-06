@@ -686,6 +686,12 @@ struct App {
     /// alongside the new label. Pruned when sessions disappear; rebuilt
     /// from scratch every PTM start (not persisted).
     session_origins: HashMap<String, String>,
+    /// Snapshot of `list_tmux_sessions()` from the most recent refresh:
+    /// `(session_id, current_name, attached)` triples. Used by the renderer
+    /// to look up a session's id from its current name (so it can resolve
+    /// the origin from `session_origins`) without re-forking tmux on every
+    /// paint. Empty on startup; populated on the first refresh.
+    live_sessions: Vec<(String, String, bool)>,
     /// Set on the FIRST mutation in a dirty epoch; preserved across
     /// subsequent mutations. Used by the 30-second backstop to bound the
     /// worst-case data loss when a long burst of edits would otherwise
@@ -730,6 +736,7 @@ impl App {
             subscribed_wids: HashSet::new(),
             pending_spawn: None,
             session_origins: HashMap::new(),
+            live_sessions: Vec::new(),
             first_dirty_at: None,
             last_dirty_at: None,
             last_drop_highlight: None,
@@ -2051,6 +2058,9 @@ fn refresh_items(
         live_sessions.iter().map(|(_, n, _)| n.clone()).collect();
     let live_session_set: HashSet<String> =
         live_session_names.iter().cloned().collect();
+    // Cache the snapshot for the renderer, which needs name → id resolution
+    // via session_origin_for_name without forking tmux on every paint.
+    app.live_sessions = live_sessions;
 
     // Pending-spawn takes priority over the ancestor walk. If the user
     // just clicked an orphan row or hit a `+ New *` button, we know the
@@ -3002,6 +3012,12 @@ impl Renderer {
                     } else {
                         (ix, iw)
                     };
+                    let origin = session_origin_for_name(
+                        name,
+                        &app.live_sessions,
+                        &app.session_origins,
+                    );
+                    let display_label = format_session_row_label(name, origin);
                     self.draw_session_row(
                         conn,
                         pix,
@@ -3009,7 +3025,7 @@ impl Renderer {
                         y,
                         w,
                         ITEM_H as u16,
-                        name,
+                        &display_label,
                         hovered,
                     )?;
                 }
@@ -3111,6 +3127,12 @@ impl Renderer {
                                 (ix, iw)
                             };
                             // Ghost reuses the session-row drawing; hovered=false, no special ghost style.
+                            let origin = session_origin_for_name(
+                                name,
+                                &app.live_sessions,
+                                &app.session_origins,
+                            );
+                            let display_label = format_session_row_label(name, origin);
                             self.draw_session_row(
                                 conn,
                                 pix,
@@ -3118,7 +3140,7 @@ impl Renderer {
                                 ghost_y,
                                 w,
                                 ITEM_H as u16,
-                                name,
+                                &display_label,
                                 false,
                             )?;
                         }

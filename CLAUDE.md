@@ -6,12 +6,17 @@ Vertical sidebar for managing application windows on Linux/X11. Pure X11 via x11
 
 ```bash
 source "$HOME/.cargo/env"
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                       # 220+ unit tests, no display needed
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                       # 270+ unit + 2 e2e (Xvfb)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --lib                 # unit tests only (~50ms)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~6s)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo build --release             # Build dev binary
 DISPLAY=:0 /tmp/ptm-dev/release/ptm                             # Run (needs X11 desktop)
+PTM_BIN=/tmp/ptm-dev/release/ptm tests/e2e/<name>.sh           # Run a single e2e script standalone
 ```
 
 **Dev vs production**: Dev builds use `/tmp/ptm-dev`. The installed launcher (`install.sh`) uses `/tmp/ptm-target`. This keeps `cargo build` during development from overwriting the production binary.
+
+**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e tests (`tests/e2e/*.sh` driven by `tests/e2e_kill_session.rs`) additionally need `xvfb`, `xdotool`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Tests share the user's tmux server (default socket) and serialize themselves via a `Mutex` in the test wrapper.
 
 ## Project Structure
 

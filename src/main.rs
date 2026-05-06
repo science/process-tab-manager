@@ -2427,6 +2427,62 @@ fn list_tmux_sessions() -> Vec<(String, bool)> {
     }
 }
 
+// ── Session origin tracking ──
+//
+// These helpers track each tmux session's ORIGINAL name (the name observed
+// the first time we ever saw the session_id) so the UI can keep showing it
+// after a user-initiated `tmux rename-session`. The `+ New tmux` button uses
+// `tmux new-session -d -P` without `-s`, so origins are typically the
+// auto-assigned numeric ids ("0", "1", ...). Externally-created sessions
+// keep whatever name `-s` gave them.
+//
+// All four functions are pure and unit-testable. They are STUBS in this
+// commit — bodies are deliberately minimal so the new RED tests fail. Each
+// gets its real body in subsequent commits.
+
+/// Update the origins map from this refresh's session list. First sighting
+/// of a session_id records its current name; subsequent sightings preserve
+/// the original. Sessions absent from the current list are pruned.
+fn update_session_origins(
+    origins: &mut HashMap<String, String>,
+    sessions: &[(String, String, bool)],
+) {
+    // STUB: implemented in a later commit.
+    let _ = origins;
+    let _ = sessions;
+}
+
+/// Resolve the origin name for a session given its CURRENT name. Returns
+/// the current name unchanged when no origin is recorded (defensive — happens
+/// when refresh sees a session for the first time after a rename and the
+/// caller queries before update_session_origins runs).
+fn session_origin_for_name<'a>(
+    name: &'a str,
+    sessions: &[(String, String, bool)],
+    origins: &'a HashMap<String, String>,
+) -> &'a str {
+    // STUB: passthrough. Implemented in a later commit.
+    let _ = sessions;
+    let _ = origins;
+    name
+}
+
+/// Format a session row's display label given its current name and origin.
+/// Origin == current → just the name. Renamed → "name (origin)".
+fn format_session_row_label(name: &str, origin: &str) -> String {
+    // STUB: returns name only. Implemented in a later commit.
+    let _ = origin;
+    name.to_string()
+}
+
+/// Render text for the green marker on attached-terminal window rows.
+/// Origin truncated to 2 chars; ASCII-only since the renderer uses
+/// `image_text8` (Latin-1).
+fn marker_glyph_for_origin(origin: &str) -> String {
+    // STUB: returns origin verbatim. Implemented in a later commit.
+    origin.to_string()
+}
+
 fn parse_proc_status_ppid(s: &str) -> Option<u32> {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("PPid:") {
@@ -9160,6 +9216,85 @@ mod tests {
                 super::DisplayRow::Session { name, .. } if name == "ghost"
             )),
             "expected display row for 'ghost' to be gone after popup-accept kill"
+        );
+    }
+
+    // ── Session origin tracking + glyph helpers (RED-first per plan) ──
+
+    #[test]
+    fn session_origin_recorded_on_first_sighting() {
+        let mut origins: HashMap<String, String> = HashMap::new();
+        let sessions = vec![("$0".to_string(), "0".to_string(), false)];
+        super::update_session_origins(&mut origins, &sessions);
+        assert_eq!(origins.get("$0").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn session_origin_preserved_across_rename() {
+        // Session $0 was originally "0"; the user has since renamed it to
+        // "myproject". A subsequent refresh must NOT overwrite the origin.
+        let mut origins: HashMap<String, String> = HashMap::new();
+        origins.insert("$0".to_string(), "0".to_string());
+        let sessions = vec![("$0".to_string(), "myproject".to_string(), false)];
+        super::update_session_origins(&mut origins, &sessions);
+        assert_eq!(
+            origins.get("$0").map(String::as_str),
+            Some("0"),
+            "origin must remain '0' after a rename observation"
+        );
+    }
+
+    #[test]
+    fn session_origin_dropped_when_session_disappears() {
+        // Origin entries for sessions absent from the live list get pruned
+        // so the map size stays bounded over long PTM lifetimes.
+        let mut origins: HashMap<String, String> = HashMap::new();
+        origins.insert("$0".to_string(), "0".to_string());
+        origins.insert("$1".to_string(), "1".to_string());
+        let sessions = vec![("$0".to_string(), "0".to_string(), false)];
+        super::update_session_origins(&mut origins, &sessions);
+        assert!(origins.contains_key("$0"));
+        assert!(
+            !origins.contains_key("$1"),
+            "origin for vanished session $1 should have been pruned"
+        );
+    }
+
+    #[test]
+    fn format_session_row_label_unrenamed() {
+        assert_eq!(super::format_session_row_label("0", "0"), "0");
+        assert_eq!(super::format_session_row_label("mywork", "mywork"), "mywork");
+    }
+
+    #[test]
+    fn format_session_row_label_renamed() {
+        assert_eq!(
+            super::format_session_row_label("myproject", "0"),
+            "myproject (0)"
+        );
+    }
+
+    #[test]
+    fn marker_glyph_truncates_origin_to_two_chars() {
+        assert_eq!(super::marker_glyph_for_origin("0"), "0");
+        assert_eq!(super::marker_glyph_for_origin("10"), "10");
+        assert_eq!(super::marker_glyph_for_origin("mywork"), "my");
+        // 3-digit ids are rare but possible if the user keeps the same tmux
+        // server alive across hundreds of session creates; truncation is
+        // documented and accepted.
+        assert_eq!(super::marker_glyph_for_origin("100"), "10");
+    }
+
+    #[test]
+    fn session_origin_for_name_returns_current_when_unmapped() {
+        // Defensive lookup: when a session we just saw has no origin record
+        // yet (refresh hasn't called update_session_origins), fall back to
+        // the current name so the renderer doesn't render an empty glyph.
+        let origins: HashMap<String, String> = HashMap::new();
+        let sessions = vec![("$0".to_string(), "0".to_string(), false)];
+        assert_eq!(
+            super::session_origin_for_name("0", &sessions, &origins),
+            "0"
         );
     }
 }

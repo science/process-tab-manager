@@ -8446,6 +8446,28 @@ mod tests {
         assert!(matches!(&app.display_rows[0], DisplayRow::GroupHeader { .. }));
     }
 
+    /// User-visible bug: collapsed Tmux Sessions group label always reads
+    /// "(0)" no matter how many sessions are present. The header label is
+    /// rendered as `format!("({})", group.live_count())` (see the group
+    /// header draw call); this test pins what `live_count()` is expected
+    /// to return for a TmuxSystem group with N session members.
+    #[test]
+    fn collapsed_tmux_system_group_count_equals_session_count() {
+        let mut app = make_app();
+        make_system_group(&mut app, &["alpha", "beta", "gamma"]);
+        let group = app
+            .groups
+            .iter()
+            .find(|g| g.kind == super::GroupKind::TmuxSystem)
+            .expect("system group present");
+        assert_eq!(
+            group.live_count(),
+            3,
+            "collapsed Tmux Sessions header should report 3 sessions, got {}",
+            group.live_count()
+        );
+    }
+
     #[test]
     fn is_session_attached_returns_true_for_attached_item() {
         let mut app = make_app();

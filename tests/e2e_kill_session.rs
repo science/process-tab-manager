@@ -70,3 +70,18 @@ fn x_button_popup_accept_kills_orphan_session() {
         out
     );
 }
+
+/// Reproducer: clicking "+ New tmux" should spawn the attached terminal
+/// at the sidebar anchor (immediately right of ptm), matching the
+/// positioning ptm applies when activating an existing window via click.
+/// Today the new terminal lands at the WM/X server's default position
+/// (typically overlapping the sidebar) — RED.
+#[test]
+fn new_tmux_button_positions_terminal_at_sidebar_anchor() {
+    let (ok, out) = run_e2e_script("spawn_position.sh");
+    assert!(
+        ok,
+        "'+ New tmux' should snap the new terminal to the sidebar anchor\n{}",
+        out
+    );
+}

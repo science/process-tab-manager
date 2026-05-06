@@ -16,7 +16,7 @@ PTM_BIN=/tmp/ptm-dev/release/ptm tests/e2e/<name>.sh           # Run a single e2
 
 **Dev vs production**: Dev builds use `/tmp/ptm-dev`. The installed launcher (`install.sh`) uses `/tmp/ptm-target`. This keeps `cargo build` during development from overwriting the production binary.
 
-**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e tests (`tests/e2e/*.sh` driven by `tests/e2e_kill_session.rs`) additionally need `xvfb`, `xdotool`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Tests share the user's tmux server (default socket) and serialize themselves via a `Mutex` in the test wrapper.
+**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e tests (`tests/e2e/*.sh` driven by `tests/e2e_kill_session.rs`) additionally need `xvfb`, `xdotool`, `xterm`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Tests share the user's tmux server (default socket) and serialize themselves via a `Mutex` in the test wrapper. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus.
 
 ## Project Structure
 

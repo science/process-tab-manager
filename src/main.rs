@@ -3764,15 +3764,17 @@ fn execute_menu_action(
 
 // ── Confirmation popup ──
 
-/// Pure dispatch for the confirmation popup. Always clears `app.confirm` and
-/// returns the popup's pending action iff the user accepted. Callers that own
-/// the X11 connection are responsible for tearing down the popup window /
-/// pixmap BEFORE calling (or for using `close_confirm_popup` on cancel paths
-/// where they don't need the action). Splitting the X11 cleanup out keeps
-/// this fn unit-testable without a display.
-fn dispatch_confirm(app: &mut App, accepted: bool) -> Option<ConfirmAction> {
-    let popup = app.confirm.take()?;
-    if accepted { Some(popup.action) } else { None }
+/// Pure dispatch for the confirmation popup. Returns the pending action if
+/// the user accepted and a popup is armed; otherwise `None`. Non-destructive
+/// — leaves `app.confirm` untouched so the caller can capture the action
+/// BEFORE running `close_confirm_popup` (which is what tears the popup
+/// down and frees its X11 resources). Calling close before dispatch loses
+/// the action, which used to silently break the popup-accept kill path.
+fn dispatch_confirm(app: &App, accepted: bool) -> Option<ConfirmAction> {
+    if !accepted {
+        return None;
+    }
+    app.confirm.as_ref().map(|p| p.action.clone())
 }
 
 /// Kill a tmux session by name and optimistically prune the matching
@@ -4727,17 +4729,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && (ev.event_x as u16) < popup.width
                         && (ev.event_y as u16) < popup.height;
                     if ev.detail == 1 && in_yes {
+                        let action = dispatch_confirm(&app, true);
                         close_confirm_popup(&conn, &mut app)?;
-                        if let Some(action) = dispatch_confirm(&mut app, true) {
+                        if let Some(action) = action {
                             execute_confirm_action(&mut app, action);
                         }
                     } else if ev.detail == 1 && in_no {
                         close_confirm_popup(&conn, &mut app)?;
-                        let _ = dispatch_confirm(&mut app, false);
                     } else if !in_popup {
                         // Click outside dismisses (treated as cancel).
                         close_confirm_popup(&conn, &mut app)?;
-                        let _ = dispatch_confirm(&mut app, false);
                     }
                     renderer.redraw(&conn, &app)?;
                 }
@@ -4762,14 +4763,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let accept = matches!(sym, 0xff0d | 0xff8d | 0x59 | 0x79);
                     let cancel = matches!(sym, 0xff1b | 0x4e | 0x6e);
                     if accept {
+                        let action = dispatch_confirm(&app, true);
                         close_confirm_popup(&conn, &mut app)?;
-                        if let Some(action) = dispatch_confirm(&mut app, true) {
+                        if let Some(action) = action {
                             execute_confirm_action(&mut app, action);
                         }
                         renderer.redraw(&conn, &app)?;
                     } else if cancel {
                         close_confirm_popup(&conn, &mut app)?;
-                        let _ = dispatch_confirm(&mut app, false);
                         renderer.redraw(&conn, &app)?;
                     }
                 }
@@ -8114,37 +8115,58 @@ mod tests {
     }
 
     #[test]
-    fn confirm_popup_with_yes_runs_action() {
+    fn confirm_popup_with_yes_returns_action() {
         let mut app = make_app();
         app.confirm = Some(make_test_confirm(
             super::ConfirmAction::KillSession("demo".to_string()),
         ));
-        let action = super::dispatch_confirm(&mut app, true);
+        let action = super::dispatch_confirm(&app, true);
         assert!(
             matches!(action, Some(super::ConfirmAction::KillSession(ref n)) if n == "demo"),
             "expected KillSession(demo), got {:?}",
             action
         );
-        assert!(app.confirm.is_none(), "popup must be cleared after dispatch");
+        assert!(
+            app.confirm.is_some(),
+            "dispatch must not consume the popup; close_confirm_popup is responsible for that"
+        );
     }
 
     #[test]
-    fn confirm_popup_with_no_only_disarms() {
+    fn confirm_popup_with_no_returns_none_without_consuming() {
         let mut app = make_app();
         app.confirm = Some(make_test_confirm(
             super::ConfirmAction::KillSession("demo".to_string()),
         ));
-        let action = super::dispatch_confirm(&mut app, false);
+        let action = super::dispatch_confirm(&app, false);
         assert!(action.is_none(), "rejected dispatch returns no action");
-        assert!(app.confirm.is_none(), "popup must be cleared after dispatch");
+        assert!(
+            app.confirm.is_some(),
+            "dispatch must not consume the popup; close_confirm_popup is responsible for that"
+        );
     }
 
     #[test]
     fn dispatch_confirm_with_no_popup_returns_none() {
-        let mut app = make_app();
+        let app = make_app();
         assert!(app.confirm.is_none());
-        let action = super::dispatch_confirm(&mut app, true);
+        let action = super::dispatch_confirm(&app, true);
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn dispatch_confirm_does_not_consume_popup() {
+        let mut app = make_app();
+        app.confirm = Some(make_test_confirm(
+            super::ConfirmAction::KillSession("demo".to_string()),
+        ));
+        let _ = super::dispatch_confirm(&app, true);
+        let _ = super::dispatch_confirm(&app, false);
+        let _ = super::dispatch_confirm(&app, true);
+        assert!(
+            app.confirm.is_some(),
+            "repeated dispatch_confirm calls must be idempotent on app.confirm"
+        );
     }
 
     // ── T4.2: kill tmux session from attached terminal row ──

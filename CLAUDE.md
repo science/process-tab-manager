@@ -115,3 +115,44 @@ Every behavior change starts with a failing test (RED), then implementation (GRE
 4. Run the test — confirm it passes (GREEN)
 5. Run the full test suite (`cargo test`) — confirm no regressions across both tiers
 6. Commit test and implementation together
+
+## Phase 5a — Recipe-capture UAT (Stage E)
+
+Phase 5a observes — for every visible window — the info PTM would need to relaunch it after a reboot: the controlling executable (Layer 1: `exe` / `cmdline` / `cwd`) and the foreground job running inside any wrapping shell or tmux pane (Layer 2: workload). It does **not** persist or restore anything yet; the data is dumped on SIGUSR1 to a markdown file the user reviews against the live sidebar.
+
+The UAT verdict gates everything else in Cluster 5: if /proc-based capture systematically misses workloads for the user's real apps, Phases 5b–5f don't ship.
+
+### How to trigger a dump
+
+```bash
+kill -USR1 $(pgrep ptm)
+```
+
+PTM writes `$XDG_CACHE_HOME/ptm/recipes-snapshot.md` (falling back to `~/.cache/ptm/recipes-snapshot.md`) and prints the path on stderr if PTM was launched from a terminal. The dump is fast (a few ms — one /proc walk + one `tmux display-message` per attached session) and side-effect-free with respect to PTM state.
+
+### How to review the dump
+
+1. Open the windows you'd care about restoring after a reboot — at minimum the ones you remember relaunching manually after the last reboot. Include a mix: GUI apps (Firefox, file manager), plain terminals, tmux-attached terminals running real work (`claude`, `npm run dev`, `vim`).
+2. Trigger the dump.
+3. Open the markdown file. Each window gets a vertical block with a scan-signal header — e.g. `## 2 — ✓ Layer 1, ✓ Layer 2 (Job)` — followed by per-field breakdown.
+4. Walk each block in sidebar order. The **PTM label** and **live title** fields disambiguate "which window is this row?" — match them against the sidebar and the window's title bar.
+5. For each cell, judge correctness. Annotate inline with HTML comments where something looks wrong:
+   ```markdown
+   - cwd: `/home/steve`  <!-- ✗ should be /home/steve/Downloads -->
+   ```
+
+### What to check per block
+
+- **Layer 1 cwd** matches `pwd` inside the terminal (or the app's actual working directory).
+- **Layer 1 cmdline** reproduces what you'd type to relaunch the app. For terminals, this may be the wrapper (`gnome-terminal-server …`) rather than the shell — that's expected.
+- **Tmux binding**, when present, names the correct session and points at a non-zero `pane_pid`.
+- **Layer 2 workload** is what's actually running in the foreground. For an idle shell, the block should read `✓ Layer 2 (Idle)`. For a tmux'd `claude` session, it should read `✓ Layer 2 (Job)` with `cmdline: claude`. If it reads `✗ Layer 2 unreachable`, the printed `reason` should tell you why (no shell descendant, ambiguous shell parentage, etc.) — those are the bugs worth flagging.
+
+### Verdict that gates Cluster 5
+
+Green-light Phases 5b–5f when:
+
+- ≥ 90 % of rows show ✓ on Layer 1, AND
+- All tmux-attached workflow apps (claude, npm dev server, vim under tmux) show ✓ Layer 2 (Job) with sensible cmdlines.
+
+If a non-trivial fraction of rows show ✗ Layer 2 with the same reason (e.g. "N shell descendants of gnome-terminal-server"), pause and decide whether to add a disambiguation strategy before 5b — restoring with the wrong workload would be worse than the current "you relaunch manually" status quo.

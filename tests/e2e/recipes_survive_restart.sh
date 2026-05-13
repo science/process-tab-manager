@@ -139,10 +139,17 @@ if ! grep -q "Group:\*\* mvp-test" "$DUMP_FILE"; then
     exit 1
 fi
 
-# Verification #2: a Tmux binding line referencing $SESSION exists.
-TMUX_BIND_LINE=$(grep "Tmux binding:.*session=.*${SESSION}" "$DUMP_FILE" || true)
+# Verification #2: a Tmux binding line referencing $SESSION appears WITHIN
+# the mvp-test row's block. A broad grep over the whole file would pass even
+# if the binding was on some other row outside the group — the dump emits a
+# binding line per row, and Bug 1 (badge missing after restart for gnome-
+# terminal-server windows) manifests as a None-session inside the mvp-test
+# block specifically. Use sed to slice from the "Group: mvp-test" marker to
+# the next block separator ("---") and grep the binding line inside.
+TMUX_BIND_LINE=$(sed -n '/\*\*Group:\*\* mvp-test/,/^---$/p' "$DUMP_FILE" \
+    | grep "Tmux binding:.*session=.*${SESSION}" || true)
 if [[ -z "$TMUX_BIND_LINE" ]]; then
-    echo "FAIL: no tmux binding for $SESSION in dump"
+    echo "FAIL: no tmux binding for $SESSION inside the mvp-test block"
     exit 1
 fi
 

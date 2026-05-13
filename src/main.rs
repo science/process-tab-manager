@@ -5893,6 +5893,24 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
                         item.custom_prefix = sm.custom_prefix.clone();
                     }
                 }
+                // Bug 1: rebind item.session from the saved recipe when the
+                // first refresh after PTM startup couldn't (e.g. gnome-
+                // terminal-server's many wids share one pid, so
+                // walk_to_window_owner returns None). Gated on the session
+                // still being live so we don't resurrect a ghost binding.
+                if let Some(tmux) = sm.recipe.as_ref().and_then(|r| r.tmux.as_ref()) {
+                    let session_live = app
+                        .live_sessions
+                        .iter()
+                        .any(|(_, name, _)| name == &tmux.session_name);
+                    if session_live {
+                        if let Some(item) = app.items.iter_mut().find(|i| i.wid == wid) {
+                            if item.session.is_none() {
+                                item.session = Some(tmux.session_name.clone());
+                            }
+                        }
+                    }
+                }
             }
             members.push(GroupMember {
                 label: sm.label.clone(),
@@ -8232,6 +8250,151 @@ mod tests {
         // Tier 0a claims wid=200 (session match), ignoring the pid+label
         // corroborator that would otherwise pick wid=100.
         assert_eq!(app.groups[0].members[0].live_wid, Some(200));
+    }
+
+    // ── Session-binding writeback (Bug 1: badge missing after restart) ──
+    //
+    // The first refresh after PTM startup can't bind a gnome-terminal item
+    // to its tmux session: walk_to_window_owner returns None because
+    // gnome-terminal-server's pid maps to many wids. restore_groups still
+    // matches the saved member to the live wid via Tier 0b (pid +
+    // corroborator), but without writing the saved recipe's session_name
+    // back to item.session, the green session badge never appears.
+
+    #[test]
+    fn restore_groups_writes_session_back_via_tier_0b_match() {
+        // Item has session=None (walk_to_window_owner failed). Saved member
+        // matches via Tier 0b (pid + label corroborator) and carries a tmux
+        // recipe naming a live session — writeback restores item.session.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "Terminal", "Gnome-terminal", None, Some(90468));
+        app.live_sessions = vec![("$0".into(), "0".into(), true)];
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "Terminal".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "0".into(),
+                        session_id: None,
+                        pane: "%0".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        let item = app.items.iter().find(|i| i.wid == 100).unwrap();
+        assert_eq!(item.session.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn restore_groups_writes_session_back_via_legacy_tier_match() {
+        // Tier 1 (exact label+class) match path. Item.session is None, recipe
+        // carries a live tmux binding — writeback should still fire.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "Terminal", "Gnome-terminal", None, None);
+        app.live_sessions = vec![("$0".into(), "0".into(), true)];
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "Terminal".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "0".into(),
+                        session_id: None,
+                        pane: "%0".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        let item = app.items.iter().find(|i| i.wid == 100).unwrap();
+        assert_eq!(item.session.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn restore_groups_does_not_write_session_when_session_dead() {
+        // Recipe names session "0" but app.live_sessions is empty (tmux
+        // server was restarted between save and load). Don't resurrect a
+        // ghost binding — item.session stays None.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "Terminal", "Gnome-terminal", None, Some(90468));
+        app.live_sessions = vec![]; // no live sessions
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "Terminal".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "0".into(),
+                        session_id: None,
+                        pane: "%0".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        let item = app.items.iter().find(|i| i.wid == 100).unwrap();
+        assert!(item.session.is_none());
+    }
+
+    #[test]
+    fn restore_groups_does_not_overwrite_existing_item_session() {
+        // Item already has session=Some("0") (claim_pending_spawn or carry-
+        // over got there first). The saved recipe names the same session, so
+        // Tier 0a fires — but the writeback must not redundantly clobber.
+        // Use a different session_id in the recipe so a clobber would be
+        // visible if it happened.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "Terminal", "Gnome-terminal", Some("0"), Some(90468));
+        app.live_sessions = vec![("$0".into(), "0".into(), true)];
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "Terminal".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "0".into(),
+                        session_id: None,
+                        pane: "%0".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        let item = app.items.iter().find(|i| i.wid == 100).unwrap();
+        assert_eq!(item.session.as_deref(), Some("0"));
     }
 
     // ── Property-change classification ──

@@ -2904,6 +2904,213 @@ fn query_tmux_pane(session_name: &str) -> Option<(String, u32)> {
     parse_tmux_pane_query(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// One entry in the SIGUSR1 recipe-snapshot dump. Carries the identity
+/// fields needed for visual alignment alongside the captured recipe.
+#[derive(Debug, Clone)]
+struct RecipeRecord {
+    /// 1-based row number for display.
+    index: usize,
+    /// Group name, or `None` for ungrouped windows.
+    group_name: Option<String>,
+    /// The label PTM shows in the sidebar (including `custom_prefix`).
+    ptm_label: String,
+    /// The raw window title PTM observed last refresh.
+    live_title: String,
+    wm_class: String,
+    wid: u32,
+    pid: Option<u32>,
+    recipe: LaunchRecipe,
+}
+
+/// Build the recipe report from an `App` and a pre-captured `ProcSnapshot`.
+/// Pure with respect to the snapshot and the pre-resolved tmux pane info —
+/// no /proc or tmux IO happens in here.
+fn build_recipe_report(
+    app: &App,
+    snap: &ProcSnapshot,
+    tmux_panes: &HashMap<String, (String, u32)>,
+) -> Vec<RecipeRecord> {
+    let session_ids: HashMap<String, String> = app
+        .live_sessions
+        .iter()
+        .map(|(id, name, _)| (name.clone(), id.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    for row in &app.display_rows {
+        let DisplayRow::Window { wid, group_id } = row else {
+            continue;
+        };
+        let Some(item) = app.items.iter().find(|i| i.wid == *wid) else {
+            continue;
+        };
+        index += 1;
+        let group_name = group_id.and_then(|gid| {
+            app.groups
+                .iter()
+                .find(|g| g.id == gid)
+                .map(|g| g.name.clone())
+        });
+        let recipe = derive_recipe(
+            item.pid,
+            item.session.as_deref(),
+            snap,
+            tmux_panes,
+            &session_ids,
+        );
+        out.push(RecipeRecord {
+            index,
+            group_name,
+            ptm_label: item.display_label(),
+            live_title: item.label.clone(),
+            wm_class: item.wm_class.clone(),
+            wid: item.wid,
+            pid: item.pid,
+            recipe,
+        });
+    }
+    out
+}
+
+/// Render the recipe report as markdown. Pure — takes a pre-formatted
+/// timestamp so tests can pin it. Output is one header block followed by
+/// one vertical block per window, separated by horizontal rules. Each
+/// block leads with a scan-signal summary line (`✓ Layer 1, ✗ Layer 2`)
+/// and breaks out each field for inline review annotation.
+fn format_recipes_markdown(records: &[RecipeRecord], timestamp: &str) -> String {
+    let total = records.len();
+    let mut n_l1 = 0usize;
+    let mut n_job = 0usize;
+    let mut n_idle = 0usize;
+    let mut n_unreachable = 0usize;
+    for r in records {
+        if r.recipe.exe.is_some() || r.recipe.cmdline.is_some() || r.recipe.cwd.is_some() {
+            n_l1 += 1;
+        }
+        match r.recipe.workload {
+            WorkloadCapture::Job { .. } => n_job += 1,
+            WorkloadCapture::Idle => n_idle += 1,
+            WorkloadCapture::Unreachable { .. } => n_unreachable += 1,
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!("# PTM recipe snapshot — {}\n\n", timestamp));
+    out.push_str(&format!("Windows visible: {}\n\n", total));
+    out.push_str(&format!("- Layer 1 captured: {}/{}\n", n_l1, total));
+    out.push_str(&format!(
+        "- Layer 2 captured: {} (Job), {} (Idle), {} (Unreachable)\n\n",
+        n_job, n_idle, n_unreachable
+    ));
+    out.push_str(
+        "Walk each block in sidebar order. Annotate inline with HTML comments \
+         (`<!-- ✗ cwd wrong -->`) and share the file when done.\n",
+    );
+    for r in records {
+        out.push_str("\n---\n\n");
+        out.push_str(&format_recipe_block(r));
+    }
+    out
+}
+
+fn format_recipe_block(r: &RecipeRecord) -> String {
+    let l1_marker = if r.recipe.exe.is_some()
+        || r.recipe.cmdline.is_some()
+        || r.recipe.cwd.is_some()
+    {
+        "✓ Layer 1"
+    } else {
+        "✗ Layer 1 (no /proc data)"
+    };
+    let l2_marker = match &r.recipe.workload {
+        WorkloadCapture::Job { .. } => "✓ Layer 2 (Job)",
+        WorkloadCapture::Idle => "✓ Layer 2 (Idle)",
+        WorkloadCapture::Unreachable { .. } => "✗ Layer 2 unreachable",
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("## {} — {}, {}\n\n", r.index, l1_marker, l2_marker));
+    out.push_str(&format!(
+        "- **Group:** {}\n",
+        r.group_name.as_deref().unwrap_or("(ungrouped)")
+    ));
+    out.push_str(&format!("- **PTM label:** `{}`\n", r.ptm_label));
+    out.push_str(&format!("- **Live title:** `{}`\n", r.live_title));
+    out.push_str(&format!("- **wm_class:** `{}`\n", r.wm_class));
+    out.push_str(&format!("- **wid:** 0x{:08x}\n", r.wid));
+    out.push_str(&format!(
+        "- **pid:** {}\n",
+        r.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string())
+    ));
+    out.push_str("- **Layer 1 (always-safe):**\n");
+    out.push_str(&format!(
+        "  - exe: {}\n",
+        r.recipe
+            .exe
+            .as_deref()
+            .map(|s| format!("`{}`", s))
+            .unwrap_or_else(|| "—".to_string())
+    ));
+    out.push_str(&format!(
+        "  - cmdline: {}\n",
+        r.recipe
+            .cmdline
+            .as_ref()
+            .map(|args| format!("`{}`", args.join(" ")))
+            .unwrap_or_else(|| "—".to_string())
+    ));
+    out.push_str(&format!(
+        "  - cwd: {}\n",
+        r.recipe
+            .cwd
+            .as_deref()
+            .map(|s| format!("`{}`", s))
+            .unwrap_or_else(|| "—".to_string())
+    ));
+    out.push_str("- **Tmux binding:** ");
+    match &r.recipe.tmux {
+        None => out.push_str("none\n"),
+        Some(b) => {
+            let sid = b
+                .session_id
+                .as_deref()
+                .map(|s| format!(" ({})", s))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "session=`{}`{}, pane=`{}`, pane_pid={}\n",
+                b.session_name, sid, b.pane, b.pane_pid
+            ));
+        }
+    }
+    out.push_str("- **Layer 2 (workload):**\n");
+    match &r.recipe.workload {
+        WorkloadCapture::Job { exe, cmdline, cwd } => {
+            out.push_str(&format!(
+                "  - cmdline: `{}`\n",
+                cmdline.join(" ")
+            ));
+            out.push_str(&format!(
+                "  - exe: {}\n",
+                exe.as_deref()
+                    .map(|s| format!("`{}`", s))
+                    .unwrap_or_else(|| "—".to_string())
+            ));
+            out.push_str(&format!(
+                "  - cwd: {}\n",
+                cwd.as_deref()
+                    .map(|s| format!("`{}`", s))
+                    .unwrap_or_else(|| "—".to_string())
+            ));
+        }
+        WorkloadCapture::Idle => {
+            out.push_str("  - shell was at its prompt (tpgid == shell_pid)\n");
+        }
+        WorkloadCapture::Unreachable { reason } => {
+            out.push_str(&format!("  - reason: {}\n", reason));
+        }
+    }
+    out
+}
+
 /// Derive a `LaunchRecipe` from a fully-populated `ProcSnapshot` plus the
 /// per-window inputs. Pure with respect to the snapshot — does no IO.
 ///
@@ -10284,5 +10491,214 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {:?}", other),
         }
+    }
+
+    // ── Phase 5a: markdown renderer ──
+
+    fn mk_record(
+        index: usize,
+        group: Option<&str>,
+        label: &str,
+        recipe: super::LaunchRecipe,
+    ) -> super::RecipeRecord {
+        super::RecipeRecord {
+            index,
+            group_name: group.map(String::from),
+            ptm_label: label.to_string(),
+            live_title: label.to_string(),
+            wm_class: "test".to_string(),
+            wid: 0x123,
+            pid: Some(999),
+            recipe,
+        }
+    }
+
+    fn mk_unreachable_recipe(reason: &str) -> super::LaunchRecipe {
+        super::LaunchRecipe {
+            exe: Some("/usr/bin/firefox".to_string()),
+            cmdline: Some(vec!["firefox".to_string()]),
+            cwd: Some("/home/steve".to_string()),
+            tmux: None,
+            workload: super::WorkloadCapture::Unreachable {
+                reason: reason.to_string(),
+            },
+        }
+    }
+
+    fn mk_job_recipe() -> super::LaunchRecipe {
+        super::LaunchRecipe {
+            exe: Some("/usr/bin/gnome-terminal-server".to_string()),
+            cmdline: Some(vec!["gnome-terminal-server".to_string()]),
+            cwd: Some("/home/steve".to_string()),
+            tmux: Some(super::TmuxBinding {
+                session_name: "ptm-dev".to_string(),
+                session_id: Some("$3".to_string()),
+                pane: "%5".to_string(),
+                pane_pid: 500,
+            }),
+            workload: super::WorkloadCapture::Job {
+                exe: Some("/home/steve/.local/bin/claude".to_string()),
+                cmdline: vec!["claude".to_string()],
+                cwd: Some("/home/steve/dev/process-tab-manager".to_string()),
+            },
+        }
+    }
+
+    fn mk_idle_recipe() -> super::LaunchRecipe {
+        super::LaunchRecipe {
+            exe: Some("/usr/bin/xterm".to_string()),
+            cmdline: Some(vec!["xterm".to_string()]),
+            cwd: Some("/home/steve".to_string()),
+            tmux: None,
+            workload: super::WorkloadCapture::Idle,
+        }
+    }
+
+    #[test]
+    fn format_recipes_markdown_empty_report() {
+        let s = super::format_recipes_markdown(&[], "2026-05-12T14:23:01");
+        assert!(s.contains("# PTM recipe snapshot — 2026-05-12T14:23:01"));
+        assert!(s.contains("Windows visible: 0"));
+        assert!(s.contains("Layer 1 captured: 0/0"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_summary_counts() {
+        let records = vec![
+            mk_record(1, Some("g"), "fox", mk_unreachable_recipe("no shell descendant")),
+            mk_record(2, None, "claude-row", mk_job_recipe()),
+            mk_record(3, None, "term", mk_idle_recipe()),
+        ];
+        let s = super::format_recipes_markdown(&records, "t");
+        assert!(s.contains("Windows visible: 3"));
+        assert!(s.contains("Layer 1 captured: 3/3"));
+        assert!(s.contains("1 (Job), 1 (Idle), 1 (Unreachable)"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_renders_layer1_only_block() {
+        let r = mk_record(
+            1,
+            None,
+            "Firefox",
+            mk_unreachable_recipe("no shell descendant under window pid 999"),
+        );
+        let s = super::format_recipes_markdown(&[r], "t");
+        assert!(s.contains("## 1 — ✓ Layer 1, ✗ Layer 2 unreachable"));
+        assert!(s.contains("**Group:** (ungrouped)"));
+        assert!(s.contains("**PTM label:** `Firefox`"));
+        assert!(s.contains("exe: `/usr/bin/firefox`"));
+        assert!(s.contains("cmdline: `firefox`"));
+        assert!(s.contains("cwd: `/home/steve`"));
+        assert!(s.contains("**Tmux binding:** none"));
+        assert!(s.contains("reason: no shell descendant under window pid 999"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_renders_tmux_job_block() {
+        let r = mk_record(2, Some("ptm-dev"), "claude (ptm)", mk_job_recipe());
+        let s = super::format_recipes_markdown(&[r], "t");
+        assert!(s.contains("## 2 — ✓ Layer 1, ✓ Layer 2 (Job)"));
+        assert!(s.contains("**Group:** ptm-dev"));
+        assert!(s.contains("session=`ptm-dev` ($3), pane=`%5`, pane_pid=500"));
+        // Layer-2 workload details
+        assert!(s.contains("cmdline: `claude`"));
+        assert!(s.contains("exe: `/home/steve/.local/bin/claude`"));
+        assert!(s.contains("cwd: `/home/steve/dev/process-tab-manager`"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_renders_idle_block() {
+        let r = mk_record(3, None, "term", mk_idle_recipe());
+        let s = super::format_recipes_markdown(&[r], "t");
+        assert!(s.contains("## 3 — ✓ Layer 1, ✓ Layer 2 (Idle)"));
+        assert!(s.contains("shell was at its prompt"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_handles_missing_pid() {
+        let mut r = mk_record(1, None, "x", mk_unreachable_recipe("no pid"));
+        r.pid = None;
+        let s = super::format_recipes_markdown(&[r], "t");
+        assert!(s.contains("**pid:** —"));
+    }
+
+    #[test]
+    fn format_recipes_markdown_blocks_separated_by_hr() {
+        let records = vec![
+            mk_record(1, None, "a", mk_idle_recipe()),
+            mk_record(2, None, "b", mk_idle_recipe()),
+        ];
+        let s = super::format_recipes_markdown(&records, "t");
+        // Each block is preceded by a horizontal rule.
+        assert_eq!(s.matches("\n---\n").count(), 2);
+    }
+
+    #[test]
+    fn build_recipe_report_uses_sidebar_order_and_resolves_groups() {
+        let mut app = make_app();
+        app.next_group_id = 0;
+        // Two ungrouped windows + one group of one window.
+        app.items.push(super::Item {
+            wid: 10,
+            label: "alpha".into(),
+            wm_class: "xterm".into(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: None,
+            pid: Some(100),
+        });
+        app.items.push(super::Item {
+            wid: 20,
+            label: "beta".into(),
+            wm_class: "xterm".into(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: None,
+            pid: Some(200),
+        });
+        app.items.push(super::Item {
+            wid: 30,
+            label: "gamma".into(),
+            wm_class: "xterm".into(),
+            accent_pixel: 0,
+            custom_prefix: String::new(),
+            session: None,
+            pid: Some(300),
+        });
+        // Make a group containing wid=30.
+        app.groups.push(super::Group {
+            id: 0,
+            name: "dev".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![super::GroupMember {
+                label: "gamma".into(),
+                wm_class: "xterm".into(),
+                custom_prefix: String::new(),
+                live_wid: Some(30),
+            }],
+        });
+        app.next_group_id = 1;
+        app.display_order = vec![
+            super::DisplaySlot::Group(0),
+            super::DisplaySlot::Window(10),
+            super::DisplaySlot::Window(20),
+        ];
+        app.build_display_rows();
+
+        let snap = super::ProcSnapshot::default();
+        let panes = HashMap::new();
+        let report = super::build_recipe_report(&app, &snap, &panes);
+        // Order is: group's member first (gamma), then ungrouped (alpha, beta).
+        assert_eq!(report.len(), 3);
+        assert_eq!(report[0].ptm_label, "gamma");
+        assert_eq!(report[0].group_name.as_deref(), Some("dev"));
+        assert_eq!(report[1].ptm_label, "alpha");
+        assert!(report[1].group_name.is_none());
+        assert_eq!(report[2].ptm_label, "beta");
+        // Index is 1-based.
+        assert_eq!(report[0].index, 1);
+        assert_eq!(report[2].index, 3);
     }
 }

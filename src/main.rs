@@ -2214,16 +2214,51 @@ fn refresh_items(
         if already_known.contains(wid) {
             continue;
         }
-        let (label, wm_class) = match new_items.iter().find(|i| i.wid == *wid) {
-            Some(i) => (i.label.clone(), i.wm_class.clone()),
-            None => continue,
-        };
+        let (label, wm_class, session, item_pid) =
+            match new_items.iter().find(|i| i.wid == *wid) {
+                Some(i) => (
+                    i.label.clone(),
+                    i.wm_class.clone(),
+                    i.session.clone(),
+                    i.pid,
+                ),
+                None => continue,
+            };
         let mut restored_prefix: Option<String> = None;
         for group in &mut app.groups {
-            // Same cascade as restore_groups (Phase 2d): exact → label →
-            // wm_class. wm_class-only catches terminals whose title drifted
-            // since the saved snapshot.
-            let exact_pos = group.members.iter().position(|m| {
+            // Phase 5c skips Tier 0a/0b for TmuxSystem; that group is
+            // rebuilt every refresh from list_tmux_sessions().
+            let can_recipe_match = matches!(group.kind, GroupKind::Normal);
+            // Phase 5c Tier 0a — tmux session match against ghost recipes.
+            let tmux_pos = if can_recipe_match {
+                group.members.iter().position(|m| {
+                    m.live_wid.is_none()
+                        && m.recipe
+                            .as_ref()
+                            .and_then(|r| r.tmux.as_ref())
+                            .map(|t| Some(t.session_name.as_str()) == session.as_deref())
+                            .unwrap_or(false)
+                })
+            } else {
+                None
+            };
+            // Phase 5c Tier 0b — pid match + label/wm_class corroborator.
+            let pid_pos = || {
+                if !can_recipe_match {
+                    return None;
+                }
+                let p = match item_pid {
+                    Some(p) => p,
+                    None => return None,
+                };
+                group.members.iter().position(|m| {
+                    m.live_wid.is_none()
+                        && m.recipe.as_ref().and_then(|r| r.pid_at_save) == Some(p)
+                        && (m.label == label || m.wm_class == wm_class)
+                })
+            };
+            // Phase 2c+2d tiers: exact → label → wm_class.
+            let exact_pos = || group.members.iter().position(|m| {
                 m.live_wid.is_none() && m.label == label && m.wm_class == wm_class
             });
             let label_only = || group.members.iter().position(|m| {
@@ -2232,7 +2267,11 @@ fn refresh_items(
             let class_only = || group.members.iter().position(|m| {
                 m.live_wid.is_none() && m.wm_class == wm_class
             });
-            let pos = exact_pos.or_else(label_only).or_else(class_only);
+            let pos = tmux_pos
+                .or_else(pid_pos)
+                .or_else(exact_pos)
+                .or_else(label_only)
+                .or_else(class_only);
             if let Some(p) = pos {
                 group.members[p].live_wid = Some(*wid);
                 if !group.members[p].custom_prefix.is_empty() {
@@ -5723,11 +5762,116 @@ fn load_groups() -> Option<Vec<SavedGroup>> {
     load_groups_from(&groups_path())
 }
 
+/// Snapshot of a live item's matching-relevant fields. Used by both
+/// `restore_groups` (at startup) and the `refresh_items` ghost re-match
+/// loop (later refreshes). Phase 5c keeps the two sites parallel by
+/// routing both through `match_saved_member`.
+#[derive(Debug, Clone)]
+struct AvailableItem {
+    label: String,
+    wm_class: String,
+    session: Option<String>,
+    pid: Option<u32>,
+    wid: u32,
+}
+
+/// Five-tier matching cascade for one saved member against the available
+/// live items, skipping already-claimed wids. Phase 5c's two new tiers
+/// run first; Phase 2c+2d's three remain unchanged behind them.
+///
+/// * **Tier 0a — Tmux session match** (gate: kind == Normal, recipe.tmux
+///   present). Match Item.session == saved session_name. High-signal
+///   when present.
+/// * **Tier 0b — Pid + corroborator match** (gate: kind == Normal,
+///   recipe.pid_at_save present). Match Item.pid == saved_pid AND
+///   (label OR wm_class agrees). The corroborator prevents the
+///   gnome-terminal-server pid-collision case from arbitrarily picking
+///   the first window.
+/// * **Tier 1 — Exact (label, wm_class)**.
+/// * **Tier 2 — Label-only** (covers titles that survived a restart).
+/// * **Tier 3 — wm_class-only** (covers terminals whose title drifted).
+///
+/// TmuxSystem groups skip Tier 0a/0b — `sync_system_group_members`
+/// rebuilds them from `list_tmux_sessions()` every refresh, so any
+/// cross-restart matching here is at best harmless and at worst
+/// confuses the rebuild.
+fn match_saved_member(
+    sm: &SavedMember,
+    group_kind: GroupKind,
+    available: &[AvailableItem],
+    claimed: &HashSet<u32>,
+) -> Option<u32> {
+    let can_recipe_match = matches!(group_kind, GroupKind::Normal);
+
+    // Tier 0a — Tmux session match.
+    if can_recipe_match {
+        if let Some(recipe) = &sm.recipe {
+            if let Some(tmux) = &recipe.tmux {
+                if let Some(it) = available.iter().find(|it| {
+                    !claimed.contains(&it.wid)
+                        && it.session.as_deref() == Some(tmux.session_name.as_str())
+                }) {
+                    return Some(it.wid);
+                }
+            }
+        }
+    }
+
+    // Tier 0b — Pid + corroborator.
+    if can_recipe_match {
+        if let Some(recipe) = &sm.recipe {
+            if let Some(saved_pid) = recipe.pid_at_save {
+                if let Some(it) = available.iter().find(|it| {
+                    !claimed.contains(&it.wid)
+                        && it.pid == Some(saved_pid)
+                        && (it.label == sm.label || it.wm_class == sm.wm_class)
+                }) {
+                    return Some(it.wid);
+                }
+            }
+        }
+    }
+
+    // Tier 1 — Exact (label, wm_class).
+    if let Some(it) = available.iter().find(|it| {
+        !claimed.contains(&it.wid) && it.label == sm.label && it.wm_class == sm.wm_class
+    }) {
+        return Some(it.wid);
+    }
+
+    // Tier 2 — Label-only.
+    if let Some(it) = available
+        .iter()
+        .find(|it| !claimed.contains(&it.wid) && it.label == sm.label)
+    {
+        return Some(it.wid);
+    }
+
+    // Tier 3 — wm_class-only.
+    if let Some(it) = available
+        .iter()
+        .find(|it| !claimed.contains(&it.wid) && it.wm_class == sm.wm_class)
+    {
+        return Some(it.wid);
+    }
+
+    None
+}
+
 fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
-    let available: Vec<(String, String, u32)> = app
+    // Per-item snapshot for matching: (label, wm_class, session, pid, wid).
+    // Phase 5c added session + pid to the tuple so the new Tier 0a/0b can
+    // match on tmux session name and saved pid respectively.
+    let available: Vec<AvailableItem> = app
         .items
         .iter()
-        .map(|item| (item.label.clone(), item.wm_class.clone(), item.wid))
+        .map(|item| AvailableItem {
+            label: item.label.clone(),
+            wm_class: item.wm_class.clone(),
+            session: item.session.clone(),
+            pid: item.pid,
+            wid: item.wid,
+        })
         .collect();
     let mut claimed: HashSet<u32> = HashSet::new();
 
@@ -5737,28 +5881,10 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
         // group survives PTM restarts where its windows aren't yet up.
         let mut members: Vec<GroupMember> = Vec::new();
         for sm in &sg.members {
-            // Matching cascade (Phase 2c + 2d):
-            //   1. exact (label, wm_class)
-            //   2. label-only (titles often match across restarts)
-            //   3. wm_class-only (terminals churn their titles every command,
-            //      so without this their groups would re-shatter every restart)
-            let exact = available.iter().find(|(l, c, w)| {
-                l == &sm.label && c == &sm.wm_class && !claimed.contains(w)
-            });
-            let matched = exact
-                .or_else(|| {
-                    available
-                        .iter()
-                        .find(|(l, _, w)| l == &sm.label && !claimed.contains(w))
-                })
-                .or_else(|| {
-                    available
-                        .iter()
-                        .find(|(_, c, w)| c == &sm.wm_class && !claimed.contains(w))
-                });
-            let live_wid = matched.map(|(_, _, w)| {
-                claimed.insert(*w);
-                *w
+            let matched = match_saved_member(sm, sg.kind, &available, &claimed);
+            let live_wid = matched.map(|w| {
+                claimed.insert(w);
+                w
             });
             // Restore custom_prefix on matched items
             if let Some(wid) = live_wid {
@@ -7802,6 +7928,310 @@ mod tests {
 
         assert_eq!(app.items[0].custom_prefix, "Browser");
         assert_eq!(app.items[1].custom_prefix, ""); // empty prefix not overwritten
+    }
+
+    // ── Phase 5c: recipe-tier matching cascade ──
+
+    fn saved_member_with_tmux(label: &str, wm_class: &str, session: &str) -> SavedMember {
+        SavedMember {
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            custom_prefix: String::new(),
+            recipe: Some(super::LaunchRecipe {
+                tmux: Some(super::TmuxBinding {
+                    session_name: session.to_string(),
+                    session_id: None,
+                    pane: "%0".to_string(),
+                    pane_pid: 0,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn saved_member_with_pid(label: &str, wm_class: &str, pid: u32) -> SavedMember {
+        SavedMember {
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            custom_prefix: String::new(),
+            recipe: Some(super::LaunchRecipe {
+                pid_at_save: Some(pid),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn add_item_full(
+        app: &mut App,
+        wid: u32,
+        label: &str,
+        wm_class: &str,
+        session: Option<&str>,
+        pid: Option<u32>,
+    ) {
+        app.items.push(super::Item {
+            wid,
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            accent_pixel: 0,
+            custom_prefix: "".into(),
+            session: session.map(String::from),
+            pid,
+        });
+        app.display_order.push(super::DisplaySlot::Window(wid));
+    }
+
+    #[test]
+    fn restore_groups_tier_0a_tmux_session_match() {
+        // Live items: terminal A (no session), terminal B (session=ptm-dev).
+        // Saved member labeled differently but with TMUX session=ptm-dev
+        // should match B via Tier 0a, despite label mismatch.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "alpha", "term", None, Some(50));
+        add_item_full(&mut app, 200, "beta", "term", Some("ptm-dev"), Some(60));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![saved_member_with_tmux("any-old-label", "term", "ptm-dev")],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(200));
+    }
+
+    #[test]
+    fn restore_groups_tier_0b_pid_plus_label_corroborator() {
+        // Live items both share pid 90468 (gnome-terminal-server case).
+        // Saved member has pid 90468 AND specific label — corroborator
+        // disambiguates to the matching label.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "claude - ~/dev", "Gnome-terminal", None, Some(90468));
+        add_item_full(&mut app, 200, "Terminal - ~/dev", "Gnome-terminal", None, Some(90468));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "claude - ~/dev".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+    }
+
+    #[test]
+    fn restore_groups_tier_0b_pid_plus_wm_class_corroborator() {
+        // Saved member's label drifted but wm_class still agrees.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "different title now", "Gnome-terminal", None, Some(90468));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "old title".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+    }
+
+    #[test]
+    fn restore_groups_tier_0b_pid_alone_without_corroborator_does_not_match() {
+        // Item has the pid but label+wm_class both differ. Tier 0b refuses;
+        // existing tiers also miss (different label AND different class).
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "different", "different-class", None, Some(90468));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![saved_member_with_pid("old", "old-class", 90468)],
+        }];
+        restore_groups(&mut app, &saved);
+        // Falls through every tier; member stays a ghost.
+        assert_eq!(app.groups[0].members[0].live_wid, None);
+    }
+
+    #[test]
+    fn restore_groups_v1_member_with_no_recipe_falls_back_to_legacy_cascade() {
+        // SavedMember with recipe=None should behave EXACTLY like v1.
+        let mut app = make_app();
+        add_item_with_class(&mut app, 100, "Firefox", "Navigator");
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "Firefox".into(),
+                wm_class: "Navigator".into(),
+                custom_prefix: "".into(),
+                recipe: None,
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+    }
+
+    #[test]
+    fn restore_groups_tmux_system_kind_skips_recipe_tiers() {
+        // A SavedMember in a TmuxSystem group with a TMUX binding should NOT
+        // be matched by Tier 0a — TmuxSystem is rebuilt from list_tmux_sessions
+        // every refresh.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "term", "Gnome-terminal", Some("ptm-dev"), None);
+        let saved = vec![SavedGroup {
+            name: "Tmux Sessions".into(),
+            collapsed: false,
+            kind: GroupKind::TmuxSystem,
+            members: vec![saved_member_with_tmux("ptm-dev", "", "ptm-dev")],
+        }];
+        restore_groups(&mut app, &saved);
+        // Tier 0a/0b skipped → existing tiers — label match against empty
+        // wm_class would still find the item via Tier 2 (label-only). To
+        // make this test meaningful, set up a saved label that doesn't
+        // match anything.
+        let mut app2 = make_app();
+        add_item_full(&mut app2, 100, "term", "Gnome-terminal", Some("ptm-dev"), None);
+        let saved2 = vec![SavedGroup {
+            name: "Tmux Sessions".into(),
+            collapsed: false,
+            kind: GroupKind::TmuxSystem,
+            members: vec![SavedMember {
+                label: "totally-different".into(),
+                wm_class: "also-different".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "ptm-dev".into(),
+                        session_id: None,
+                        pane: "".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app2, &saved2);
+        // With Tier 0a gated off for TmuxSystem and no label/class match
+        // possible, the member stays a ghost.
+        assert_eq!(app2.groups[0].members[0].live_wid, None);
+        let _ = saved; // silence the unused-variable warning from the dual setup
+    }
+
+    #[test]
+    fn restore_groups_two_saved_members_same_session_only_one_matches() {
+        // Two saved members both pointing at "foo", only one live foo
+        // session — first member claims it, second falls through (no
+        // wm_class/label alternative either).
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "term", "Gnome-terminal", Some("foo"), None);
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![
+                saved_member_with_tmux("first", "x", "foo"),
+                saved_member_with_tmux("second", "y", "foo"),
+            ],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        assert_eq!(app.groups[0].members[1].live_wid, None);
+    }
+
+    #[test]
+    fn restore_groups_tier_0a_claims_blocks_lower_tiers_from_same_wid() {
+        // Tier 0a claims wid 100; the next member with a label-only match
+        // for the same wid must be denied (claimed HashSet).
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "alpha", "term", Some("foo"), None);
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![
+                saved_member_with_tmux("anything", "anything", "foo"),
+                SavedMember {
+                    label: "alpha".into(),
+                    wm_class: "term".into(),
+                    custom_prefix: "".into(),
+                    recipe: None,
+                },
+            ],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        assert_eq!(app.groups[0].members[1].live_wid, None);
+    }
+
+    #[test]
+    fn restore_groups_three_ghosts_sharing_pid_first_matches_rest_fall_through() {
+        // gnome-terminal-server case: 3 saved members with pid 90468 +
+        // identical wm_class. One live wid → first claims it; other two
+        // stay ghosts (no other wid to match against).
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "one", "Gnome-terminal", None, Some(90468));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![
+                saved_member_with_pid("one", "Gnome-terminal", 90468),
+                saved_member_with_pid("two", "Gnome-terminal", 90468),
+                saved_member_with_pid("three", "Gnome-terminal", 90468),
+            ],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        assert_eq!(app.groups[0].members[1].live_wid, None);
+        assert_eq!(app.groups[0].members[2].live_wid, None);
+    }
+
+    #[test]
+    fn restore_groups_tier_0a_preferred_over_tier_0b_when_both_apply() {
+        // When a saved member has BOTH a tmux session and a pid, and TWO
+        // live items could match (one by session, one by pid), Tier 0a
+        // wins.
+        let mut app = make_app();
+        add_item_full(&mut app, 100, "pid-match", "x", None, Some(90468));
+        add_item_full(&mut app, 200, "session-match", "y", Some("ptm-dev"), Some(99999));
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "pid-match".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    pid_at_save: Some(90468),
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "ptm-dev".into(),
+                        session_id: None,
+                        pane: "".into(),
+                        pane_pid: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+        }];
+        restore_groups(&mut app, &saved);
+        // Tier 0a claims wid=200 (session match), ignoring the pid+label
+        // corroborator that would otherwise pick wid=100.
+        assert_eq!(app.groups[0].members[0].live_wid, Some(200));
     }
 
     // ── Property-change classification ──

@@ -11,3 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 x11rb = { version = "0.13", features = ["extra-traits"] }
+# SIGUSR1 signal handling for the Phase 5a recipe-dump trigger. Tiny,
+# ubiquitous, no transitive risk. Only used by the signal thread; the
+# rest of the code is libc-free.
+libc = "0.2"

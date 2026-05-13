@@ -79,6 +79,9 @@ struct Atoms {
     net_wm_pid: Atom,
     ptm_wake: Atom,
     ptm_save_tick: Atom,
+    /// Wake atom for the Phase 5a recipe-dump trigger (sent by the
+    /// SIGUSR1 thread).
+    ptm_dump_recipes: Atom,
 }
 
 impl Atoms {
@@ -98,6 +101,7 @@ impl Atoms {
         let c12 = conn.intern_atom(false, b"_NET_WM_PID")?;
         let c13 = conn.intern_atom(false, b"_PTM_WAKE")?;
         let c14 = conn.intern_atom(false, b"_PTM_SAVE_TICK")?;
+        let c15 = conn.intern_atom(false, b"_PTM_DUMP_RECIPES")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -114,6 +118,7 @@ impl Atoms {
             net_wm_pid: c12.reply()?.atom,
             ptm_wake: c13.reply()?.atom,
             ptm_save_tick: c14.reply()?.atom,
+            ptm_dump_recipes: c15.reply()?.atom,
         })
     }
 }
@@ -173,6 +178,59 @@ fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::
 /// during pure-idle periods (no X events flowing). Identical mechanism to
 /// `spawn_tmux_poll_thread` but with a distinct atom so the main loop can
 /// avoid the cost of refreshing tmux state on every save tick.
+/// Build a `sigset_t` containing just SIGUSR1 — used both by the
+/// process-wide block (called from main early) and by the sigwait
+/// thread.
+fn sigusr1_set() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+    }
+    set
+}
+
+/// Block SIGUSR1 in the calling thread. Must be called BEFORE any other
+/// threads are spawned so they all inherit the block — otherwise sigwait
+/// in the dedicated thread races with arbitrary signal delivery.
+fn block_sigusr1_process_wide() {
+    let set = sigusr1_set();
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Wake PTM on SIGUSR1 — opens its own X11 connection, loops on sigwait,
+/// and sends a ClientMessage with `dump_atom` to our main window each
+/// time the signal fires. Latency: signal-to-event is essentially zero
+/// (sigwait dequeues immediately, ClientMessage round-trip is sub-ms).
+fn spawn_sigusr1_thread(window: Window, dump_atom: Atom) {
+    std::thread::spawn(move || {
+        let set = sigusr1_set();
+        let Ok((c, _)) = x11rb::connect(None) else {
+            return;
+        };
+        loop {
+            let mut sig: libc::c_int = 0;
+            let rc = unsafe { libc::sigwait(&set, &mut sig) };
+            if rc != 0 || sig != libc::SIGUSR1 {
+                continue;
+            }
+            let data = ClientMessageData::from([0u32; 5]);
+            let ev = ClientMessageEvent {
+                response_type: 33,
+                format: 32,
+                sequence: 0,
+                window,
+                type_: dump_atom,
+                data,
+            };
+            let _ = c.send_event(false, window, EventMask::NO_EVENT, ev);
+            let _ = c.flush();
+        }
+    });
+}
+
 fn spawn_save_tick_thread(window: Window, save_tick_atom: Atom, interval: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(interval);
@@ -2904,6 +2962,69 @@ fn query_tmux_pane(session_name: &str) -> Option<(String, u32)> {
     parse_tmux_pane_query(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Path the SIGUSR1 dump writes to. `$XDG_CACHE_HOME/ptm/recipes-snapshot.md`
+/// if set; otherwise `~/.cache/ptm/recipes-snapshot.md`.
+fn recipe_dump_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME").ok().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.cache", home)
+    });
+    std::path::PathBuf::from(base)
+        .join("ptm")
+        .join("recipes-snapshot.md")
+}
+
+/// Current wall-clock time as `YYYY-MM-DDTHH:MM:SS`. Implemented via the
+/// `date` subprocess to avoid pulling in chrono just for one timestamp.
+/// Returns `"unknown-time"` if `date` isn't available.
+fn current_timestamp() -> String {
+    std::process::Command::new("date")
+        .args(["+%Y-%m-%dT%H:%M:%S"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-time".to_string())
+}
+
+/// Full dump pipeline: capture /proc, query tmux panes for any session
+/// any item is attached to, build the report, render markdown, write to
+/// `recipe_dump_path()`. Idempotent; overwrites any prior dump.
+fn dump_recipes_to_cache(app: &App) {
+    let snap = ProcSnapshot::capture_all();
+    let mut tmux_panes: HashMap<String, (String, u32)> = HashMap::new();
+    let mut seen_sessions: HashSet<String> = HashSet::new();
+    for item in &app.items {
+        if let Some(s) = &item.session {
+            if seen_sessions.insert(s.clone()) {
+                if let Some(p) = query_tmux_pane(s) {
+                    tmux_panes.insert(s.clone(), p);
+                }
+            }
+        }
+    }
+    let records = build_recipe_report(app, &snap, &tmux_panes);
+    let timestamp = current_timestamp();
+    let markdown = format_recipes_markdown(&records, &timestamp);
+    let path = recipe_dump_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, &markdown) {
+        Ok(()) => eprintln!(
+            "[ptm] dumped {} recipes to {}",
+            records.len(),
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "[ptm] failed to write recipe dump to {}: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
 /// One entry in the SIGUSR1 recipe-snapshot dump. Carries the identity
 /// fields needed for visual alignment alongside the captured recipe.
 #[derive(Debug, Clone)]
@@ -5265,6 +5386,13 @@ fn load_geometry_from(path: &std::path::Path) -> Option<(i16, i16, u16, u16)> {
 // ── Main ──
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Block SIGUSR1 process-wide BEFORE any thread spawn, so the dedicated
+    // sigwait thread is the only one that ever sees it. Children inherit
+    // the mask from their parent thread; if we did this after spawning the
+    // tmux poll thread or save-tick thread, the kernel could deliver the
+    // signal to any of them.
+    block_sigusr1_process_wide();
+
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
@@ -5381,6 +5509,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_millis(250),
     );
 
+    // Phase 5a recipe-dump trigger: SIGUSR1 from the user (typically via
+    // `kill -USR1 $(pgrep ptm)`) wakes a dedicated thread that posts a
+    // ClientMessage to the main loop, which then captures /proc + tmux and
+    // writes ~/.cache/ptm/recipes-snapshot.md for visual alignment review.
+    spawn_sigusr1_thread(window, atoms.ptm_dump_recipes);
+
     loop {
         let event = conn.wait_for_event()?;
 
@@ -5416,6 +5550,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.last_drop_highlight = None;
                     }
                 }
+                continue;
+            }
+            if ev.type_ == atoms.ptm_dump_recipes {
+                // Phase 5a SIGUSR1 dump: capture /proc + tmux, write a
+                // markdown report to the cache dir for visual alignment.
+                // Doesn't touch app state or the renderer; safe to fire
+                // mid-gesture.
+                dump_recipes_to_cache(&app);
                 continue;
             }
             if ev.type_ == atoms.ptm_wake {

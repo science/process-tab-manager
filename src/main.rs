@@ -206,6 +206,12 @@ struct Item {
     accent_pixel: u32,
     custom_prefix: String,
     session: Option<String>,
+    /// `_NET_WM_PID` for this window, captured during the refresh that
+    /// first observed it. None when the window doesn't set the property
+    /// (a few exotic apps, but most do). Used by the Phase 5a recipe
+    /// dump path to drive Layer-1 / Layer-2 capture without re-querying
+    /// X11 at dump time.
+    pid: Option<u32>,
 }
 
 impl Item {
@@ -2032,7 +2038,8 @@ fn refresh_items(
             .map(|i| i.custom_prefix.clone())
             .unwrap_or_default();
 
-        if let Some(pid) = get_window_pid(conn, wid, atoms) {
+        let pid_opt = get_window_pid(conn, wid, atoms);
+        if let Some(pid) = pid_opt {
             pid_to_wid.entry(pid).or_insert_with(Vec::new).push(wid);
         }
 
@@ -2043,6 +2050,7 @@ fn refresh_items(
             accent_pixel,
             custom_prefix,
             session: None,
+            pid: pid_opt,
         });
     }
 
@@ -2806,6 +2814,188 @@ fn find_foreground_pid(shell_pid: u32, tree: &ProcTree) -> ForegroundLookup {
                 tpgid
             ),
         },
+    }
+}
+
+/// Bundle of `/proc`-derived data needed to derive recipes without any
+/// further IO. The `tree` carries the parent/tpgid graph; `exes`,
+/// `cmdlines`, `cwds` are per-pid maps populated alongside the tree.
+/// A `None` value in any map means the file was unreadable (process
+/// exited, sandboxed, suid binary).
+#[derive(Debug, Clone, Default)]
+struct ProcSnapshot {
+    tree: ProcTree,
+    exes: HashMap<u32, Option<String>>,
+    cmdlines: HashMap<u32, Option<Vec<String>>>,
+    cwds: HashMap<u32, Option<String>>,
+}
+
+impl ProcSnapshot {
+    /// Read every numeric directory under `/proc` for stat + exe + cmdline
+    /// + cwd. Cost is ~3 syscalls × pid-count; with a few hundred processes
+    /// that's a handful of milliseconds. Called only on the SIGUSR1 dump
+    /// path, not during normal refresh.
+    fn capture_all() -> Self {
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(d) => d,
+            Err(_) => return Self::default(),
+        };
+        let mut snap = Self::default();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            if !name_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(pid) = name_str.parse::<u32>() else { continue };
+            let stat_path = entry.path().join("stat");
+            let Ok(stat_content) = std::fs::read_to_string(&stat_path) else { continue };
+            let Some(stat) = parse_proc_stat_fields(&stat_content) else { continue };
+            snap.tree.stats.insert(stat.pid, stat);
+            snap.exes.insert(pid, read_proc_exe(pid));
+            snap.cmdlines.insert(pid, read_proc_cmdline(pid));
+            snap.cwds.insert(pid, read_proc_cwd(pid));
+        }
+        snap
+    }
+}
+
+fn read_proc_exe(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{}/exe", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn read_proc_cmdline(pid: u32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    Some(parse_proc_cmdline(&bytes))
+}
+
+fn read_proc_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{}/cwd", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Parse the output of
+/// `tmux display-message -p -t <session> '#{pane_id} #{pane_pid}'`
+/// into the pane id (e.g. `"%5"`) and the pane's shell pid.
+fn parse_tmux_pane_query(s: &str) -> Option<(String, u32)> {
+    let mut parts = s.trim().split_whitespace();
+    let pane = parts.next()?.to_string();
+    let pid: u32 = parts.next()?.parse().ok()?;
+    Some((pane, pid))
+}
+
+fn query_tmux_pane(session_name: &str) -> Option<(String, u32)> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            session_name,
+            "#{pane_id} #{pane_pid}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_tmux_pane_query(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Derive a `LaunchRecipe` from a fully-populated `ProcSnapshot` plus the
+/// per-window inputs. Pure with respect to the snapshot — does no IO.
+///
+/// `tmux_panes` maps tmux session name → (pane id, pane shell pid).
+/// `session_ids` maps tmux session name → `#{session_id}` (e.g. `"$3"`).
+fn derive_recipe(
+    window_pid: Option<u32>,
+    session: Option<&str>,
+    snap: &ProcSnapshot,
+    tmux_panes: &HashMap<String, (String, u32)>,
+    session_ids: &HashMap<String, String>,
+) -> LaunchRecipe {
+    // Layer 1: window pid's exe/cmdline/cwd.
+    let exe = window_pid.and_then(|p| snap.exes.get(&p).cloned()).flatten();
+    let cmdline = window_pid
+        .and_then(|p| snap.cmdlines.get(&p).cloned())
+        .flatten();
+    let cwd = window_pid.and_then(|p| snap.cwds.get(&p).cloned()).flatten();
+
+    // tmux binding, if this window is attached.
+    let tmux = session.and_then(|name| {
+        tmux_panes
+            .get(name)
+            .map(|(pane, pane_pid)| TmuxBinding {
+                session_name: name.to_string(),
+                session_id: session_ids.get(name).cloned(),
+                pane: pane.clone(),
+                pane_pid: *pane_pid,
+            })
+    });
+
+    // Layer 2: workload.
+    let shell_pid_result: Result<u32, WorkloadCapture> = if let Some(b) = &tmux {
+        // tmux's pane_pid IS the shell pid; skip the descendant search.
+        if snap.tree.get(b.pane_pid).is_some() {
+            Ok(b.pane_pid)
+        } else {
+            Err(WorkloadCapture::Unreachable {
+                reason: format!(
+                    "tmux pane pid {} not in /proc snapshot (race?)",
+                    b.pane_pid
+                ),
+            })
+        }
+    } else {
+        match window_pid {
+            None => Err(WorkloadCapture::Unreachable {
+                reason: "window has no _NET_WM_PID".to_string(),
+            }),
+            Some(p) => match find_window_shell(p, &snap.tree) {
+                ShellLookup::Found(s) => Ok(s),
+                ShellLookup::Multiple(pids) => Err(WorkloadCapture::Unreachable {
+                    reason: format!(
+                        "{} shell descendants under window pid {} — can't disambiguate from /proc alone (typical with gnome-terminal-server)",
+                        pids.len(),
+                        p
+                    ),
+                }),
+                ShellLookup::NotFound => Err(WorkloadCapture::Unreachable {
+                    reason: format!(
+                        "no shell descendant under window pid {}; either the window doesn't host a shell or capture is racing process startup",
+                        p
+                    ),
+                }),
+            },
+        }
+    };
+
+    let workload = match shell_pid_result {
+        Err(unreachable) => unreachable,
+        Ok(shell_pid) => match find_foreground_pid(shell_pid, &snap.tree) {
+            ForegroundLookup::Idle => WorkloadCapture::Idle,
+            ForegroundLookup::Found(job_pid) => WorkloadCapture::Job {
+                exe: snap.exes.get(&job_pid).cloned().flatten(),
+                cmdline: snap
+                    .cmdlines
+                    .get(&job_pid)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default(),
+                cwd: snap.cwds.get(&job_pid).cloned().flatten(),
+            },
+            ForegroundLookup::NotFound { reason } => WorkloadCapture::Unreachable { reason },
+        },
+    };
+
+    LaunchRecipe {
+        exe,
+        cmdline,
+        cwd,
+        tmux,
+        workload,
     }
 }
 
@@ -5604,6 +5794,7 @@ mod tests {
             accent_pixel: 0,
             custom_prefix: String::new(),
             session: None,
+            pid: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -6272,6 +6463,7 @@ mod tests {
             accent_pixel: 0,
             custom_prefix: String::new(),
             session: None,
+            pid: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -7109,6 +7301,7 @@ mod tests {
             accent_pixel: 0,
             custom_prefix: String::new(),
             session: None,
+            pid: None,
         }
     }
 
@@ -7282,6 +7475,7 @@ mod tests {
             accent_pixel: 0,
             custom_prefix: String::new(),
             session: session.map(String::from),
+            pid: None,
         }
     }
 
@@ -8706,6 +8900,7 @@ mod tests {
             accent_pixel: 0,
             custom_prefix: String::new(),
             session: Some(session.to_string()),
+            pid: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
         app.build_display_rows();
@@ -9874,5 +10069,220 @@ mod tests {
             super::find_foreground_pid(200, &tree),
             super::ForegroundLookup::NotFound { .. }
         ));
+    }
+
+    // ── Phase 5a: tmux pane parse + recipe orchestrator ──
+
+    #[test]
+    fn parse_tmux_pane_query_basic() {
+        assert_eq!(
+            super::parse_tmux_pane_query("%5 472890\n"),
+            Some(("%5".to_string(), 472890))
+        );
+    }
+
+    #[test]
+    fn parse_tmux_pane_query_no_trailing_newline() {
+        assert_eq!(
+            super::parse_tmux_pane_query("%0 100"),
+            Some(("%0".to_string(), 100))
+        );
+    }
+
+    #[test]
+    fn parse_tmux_pane_query_rejects_garbage() {
+        assert_eq!(super::parse_tmux_pane_query(""), None);
+        assert_eq!(super::parse_tmux_pane_query("%5"), None);
+        assert_eq!(super::parse_tmux_pane_query("%5 notapid"), None);
+    }
+
+    fn snap_with(stats: Vec<super::ProcStat>) -> super::ProcSnapshot {
+        super::ProcSnapshot {
+            tree: super::ProcTree {
+                stats: stats.into_iter().map(|s| (s.pid, s)).collect(),
+            },
+            exes: HashMap::new(),
+            cmdlines: HashMap::new(),
+            cwds: HashMap::new(),
+        }
+    }
+
+    fn snap_set_details(snap: &mut super::ProcSnapshot, pid: u32, exe: &str, cmdline: &[&str], cwd: &str) {
+        snap.exes.insert(pid, Some(exe.to_string()));
+        snap.cmdlines.insert(
+            pid,
+            Some(cmdline.iter().map(|s| s.to_string()).collect()),
+        );
+        snap.cwds.insert(pid, Some(cwd.to_string()));
+    }
+
+    #[test]
+    fn derive_recipe_layer1_only_no_shell_descendants() {
+        // A pure GUI app (e.g. firefox) — window pid has Layer-1 data but
+        // no shell underneath. Workload is Unreachable("no shell ...").
+        let mut snap = snap_with(vec![mk_stat(100, "firefox", 1, None)]);
+        snap_set_details(&mut snap, 100, "/usr/lib/firefox/firefox", &["firefox"], "/home/steve");
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        assert_eq!(rec.exe, Some("/usr/lib/firefox/firefox".to_string()));
+        assert_eq!(rec.cmdline, Some(vec!["firefox".to_string()]));
+        assert_eq!(rec.cwd, Some("/home/steve".to_string()));
+        assert!(rec.tmux.is_none());
+        match rec.workload {
+            super::WorkloadCapture::Unreachable { reason } => {
+                assert!(reason.contains("no shell descendant"), "got: {}", reason);
+            }
+            other => panic!("expected Unreachable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_recipe_non_tmux_idle_shell() {
+        // xterm → bash (idle). Layer-2 = Idle.
+        let mut snap = snap_with(vec![
+            mk_stat(100, "xterm", 1, Some(100)),
+            mk_stat(200, "bash", 100, Some(200)),
+        ]);
+        snap_set_details(&mut snap, 100, "/usr/bin/xterm", &["xterm"], "/home/steve");
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        assert_eq!(rec.workload, super::WorkloadCapture::Idle);
+    }
+
+    #[test]
+    fn derive_recipe_non_tmux_with_foreground_claude() {
+        // xterm → bash running claude.
+        let mut snap = snap_with(vec![
+            mk_stat(100, "xterm", 1, Some(100)),
+            mk_stat(200, "bash", 100, Some(300)),
+            mk_stat(300, "claude", 200, Some(300)),
+        ]);
+        snap_set_details(&mut snap, 100, "/usr/bin/xterm", &["xterm"], "/home/steve");
+        snap_set_details(
+            &mut snap,
+            300,
+            "/home/steve/.local/bin/claude",
+            &["claude"],
+            "/home/steve/dev/process-tab-manager",
+        );
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        match rec.workload {
+            super::WorkloadCapture::Job { exe, cmdline, cwd } => {
+                assert_eq!(exe, Some("/home/steve/.local/bin/claude".to_string()));
+                assert_eq!(cmdline, vec!["claude".to_string()]);
+                assert_eq!(cwd, Some("/home/steve/dev/process-tab-manager".to_string()));
+            }
+            other => panic!("expected Job, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_recipe_tmux_uses_pane_pid_not_window_descendants() {
+        // The window pid is gnome-terminal-server (with many shells under
+        // it — we'd get ShellLookup::Multiple), but because we have a tmux
+        // pane binding, we bypass the descendant search entirely and use
+        // pane_pid directly as the shell pid. This is THE critical test
+        // for the tmux happy path.
+        let mut snap = snap_with(vec![
+            // GUI parent with multiple shell children — would be ambiguous
+            // if we walked descendants.
+            mk_stat(50, "gnome-terminal-server", 1, None),
+            mk_stat(201, "bash", 50, Some(201)),
+            mk_stat(202, "bash", 50, Some(202)),
+            // Separately, a tmux session whose shell is pid 500.
+            mk_stat(400, "tmux: server", 1, None),
+            mk_stat(500, "bash", 400, Some(600)),
+            mk_stat(600, "claude", 500, Some(600)),
+        ]);
+        snap_set_details(&mut snap, 50, "/usr/bin/gnome-terminal-server", &["gnome-terminal-server"], "/home/steve");
+        snap_set_details(&mut snap, 600, "/home/steve/.local/bin/claude", &["claude"], "/home/steve/dev/process-tab-manager");
+
+        let mut panes = HashMap::new();
+        panes.insert("ptm-dev".to_string(), ("%5".to_string(), 500));
+        let mut ids = HashMap::new();
+        ids.insert("ptm-dev".to_string(), "$3".to_string());
+
+        let rec = super::derive_recipe(Some(50), Some("ptm-dev"), &snap, &panes, &ids);
+        let tmux = rec.tmux.expect("tmux binding should be populated");
+        assert_eq!(tmux.session_name, "ptm-dev");
+        assert_eq!(tmux.session_id, Some("$3".to_string()));
+        assert_eq!(tmux.pane, "%5");
+        assert_eq!(tmux.pane_pid, 500);
+        match rec.workload {
+            super::WorkloadCapture::Job { cmdline, .. } => {
+                assert_eq!(cmdline, vec!["claude".to_string()]);
+            }
+            other => panic!("expected Job, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_recipe_tmux_with_idle_shell() {
+        // tmux pane's shell is at its prompt.
+        let snap = snap_with(vec![
+            mk_stat(500, "bash", 400, Some(500)),
+            mk_stat(400, "tmux: server", 1, None),
+        ]);
+        let mut panes = HashMap::new();
+        panes.insert("idle".to_string(), ("%1".to_string(), 500));
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(None, Some("idle"), &snap, &panes, &ids);
+        assert_eq!(rec.workload, super::WorkloadCapture::Idle);
+    }
+
+    #[test]
+    fn derive_recipe_session_but_no_pane_info() {
+        // Item is bound to a session but the tmux query produced nothing
+        // for it (session vanished mid-capture, or tmux is gone). tmux
+        // binding is None, and we fall back to the descendant walk.
+        let snap = snap_with(vec![mk_stat(100, "gnome-terminal", 1, Some(100))]);
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(Some(100), Some("ghost"), &snap, &panes, &ids);
+        assert!(rec.tmux.is_none(), "no pane info → no binding");
+        // No shell child of pid 100 → Unreachable.
+        assert!(matches!(rec.workload, super::WorkloadCapture::Unreachable { .. }));
+    }
+
+    #[test]
+    fn derive_recipe_ambiguous_shells_marks_unreachable() {
+        let snap = snap_with(vec![
+            mk_stat(100, "gnome-terminal-server", 1, None),
+            mk_stat(200, "bash", 100, Some(200)),
+            mk_stat(300, "bash", 100, Some(300)),
+            mk_stat(400, "zsh", 100, Some(400)),
+        ]);
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        match rec.workload {
+            super::WorkloadCapture::Unreachable { reason } => {
+                assert!(reason.contains("3 shell descendants"), "got: {}", reason);
+                assert!(reason.contains("disambiguate"), "got: {}", reason);
+            }
+            other => panic!("expected Unreachable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_recipe_no_window_pid_yields_empty_layer1() {
+        let snap = super::ProcSnapshot::default();
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(None, None, &snap, &panes, &ids);
+        assert!(rec.exe.is_none());
+        assert!(rec.cmdline.is_none());
+        assert!(rec.cwd.is_none());
+        assert!(rec.tmux.is_none());
+        match rec.workload {
+            super::WorkloadCapture::Unreachable { reason } => {
+                assert!(reason.contains("no _NET_WM_PID"), "got: {}", reason);
+            }
+            other => panic!("expected Unreachable, got {:?}", other),
+        }
     }
 }

@@ -2567,6 +2567,182 @@ fn walk_to_window_owner(
     None
 }
 
+// ── Phase 5a: Recipe capture ──
+//
+// Stage E Phase 5a observes — for every visible window — the information
+// PTM would need to relaunch it after a reboot: the controlling executable
+// (Layer 1) and the foreground job running inside any wrapping shell or
+// tmux pane (Layer 2). 5a does NOT persist or restore anything yet; the
+// data is dumped on SIGUSR1 to a markdown file the user reviews against
+// the live sidebar to judge whether capture is correct enough to commit
+// to 5b–5f.
+//
+// All parsing and tree-walking is pure: the IO layer (read /proc, fork
+// tmux) is separated so the orchestrator can be unit-tested against
+// synthetic ProcTrees.
+
+/// One row from `/proc/<pid>/stat`, fields we care about. Field 2 (`comm`)
+/// is the kernel-truncated argv[0] (15 chars max, no path); it may contain
+/// arbitrary characters including embedded parentheses and spaces because
+/// userspace gets to pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcStat {
+    pid: u32,
+    comm: String,
+    ppid: u32,
+    /// Foreground process group id on the controlling terminal. `None`
+    /// when the process has no controlling tty (kernel reports `-1`,
+    /// which we surface as `None` rather than `u32::MAX`).
+    tpgid: Option<u32>,
+}
+
+/// Snapshot of `/proc/*/stat` for the descendants of a set of root pids.
+/// Pure data container — populated by `ProcTree::from_proc` (IO) or by
+/// tests directly. All tree-walking is `&self`.
+#[derive(Debug, Clone, Default)]
+struct ProcTree {
+    stats: HashMap<u32, ProcStat>,
+}
+
+impl ProcTree {
+    /// Direct children of `pid`. O(N) scan; the snapshot is small (typically
+    /// a few hundred pids at most) so this is fine.
+    fn children_of(&self, pid: u32) -> Vec<&ProcStat> {
+        let mut out: Vec<&ProcStat> = self.stats.values().filter(|s| s.ppid == pid).collect();
+        out.sort_by_key(|s| s.pid);
+        out
+    }
+
+    fn get(&self, pid: u32) -> Option<&ProcStat> {
+        self.stats.get(&pid)
+    }
+}
+
+/// Recipe captured from `/proc` for a single window. Layer 1 is the
+/// window's own controlling process; Layer 2 is the foreground job
+/// running inside any wrapping shell or tmux pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchRecipe {
+    /// `/proc/<window_pid>/exe`. None when unreadable.
+    exe: Option<String>,
+    /// `/proc/<window_pid>/cmdline`, NUL-split. `Some(empty)` means kernel
+    /// thread / zombie; `None` means the file was unreadable.
+    cmdline: Option<Vec<String>>,
+    /// `/proc/<window_pid>/cwd`. None when unreadable.
+    cwd: Option<String>,
+    /// Populated when the window is wrapped in a tmux session (per
+    /// `Item::session`). The pane id and pane pid come from
+    /// `tmux display-message`.
+    tmux: Option<TmuxBinding>,
+    workload: WorkloadCapture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxBinding {
+    session_name: String,
+    /// `#{session_id}` (e.g. `"$3"`). Looked up from `App::session_origins`
+    /// keys via the live sessions snapshot.
+    session_id: Option<String>,
+    /// `#{pane_id}` (e.g. `"%5"`) of the session's currently active pane.
+    pane: String,
+    pane_pid: u32,
+}
+
+/// Outcome of looking for the foreground job inside a window's wrapping
+/// shell. Strict per OQ-E8: we do not guess when the capture is ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkloadCapture {
+    Job {
+        exe: Option<String>,
+        cmdline: Vec<String>,
+        cwd: Option<String>,
+    },
+    /// `tpgid == shell_pid` — the shell itself owns the foreground process
+    /// group, i.e. nothing is running, the shell is at its prompt.
+    Idle,
+    /// Couldn't capture. `reason` is human-readable text for the dump so
+    /// reviewers can tell apart "no shell descendant found" from "ambiguous
+    /// shell parentage" from "tmux pane query failed".
+    Unreachable { reason: String },
+}
+
+/// Outcome of walking down from a window pid in search of a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellLookup {
+    /// Exactly one shell descendant — unambiguously the one we want.
+    Found(u32),
+    /// Multiple shell descendants in the subtree (e.g. gnome-terminal-server
+    /// hosting many windows under one pid). We don't have enough info from
+    /// `/proc` alone to pick which one belongs to this window.
+    Multiple(Vec<u32>),
+    /// No shell descendant in the subtree.
+    NotFound,
+}
+
+/// Outcome of looking up the foreground job leader inside a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForegroundLookup {
+    /// Pid of the foreground process group leader (i.e. the process whose
+    /// `pid == shell.tpgid`).
+    Found(u32),
+    /// Shell was idle (`shell.tpgid == shell.pid`).
+    Idle,
+    /// Couldn't find the foreground leader. `reason` differentiates the
+    /// several "we don't know" cases for the dump.
+    NotFound { reason: String },
+}
+
+// ── Stubs (RED commit) — bodies land in the next commit. ──
+
+/// Parse one line of `/proc/<pid>/stat` into the fields we use. Returns
+/// `None` if the line is too short or any required numeric field doesn't
+/// parse. The `comm` field (second field, paren-wrapped) may contain
+/// arbitrary characters including parens and spaces — split on the LAST
+/// `)` to find its end, then parse the trailing space-separated fields.
+fn parse_proc_stat_fields(s: &str) -> Option<ProcStat> {
+    // STUB: implemented in the next commit.
+    let _ = s;
+    None
+}
+
+/// Split `/proc/<pid>/cmdline` (NUL-separated argv) into a Vec. Trailing
+/// NULs are dropped (kernel threads sometimes report `\0`).
+fn parse_proc_cmdline(bytes: &[u8]) -> Vec<String> {
+    // STUB: implemented in the next commit.
+    let _ = bytes;
+    Vec::new()
+}
+
+/// True when `argv0` (or its basename) names a known shell binary. Also
+/// strips a leading `-` (login-shell convention: `-bash`, `-zsh`).
+fn is_shell_argv0(argv0: &str) -> bool {
+    // STUB: implemented in the next commit.
+    let _ = argv0;
+    false
+}
+
+/// Walk DOWN from `window_pid` through `tree`, collecting all descendants
+/// whose `comm` is a known shell. Returns Single/Multiple/None per the
+/// disambiguation policy (strict: never guess).
+fn find_window_shell(window_pid: u32, tree: &ProcTree) -> ShellLookup {
+    // STUB: implemented in the next commit.
+    let _ = window_pid;
+    let _ = tree;
+    ShellLookup::NotFound
+}
+
+/// Look up the foreground job leader given a shell's pid. Reads
+/// `shell.tpgid` and finds the matching process in `tree`. Strict — no
+/// heuristic; if anything is ambiguous, returns `NotFound { reason }`.
+fn find_foreground_pid(shell_pid: u32, tree: &ProcTree) -> ForegroundLookup {
+    // STUB: implemented in the next commit.
+    let _ = shell_pid;
+    let _ = tree;
+    ForegroundLookup::NotFound {
+        reason: "stub".to_string(),
+    }
+}
+
 // True if there's already an in-flight attach for the same session. Used
 // to debounce rapid repeat clicks on an orphan row — otherwise every
 // click spawns another terminal while we wait for the first spawn's
@@ -9394,5 +9570,243 @@ mod tests {
             super::session_origin_for_name("0", &sessions, &origins),
             "0"
         );
+    }
+
+    // ── Phase 5a: /proc parsing + tree-walking helpers (RED-first) ──
+
+    fn mk_stat(pid: u32, comm: &str, ppid: u32, tpgid: Option<u32>) -> super::ProcStat {
+        super::ProcStat {
+            pid,
+            comm: comm.to_string(),
+            ppid,
+            tpgid,
+        }
+    }
+
+    fn mk_tree(stats: Vec<super::ProcStat>) -> super::ProcTree {
+        super::ProcTree {
+            stats: stats.into_iter().map(|s| (s.pid, s)).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_proc_stat_fields_basic() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid flags ...
+        // Real-world example from Linux 6.x; tpgid is the 8th field.
+        let s = "1234 (bash) S 1000 1234 1234 34816 1500 4194304 …\n";
+        let p = super::parse_proc_stat_fields(s).expect("should parse");
+        assert_eq!(p.pid, 1234);
+        assert_eq!(p.comm, "bash");
+        assert_eq!(p.ppid, 1000);
+        assert_eq!(p.tpgid, Some(1500));
+    }
+
+    #[test]
+    fn parse_proc_stat_fields_with_parens_in_comm() {
+        // Userspace can name a process anything — embedded parens defeat
+        // a naive `split_whitespace` parse. Splitting on the LAST `)`
+        // recovers cleanly.
+        let s = "9 (my (proc) name) S 1 9 9 0 -1 4194304\n";
+        let p = super::parse_proc_stat_fields(s).expect("should parse despite parens");
+        assert_eq!(p.pid, 9);
+        assert_eq!(p.comm, "my (proc) name");
+        assert_eq!(p.ppid, 1);
+        assert_eq!(p.tpgid, None, "-1 tpgid means no controlling tty");
+    }
+
+    #[test]
+    fn parse_proc_stat_fields_with_space_in_comm() {
+        let s = "42 (Web Content) S 100 42 42 0 200 4194304\n";
+        let p = super::parse_proc_stat_fields(s).expect("space-in-comm should parse");
+        assert_eq!(p.comm, "Web Content");
+        assert_eq!(p.ppid, 100);
+        assert_eq!(p.tpgid, Some(200));
+    }
+
+    #[test]
+    fn parse_proc_stat_fields_returns_none_on_no_closing_paren() {
+        // Lines without `)` are malformed (real /proc never produces them
+        // but defensive code stays defensive).
+        assert!(super::parse_proc_stat_fields("garbage with no paren").is_none());
+    }
+
+    #[test]
+    fn parse_proc_stat_fields_returns_none_on_too_few_fields() {
+        let s = "1 (init)\n";
+        assert!(super::parse_proc_stat_fields(s).is_none());
+    }
+
+    #[test]
+    fn parse_proc_cmdline_basic() {
+        let bytes = b"bash\0-c\0claude\0";
+        assert_eq!(
+            super::parse_proc_cmdline(bytes),
+            vec!["bash".to_string(), "-c".to_string(), "claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_proc_cmdline_single_arg() {
+        let bytes = b"claude\0";
+        assert_eq!(super::parse_proc_cmdline(bytes), vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn parse_proc_cmdline_no_trailing_null() {
+        // Some processes don't terminate the last arg with NUL.
+        let bytes = b"claude";
+        assert_eq!(super::parse_proc_cmdline(bytes), vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn parse_proc_cmdline_empty_is_empty_vec() {
+        assert!(super::parse_proc_cmdline(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_proc_cmdline_only_nulls_is_empty_vec() {
+        assert!(super::parse_proc_cmdline(b"\0\0").is_empty());
+    }
+
+    #[test]
+    fn is_shell_argv0_recognizes_common_shells() {
+        for name in &["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"] {
+            assert!(super::is_shell_argv0(name), "{} should be recognized", name);
+        }
+    }
+
+    #[test]
+    fn is_shell_argv0_recognizes_login_dash_prefix() {
+        // Login shells exec with argv[0] = "-bash" / "-zsh" / etc.
+        assert!(super::is_shell_argv0("-bash"));
+        assert!(super::is_shell_argv0("-zsh"));
+    }
+
+    #[test]
+    fn is_shell_argv0_recognizes_basename_form() {
+        // /proc/<pid>/stat's comm is the basename. But callers may also
+        // pass the full path from cmdline[0]; basename it before matching.
+        assert!(super::is_shell_argv0("/usr/bin/bash"));
+        assert!(super::is_shell_argv0("/bin/zsh"));
+    }
+
+    #[test]
+    fn is_shell_argv0_rejects_non_shells() {
+        for name in &["claude", "vim", "tmux", "node", "python3", "gnome-terminal-server"] {
+            assert!(!super::is_shell_argv0(name), "{} should not match", name);
+        }
+    }
+
+    #[test]
+    fn is_shell_argv0_empty_is_not_shell() {
+        assert!(!super::is_shell_argv0(""));
+    }
+
+    #[test]
+    fn find_window_shell_single_direct_chain() {
+        // window_pid 100 → bash 200.
+        let tree = mk_tree(vec![
+            mk_stat(100, "xterm", 1, Some(100)),
+            mk_stat(200, "bash", 100, Some(200)),
+        ]);
+        assert_eq!(super::find_window_shell(100, &tree), super::ShellLookup::Found(200));
+    }
+
+    #[test]
+    fn find_window_shell_grandchild() {
+        // window_pid 100 → some-wrapper 150 → bash 200.
+        let tree = mk_tree(vec![
+            mk_stat(100, "gnome-terminal", 1, Some(100)),
+            mk_stat(150, "wrapper", 100, Some(150)),
+            mk_stat(200, "bash", 150, Some(200)),
+        ]);
+        assert_eq!(super::find_window_shell(100, &tree), super::ShellLookup::Found(200));
+    }
+
+    #[test]
+    fn find_window_shell_multiple_shells_returns_all() {
+        // gnome-terminal-server has many shells under it; can't tell which
+        // belongs to which window from /proc alone.
+        let tree = mk_tree(vec![
+            mk_stat(100, "gnome-terminal-server", 1, Some(100)),
+            mk_stat(200, "bash", 100, Some(200)),
+            mk_stat(300, "bash", 100, Some(300)),
+            mk_stat(400, "zsh", 100, Some(400)),
+        ]);
+        match super::find_window_shell(100, &tree) {
+            super::ShellLookup::Multiple(pids) => {
+                let mut sorted = pids.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![200, 300, 400]);
+            }
+            other => panic!("expected Multiple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn find_window_shell_no_shell_in_subtree() {
+        // No shells, only a wrapper.
+        let tree = mk_tree(vec![
+            mk_stat(100, "firefox", 1, None),
+            mk_stat(150, "Web Content", 100, None),
+        ]);
+        assert_eq!(super::find_window_shell(100, &tree), super::ShellLookup::NotFound);
+    }
+
+    #[test]
+    fn find_window_shell_window_pid_missing_from_tree() {
+        let tree = mk_tree(vec![mk_stat(200, "bash", 1, Some(200))]);
+        assert_eq!(super::find_window_shell(999, &tree), super::ShellLookup::NotFound);
+    }
+
+    #[test]
+    fn find_foreground_pid_idle() {
+        // Shell's tpgid points at itself → shell is the foreground process
+        // group → nothing else is running.
+        let tree = mk_tree(vec![mk_stat(200, "bash", 100, Some(200))]);
+        assert_eq!(super::find_foreground_pid(200, &tree), super::ForegroundLookup::Idle);
+    }
+
+    #[test]
+    fn find_foreground_pid_with_job() {
+        // bash (200) running claude (300). claude's pid == bash's tpgid.
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(300)),
+            mk_stat(300, "claude", 200, Some(300)),
+        ]);
+        assert_eq!(
+            super::find_foreground_pid(200, &tree),
+            super::ForegroundLookup::Found(300)
+        );
+    }
+
+    #[test]
+    fn find_foreground_pid_no_controlling_tty() {
+        let tree = mk_tree(vec![mk_stat(200, "bash", 100, None)]);
+        match super::find_foreground_pid(200, &tree) {
+            super::ForegroundLookup::NotFound { reason } => {
+                assert!(reason.to_lowercase().contains("tty") || reason.to_lowercase().contains("tpgid"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn find_foreground_pid_tpgid_points_to_unknown_process() {
+        // tpgid 9999 doesn't exist in the tree (race with process exit).
+        let tree = mk_tree(vec![mk_stat(200, "bash", 100, Some(9999))]);
+        assert!(matches!(
+            super::find_foreground_pid(200, &tree),
+            super::ForegroundLookup::NotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn find_foreground_pid_shell_missing_from_tree() {
+        let tree = mk_tree(vec![]);
+        assert!(matches!(
+            super::find_foreground_pid(200, &tree),
+            super::ForegroundLookup::NotFound { .. }
+        ));
     }
 }

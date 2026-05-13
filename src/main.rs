@@ -3074,6 +3074,7 @@ fn build_recipe_report(
         });
         let recipe = derive_recipe(
             item.pid,
+            Some(&item.label),
             item.session.as_deref(),
             snap,
             tmux_panes,
@@ -3232,13 +3233,64 @@ fn format_recipe_block(r: &RecipeRecord) -> String {
     out
 }
 
+/// Extract the leading command-like token from a window title. Shell
+/// `PROMPT_COMMAND` / DEBUG-trap conventions typically set titles to
+/// either `"<cmd>"` or `"<cmd> - <cwd>"`, so the first whitespace-
+/// bounded word is a reasonable guess at what's running. Returns `None`
+/// for empty or whitespace-only titles.
+fn title_command_prefix(title: &str) -> Option<&str> {
+    title.split_whitespace().next()
+}
+
+/// When `find_window_shell` returns `Multiple`, try to pick the unique
+/// candidate whose foreground job's `comm` matches the title's leading
+/// word (case-insensitive). Returns `Some(pid)` only when exactly one
+/// candidate matches — strict per OQ-E8.
+///
+/// Why this works: shell-set titles are causally coupled to whatever's
+/// in the foreground process group at any given moment (bash's DEBUG
+/// trap / `PROMPT_COMMAND` is what sets them). The title and the
+/// foreground job's comm are consistent within a single dump snapshot
+/// even when both are transient (e.g. captured during a brief command
+/// execution). What this does NOT recover is workloads whose comm
+/// doesn't appear in `/proc` at capture time (a `kill` that already
+/// returned) — those stay `Unreachable`.
+fn disambiguate_shells_by_title(
+    title: Option<&str>,
+    candidates: &[u32],
+    tree: &ProcTree,
+) -> Option<u32> {
+    let prefix = title.and_then(title_command_prefix)?;
+    let mut matches: Vec<u32> = Vec::new();
+    for &shell_pid in candidates {
+        let fg_comm = match find_foreground_pid(shell_pid, tree) {
+            ForegroundLookup::Found(fg) => tree.get(fg).map(|s| s.comm.clone()),
+            _ => None,
+        };
+        if let Some(comm) = fg_comm {
+            if comm.eq_ignore_ascii_case(prefix) {
+                matches.push(shell_pid);
+            }
+        }
+    }
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
 /// Derive a `LaunchRecipe` from a fully-populated `ProcSnapshot` plus the
 /// per-window inputs. Pure with respect to the snapshot — does no IO.
 ///
 /// `tmux_panes` maps tmux session name → (pane id, pane shell pid).
 /// `session_ids` maps tmux session name → `#{session_id}` (e.g. `"$3"`).
+/// `window_title` is the live `_NET_WM_NAME` PTM last observed for this
+/// window; used to disambiguate the gnome-terminal-server "many shells
+/// under one pid" case via foreground-job-comm matching.
 fn derive_recipe(
     window_pid: Option<u32>,
+    window_title: Option<&str>,
     session: Option<&str>,
     snap: &ProcSnapshot,
     tmux_panes: &HashMap<String, (String, u32)>,
@@ -3283,13 +3335,22 @@ fn derive_recipe(
             }),
             Some(p) => match find_window_shell(p, &snap.tree) {
                 ShellLookup::Found(s) => Ok(s),
-                ShellLookup::Multiple(pids) => Err(WorkloadCapture::Unreachable {
-                    reason: format!(
-                        "{} shell descendants under window pid {} — can't disambiguate from /proc alone (typical with gnome-terminal-server)",
-                        pids.len(),
-                        p
-                    ),
-                }),
+                ShellLookup::Multiple(pids) => {
+                    if let Some(disambig) =
+                        disambiguate_shells_by_title(window_title, &pids, &snap.tree)
+                    {
+                        Ok(disambig)
+                    } else {
+                        Err(WorkloadCapture::Unreachable {
+                            reason: format!(
+                                "{} shell descendants under window pid {}; title {:?} did not uniquely match any candidate's foreground job (typical with gnome-terminal-server)",
+                                pids.len(),
+                                p,
+                                window_title.unwrap_or(""),
+                            ),
+                        })
+                    }
+                }
                 ShellLookup::NotFound => Err(WorkloadCapture::Unreachable {
                     reason: format!(
                         "no shell descendant under window pid {}; either the window doesn't host a shell or capture is racing process startup",
@@ -10473,7 +10534,7 @@ mod tests {
         snap_set_details(&mut snap, 100, "/usr/lib/firefox/firefox", &["firefox"], "/home/steve");
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(100), None, None, &snap, &panes, &ids);
         assert_eq!(rec.exe, Some("/usr/lib/firefox/firefox".to_string()));
         assert_eq!(rec.cmdline, Some(vec!["firefox".to_string()]));
         assert_eq!(rec.cwd, Some("/home/steve".to_string()));
@@ -10496,7 +10557,7 @@ mod tests {
         snap_set_details(&mut snap, 100, "/usr/bin/xterm", &["xterm"], "/home/steve");
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(100), None, None, &snap, &panes, &ids);
         assert_eq!(rec.workload, super::WorkloadCapture::Idle);
     }
 
@@ -10518,7 +10579,7 @@ mod tests {
         );
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(100), None, None, &snap, &panes, &ids);
         match rec.workload {
             super::WorkloadCapture::Job { exe, cmdline, cwd } => {
                 assert_eq!(exe, Some("/home/steve/.local/bin/claude".to_string()));
@@ -10555,7 +10616,7 @@ mod tests {
         let mut ids = HashMap::new();
         ids.insert("ptm-dev".to_string(), "$3".to_string());
 
-        let rec = super::derive_recipe(Some(50), Some("ptm-dev"), &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(50), None, Some("ptm-dev"), &snap, &panes, &ids);
         let tmux = rec.tmux.expect("tmux binding should be populated");
         assert_eq!(tmux.session_name, "ptm-dev");
         assert_eq!(tmux.session_id, Some("$3".to_string()));
@@ -10579,7 +10640,7 @@ mod tests {
         let mut panes = HashMap::new();
         panes.insert("idle".to_string(), ("%1".to_string(), 500));
         let ids = HashMap::new();
-        let rec = super::derive_recipe(None, Some("idle"), &snap, &panes, &ids);
+        let rec = super::derive_recipe(None, None, Some("idle"), &snap, &panes, &ids);
         assert_eq!(rec.workload, super::WorkloadCapture::Idle);
     }
 
@@ -10591,14 +10652,15 @@ mod tests {
         let snap = snap_with(vec![mk_stat(100, "gnome-terminal", 1, Some(100))]);
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(Some(100), Some("ghost"), &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(100), None, Some("ghost"), &snap, &panes, &ids);
         assert!(rec.tmux.is_none(), "no pane info → no binding");
         // No shell child of pid 100 → Unreachable.
         assert!(matches!(rec.workload, super::WorkloadCapture::Unreachable { .. }));
     }
 
     #[test]
-    fn derive_recipe_ambiguous_shells_marks_unreachable() {
+    fn derive_recipe_ambiguous_shells_without_title_marks_unreachable() {
+        // No title to disambiguate against → still Unreachable.
         let snap = snap_with(vec![
             mk_stat(100, "gnome-terminal-server", 1, None),
             mk_stat(200, "bash", 100, Some(200)),
@@ -10607,14 +10669,175 @@ mod tests {
         ]);
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(Some(100), None, &snap, &panes, &ids);
+        let rec = super::derive_recipe(Some(100), None, None, &snap, &panes, &ids);
         match rec.workload {
             super::WorkloadCapture::Unreachable { reason } => {
                 assert!(reason.contains("3 shell descendants"), "got: {}", reason);
-                assert!(reason.contains("disambiguate"), "got: {}", reason);
+                assert!(
+                    reason.contains("did not uniquely match"),
+                    "expected the disambig-failure reason, got: {}",
+                    reason
+                );
             }
             other => panic!("expected Unreachable, got {:?}", other),
         }
+    }
+
+    // ── Phase 5a: title-prefix disambiguation ──
+
+    #[test]
+    fn title_command_prefix_basic() {
+        assert_eq!(super::title_command_prefix("claude - ~/dev"), Some("claude"));
+        assert_eq!(super::title_command_prefix("kill - ~/dev"), Some("kill"));
+        assert_eq!(super::title_command_prefix("Terminal"), Some("Terminal"));
+    }
+
+    #[test]
+    fn title_command_prefix_empty_or_whitespace() {
+        assert_eq!(super::title_command_prefix(""), None);
+        assert_eq!(super::title_command_prefix("   "), None);
+    }
+
+    #[test]
+    fn disambiguate_returns_none_without_title() {
+        let tree = mk_tree(vec![mk_stat(200, "bash", 100, Some(200))]);
+        assert_eq!(super::disambiguate_shells_by_title(None, &[200], &tree), None);
+    }
+
+    #[test]
+    fn disambiguate_returns_unique_match_on_foreground_comm() {
+        // One shell with foreground claude, two idle shells; title "claude".
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(300)),
+            mk_stat(300, "claude", 200, Some(300)),
+            mk_stat(400, "bash", 100, Some(400)),
+            mk_stat(500, "bash", 100, Some(500)),
+        ]);
+        assert_eq!(
+            super::disambiguate_shells_by_title(Some("claude - ~/path"), &[200, 400, 500], &tree),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn disambiguate_returns_none_when_no_candidate_matches() {
+        // Title "kill - ..." but no shell has a `kill` foreground job in
+        // the snapshot (kill returns instantly; tpgid has moved on).
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(300)),
+            mk_stat(300, "claude", 200, Some(300)),
+            mk_stat(400, "bash", 100, Some(400)),
+        ]);
+        assert_eq!(
+            super::disambiguate_shells_by_title(Some("kill - ~/dev"), &[200, 400], &tree),
+            None
+        );
+    }
+
+    #[test]
+    fn disambiguate_returns_none_when_multiple_candidates_match() {
+        // Two shells both running `bash` as foreground (e.g. nested bash
+        // invocations) — title prefix "bash" matches both → no guess.
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(210)),
+            mk_stat(210, "bash", 200, Some(210)),
+            mk_stat(300, "bash", 100, Some(310)),
+            mk_stat(310, "bash", 300, Some(310)),
+        ]);
+        assert_eq!(
+            super::disambiguate_shells_by_title(Some("bash - ~/dev"), &[200, 300], &tree),
+            None
+        );
+    }
+
+    #[test]
+    fn disambiguate_case_insensitive_match() {
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(300)),
+            mk_stat(300, "claude", 200, Some(300)),
+        ]);
+        assert_eq!(
+            super::disambiguate_shells_by_title(Some("CLAUDE - ~"), &[200], &tree),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn disambiguate_skips_idle_shells() {
+        // Idle shells have no foreground job → never match a title prefix.
+        let tree = mk_tree(vec![
+            mk_stat(200, "bash", 100, Some(200)),
+            mk_stat(300, "bash", 100, Some(300)),
+        ]);
+        // No comm to match.
+        assert_eq!(
+            super::disambiguate_shells_by_title(Some("Terminal"), &[200, 300], &tree),
+            None
+        );
+    }
+
+    #[test]
+    fn derive_recipe_ambiguous_shells_resolved_by_title() {
+        // The gnome-terminal-server case from real-world UAT: 3 shells under
+        // pid 100, one running claude. Title "claude - ~/dev/..." → resolves
+        // to the claude shell, Job captured.
+        let mut snap = snap_with(vec![
+            mk_stat(100, "gnome-terminal-server", 1, None),
+            mk_stat(200, "bash", 100, Some(300)),     // shell running claude
+            mk_stat(300, "claude", 200, Some(300)),
+            mk_stat(400, "bash", 100, Some(400)),     // idle
+            mk_stat(500, "bash", 100, Some(500)),     // idle
+        ]);
+        snap_set_details(
+            &mut snap,
+            300,
+            "/home/steve/.local/bin/claude",
+            &["claude", "--dangerously-skip-permissions"],
+            "/home/steve/dev/process-tab-manager",
+        );
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(
+            Some(100),
+            Some("claude - ~/dev/process-tab-manager"),
+            None,
+            &snap,
+            &panes,
+            &ids,
+        );
+        match rec.workload {
+            super::WorkloadCapture::Job { exe, cmdline, cwd } => {
+                assert_eq!(exe, Some("/home/steve/.local/bin/claude".to_string()));
+                assert_eq!(
+                    cmdline,
+                    vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()]
+                );
+                assert_eq!(cwd, Some("/home/steve/dev/process-tab-manager".to_string()));
+            }
+            other => panic!("expected Job (disambiguated), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn derive_recipe_ambiguous_shells_with_idle_title_stays_unreachable() {
+        // Title is the bash prompt default ("Terminal - …"); no candidate's
+        // foreground comm matches "Terminal" → stays Unreachable.
+        let snap = snap_with(vec![
+            mk_stat(100, "gnome-terminal-server", 1, None),
+            mk_stat(200, "bash", 100, Some(200)),
+            mk_stat(300, "bash", 100, Some(300)),
+        ]);
+        let panes = HashMap::new();
+        let ids = HashMap::new();
+        let rec = super::derive_recipe(
+            Some(100),
+            Some("Terminal - ~/dev"),
+            None,
+            &snap,
+            &panes,
+            &ids,
+        );
+        assert!(matches!(rec.workload, super::WorkloadCapture::Unreachable { .. }));
     }
 
     #[test]
@@ -10622,7 +10845,7 @@ mod tests {
         let snap = super::ProcSnapshot::default();
         let panes = HashMap::new();
         let ids = HashMap::new();
-        let rec = super::derive_recipe(None, None, &snap, &panes, &ids);
+        let rec = super::derive_recipe(None, None, None, &snap, &panes, &ids);
         assert!(rec.exe.is_none());
         assert!(rec.cmdline.is_none());
         assert!(rec.cwd.is_none());

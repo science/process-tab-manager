@@ -6,9 +6,9 @@ Vertical sidebar for managing application windows on Linux/X11. Pure X11 via x11
 
 ```bash
 source "$HOME/.cargo/env"
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 291 unit + 3 e2e (Xvfb)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 378 unit + 4 e2e (Xvfb)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --bin ptm                # unit tests only (~50ms)
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~10s)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~13s)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo build --release               # Build dev binary
 DISPLAY=:0 /tmp/ptm-dev/release/ptm                               # Run (needs X11 desktop)
 PTM_BIN=/tmp/ptm-dev/release/ptm tests/e2e/<name>.sh              # Run a single e2e script standalone
@@ -18,11 +18,12 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 
 **Dev vs production**: Dev builds use `/tmp/ptm-dev`. The installed launcher (`install.sh`) uses `/tmp/ptm-target`. This keeps `cargo build` during development from overwriting the production binary.
 
-**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Three scripts live under `tests/e2e/`:
+**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Four scripts live under `tests/e2e/`:
 
 - `menu_kills_session.sh` — right-click → Kill Session via the context menu, popup-accept path.
 - `x_button_kills_session.sh` — click the `[x]` glyph on a session row, popup-accept path.
 - `spawn_position.sh` — clicking `+ New tmux` snaps the spawned terminal to the sidebar anchor.
+- `recipes_survive_restart.sh` — Phase 5c Tier 0a: a saved tmux MEMBER reattaches to its live xterm by session-name match after PTM restart.
 
 Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Tests share the user's tmux server (default socket) and serialize themselves via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
 
@@ -38,20 +39,21 @@ tests/
     menu_kills_session.sh       # right-click → Kill Session
     x_button_kills_session.sh   # [x] glyph + popup-accept
     spawn_position.sh           # `+ New tmux` snaps terminal to sidebar anchor
+    recipes_survive_restart.sh  # Phase 5c: tmux row reattaches after PTM restart
 LICENSE
 README.md
 ```
 
 ## Architecture
 
-Single-file binary (~9400 LOC) with clean separation of concerns within `main.rs`:
+Single-file binary (~12000 LOC) with clean separation of concerns within `main.rs`:
 
 - **Data model** (top): `Item`, `Group`, `DisplaySlot`, `DisplayRow`, `App` — all state management, group operations, drag-and-drop resolution
 - **EWMH helpers**: `get_client_list`, `get_active_window`, `get_window_title`, `activate_window`, `snap_to_sidebar` — thin wrappers over X11 properties
 - **Renderer**: double-buffered drawing to pixmap, copies to window. Items, group headers, ghost drag, drop indicators, hover, active highlight
 - **Context menu**: override-redirect popup with pointer grab. `build_menu_entries` / `open_context_menu` / `draw_context_menu`
 - **Event loop**: single `wait_for_event` loop with two modes: context menu (grab active) and normal
-- **Tests**: `#[cfg(test)] mod tests` at bottom of `src/main.rs` — 291 unit tests covering pure state logic. The Xvfb-driven e2e harness lives separately under `tests/`.
+- **Tests**: `#[cfg(test)] mod tests` at bottom of `src/main.rs` — 378 unit tests covering pure state logic. The Xvfb-driven e2e harness lives separately under `tests/`.
 
 ### What's testable without X11
 
@@ -156,3 +158,52 @@ Green-light Phases 5b–5f when:
 - All tmux-attached workflow apps (claude, npm dev server, vim under tmux) show ✓ Layer 2 (Job) with sensible cmdlines.
 
 If a non-trivial fraction of rows show ✗ Layer 2 with the same reason (e.g. "N shell descendants of gnome-terminal-server"), pause and decide whether to add a disambiguation strategy before 5b — restoring with the wrong workload would be worse than the current "you relaunch manually" status quo.
+
+## Phases 5b + 5c — Persistence v2 + recipe-tier matching (MVP)
+
+5b persists the Phase-5a-captured `LaunchRecipe` per group member to disk. 5c uses that data at restore time to anchor saved groups to live windows by tmux session or `_NET_WM_PID`, rather than the brittle (label, wm_class) cascade alone. Together they turn the "I restarted PTM and my groups re-shattered" failure mode into "groups re-attach cleanly".
+
+### Wire format (v2)
+
+Header bumps `v1` → `v2`. v1 files still load (members come back with `recipe: None`). Each MEMBER can carry up to three optional lines, in any order, until the next MEMBER or GROUP:
+
+```
+v2
+GROUP\t<name>\t<collapsed>\t<kind>
+MEMBER\t<label>\t<wm_class>\t<custom_prefix>
+LAYER1\t<exe>\t<cwd>\t<pid>\t<argc>[\t<arg0>...]
+TMUX\t<session_name>\t<session_id>\t<pane>\t<pane_pid>
+LAYER2\tjob\t<exe>\t<cwd>\t<argc>[\t<arg0>...]
+LAYER2\tidle
+LAYER2\tunreachable\t<reason>
+```
+
+Field values are percent-encoded: `%` → `%25`, `\t` → `%09`, `\n` → `%0a`. Empty fields (`\t\t`) are the "no value" sentinel for exe/cwd/pid/session_id. v2 reader skips unknown line types (forward-compat for a hypothetical v3); v1 stays strict.
+
+### Matching cascade (5 tiers, head-first)
+
+`restore_groups` and `refresh_items` ghost re-match both route through the same logic:
+
+1. **Tier 0a — Tmux session match** (Normal groups only). `member.recipe.tmux.session_name` against `item.session`.
+2. **Tier 0b — Pid + corroborator** (Normal groups only). `member.recipe.pid_at_save` against `item.pid` AND (`item.label == member.label` OR `item.wm_class == member.wm_class`). The corroborator prevents pid-collision false matches when many windows share `gnome-terminal-server`'s pid.
+3. **Tier 1 — Exact** `(label, wm_class)`.
+4. **Tier 2 — Label-only**.
+5. **Tier 3 — wm_class-only**.
+
+TmuxSystem groups skip Tier 0a/0b because they're rebuilt every refresh from `list_tmux_sessions()`.
+
+### Capture-at-save cost
+
+`save_groups` calls `capture_recipes_for_save(&app)` first — one `ProcSnapshot::capture_all()` + one `query_tmux_pane` per distinct `item.session`. ~5–10 ms per call. Save fires at most a handful of times per minute under the existing debounce; cost is negligible.
+
+### MVP UAT
+
+After installing (`./install.sh`) and relaunching PTM:
+
+1. Create a labelled group named `mvp-test` and drag a tmux-wrapped terminal row into it.
+2. Inspect `~/.config/ptm/profiles/default/groups`: header is `v2`; the MEMBER for the tmux row is followed by a `LAYER1` line, a `TMUX` line, and a `LAYER2` line.
+3. Quit PTM (Ctrl+Q or WM close). Reopen.
+4. The `mvp-test` group should reappear with the tmux row already attached — no momentary ghosting, no row-shuffle.
+5. Send `kill -USR1 $(pgrep ptm)` to dump current state; verify the dump shows the row under the `mvp-test` group with its `Tmux binding` line populated and a non-zero `pane_pid`.
+
+If step 4 shows the row as a ghost (greyed) or in the wrong group, Tier 0a probably didn't fire — capture some data with `kill -USR1` and check that the saved member's TMUX line names the right session.

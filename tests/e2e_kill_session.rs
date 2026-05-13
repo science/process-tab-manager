@@ -85,3 +85,19 @@ fn new_tmux_button_positions_terminal_at_sidebar_anchor() {
         out
     );
 }
+
+/// Phase 5c MVP: a saved tmux row reattaches to its live xterm via Tier 0a
+/// (session-name match) after PTM restarts. The script pre-seeds a v2
+/// groups file with a stale pane_pid sentinel, starts the tmux session +
+/// xterm, launches PTM, closes it via WM_DELETE_WINDOW, and verifies the
+/// shutdown save updated the pane_pid (proof that Tier 0a matched and
+/// capture-at-save ran).
+#[test]
+fn tmux_row_reattaches_via_tier_0a_after_restart() {
+    let (ok, out) = run_e2e_script("recipes_survive_restart.sh");
+    assert!(
+        ok,
+        "saved tmux row should reattach via session-name match after restart\n{}",
+        out
+    );
+}

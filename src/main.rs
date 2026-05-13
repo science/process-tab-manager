@@ -2700,46 +2700,112 @@ enum ForegroundLookup {
 /// arbitrary characters including parens and spaces — split on the LAST
 /// `)` to find its end, then parse the trailing space-separated fields.
 fn parse_proc_stat_fields(s: &str) -> Option<ProcStat> {
-    // STUB: implemented in the next commit.
-    let _ = s;
-    None
+    let s = s.trim_end_matches('\n');
+    // Split on the LAST ')' so comm with embedded parens still works.
+    let close = s.rfind(')')?;
+    let head = &s[..close];
+    // head should be "PID (COMM_BODY". Strip the "PID (" prefix.
+    let open = head.find(" (")?;
+    let pid: u32 = head[..open].parse().ok()?;
+    let comm = head[open + 2..].to_string();
+    // After ')': " state ppid pgrp session tty_nr tpgid ..."
+    let rest = s[close + 1..].trim_start();
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    let _pgrp = fields.next()?;
+    let _session = fields.next()?;
+    let _tty_nr = fields.next()?;
+    let tpgid_raw = fields.next()?;
+    // tpgid is signed: -1 when no controlling terminal.
+    let tpgid: Option<u32> = if tpgid_raw.starts_with('-') {
+        None
+    } else {
+        tpgid_raw.parse().ok()
+    };
+    Some(ProcStat { pid, comm, ppid, tpgid })
 }
 
 /// Split `/proc/<pid>/cmdline` (NUL-separated argv) into a Vec. Trailing
-/// NULs are dropped (kernel threads sometimes report `\0`).
+/// empty entries (from a trailing NUL or all-NUL content) are dropped.
 fn parse_proc_cmdline(bytes: &[u8]) -> Vec<String> {
-    // STUB: implemented in the next commit.
-    let _ = bytes;
-    Vec::new()
+    bytes
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 
 /// True when `argv0` (or its basename) names a known shell binary. Also
 /// strips a leading `-` (login-shell convention: `-bash`, `-zsh`).
 fn is_shell_argv0(argv0: &str) -> bool {
-    // STUB: implemented in the next commit.
-    let _ = argv0;
-    false
+    let stripped = argv0.strip_prefix('-').unwrap_or(argv0);
+    let base = match stripped.rsplit_once('/') {
+        Some((_, b)) => b,
+        None => stripped,
+    };
+    matches!(base, "bash" | "zsh" | "sh" | "dash" | "fish" | "ksh" | "tcsh" | "csh")
 }
 
 /// Walk DOWN from `window_pid` through `tree`, collecting all descendants
 /// whose `comm` is a known shell. Returns Single/Multiple/None per the
 /// disambiguation policy (strict: never guess).
 fn find_window_shell(window_pid: u32, tree: &ProcTree) -> ShellLookup {
-    // STUB: implemented in the next commit.
-    let _ = window_pid;
-    let _ = tree;
-    ShellLookup::NotFound
+    // BFS so a near shell is reported before a deeper one. With Multiple
+    // we collect every shell in the subtree regardless of depth.
+    let mut shells: Vec<u32> = Vec::new();
+    let mut frontier: Vec<u32> = vec![window_pid];
+    let mut visited: HashSet<u32> = HashSet::new();
+    while let Some(cur) = frontier.pop() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        for child in tree.children_of(cur) {
+            if is_shell_argv0(&child.comm) {
+                shells.push(child.pid);
+            }
+            frontier.push(child.pid);
+        }
+    }
+    shells.sort();
+    match shells.len() {
+        0 => ShellLookup::NotFound,
+        1 => ShellLookup::Found(shells[0]),
+        _ => ShellLookup::Multiple(shells),
+    }
 }
 
 /// Look up the foreground job leader given a shell's pid. Reads
 /// `shell.tpgid` and finds the matching process in `tree`. Strict — no
 /// heuristic; if anything is ambiguous, returns `NotFound { reason }`.
 fn find_foreground_pid(shell_pid: u32, tree: &ProcTree) -> ForegroundLookup {
-    // STUB: implemented in the next commit.
-    let _ = shell_pid;
-    let _ = tree;
-    ForegroundLookup::NotFound {
-        reason: "stub".to_string(),
+    let shell = match tree.get(shell_pid) {
+        Some(s) => s,
+        None => {
+            return ForegroundLookup::NotFound {
+                reason: format!("shell pid {} not in /proc snapshot", shell_pid),
+            }
+        }
+    };
+    let tpgid = match shell.tpgid {
+        Some(t) => t,
+        None => {
+            return ForegroundLookup::NotFound {
+                reason: "shell has no controlling tty (tpgid = -1)".to_string(),
+            }
+        }
+    };
+    if tpgid == shell_pid {
+        return ForegroundLookup::Idle;
+    }
+    match tree.get(tpgid) {
+        Some(_) => ForegroundLookup::Found(tpgid),
+        None => ForegroundLookup::NotFound {
+            reason: format!(
+                "foreground tpgid {} not in /proc snapshot (likely exited)",
+                tpgid
+            ),
+        },
     }
 }
 

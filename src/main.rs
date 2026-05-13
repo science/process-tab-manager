@@ -5286,7 +5286,10 @@ fn percent_decode_field(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
+fn extract_saved_state(
+    app: &App,
+    recipes: &HashMap<u32, LaunchRecipe>,
+) -> Vec<SavedGroup> {
     let mut saved = Vec::new();
     for slot in &app.display_order {
         if let DisplaySlot::Group(gid) = slot {
@@ -5294,14 +5297,28 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
                 // Serialize ALL members (live and ghost) — that's the
                 // whole point of Phase 2c: a group with only ghost
                 // members must still round-trip across PTM restarts.
+                //
+                // Phase 5b recipe resolution: live members prefer the
+                // freshly-captured recipe from the save-time snapshot;
+                // ghosts fall back to whatever member.recipe holds from
+                // the last refresh that saw them live.
                 let members = group
                     .members
                     .iter()
-                    .map(|m| SavedMember {
-                        label: m.label.clone(),
-                        wm_class: m.wm_class.clone(),
-                        custom_prefix: m.custom_prefix.clone(),
-                        recipe: None,
+                    .map(|m| {
+                        let recipe = match m.live_wid {
+                            Some(wid) => recipes
+                                .get(&wid)
+                                .cloned()
+                                .or_else(|| m.recipe.clone()),
+                            None => m.recipe.clone(),
+                        };
+                        SavedMember {
+                            label: m.label.clone(),
+                            wm_class: m.wm_class.clone(),
+                            custom_prefix: m.custom_prefix.clone(),
+                            recipe,
+                        }
                     })
                     .collect();
                 saved.push(SavedGroup {
@@ -5316,31 +5333,155 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
     saved
 }
 
+/// Capture a fresh `LaunchRecipe` for every live `Item` in `app`. Walks
+/// `/proc` once, queries `tmux display-message` once per distinct
+/// `item.session`, then runs `derive_recipe` per item. Returns a map
+/// keyed by `wid` so `extract_saved_state` can look up the recipe for
+/// each live group member.
+fn capture_recipes_for_save(app: &App) -> HashMap<u32, LaunchRecipe> {
+    let snap = ProcSnapshot::capture_all();
+    let mut tmux_panes: HashMap<String, (String, u32)> = HashMap::new();
+    let mut seen_sessions: HashSet<String> = HashSet::new();
+    for item in &app.items {
+        if let Some(s) = &item.session {
+            if seen_sessions.insert(s.clone()) {
+                if let Some(p) = query_tmux_pane(s) {
+                    tmux_panes.insert(s.clone(), p);
+                }
+            }
+        }
+    }
+    let session_ids: HashMap<String, String> = app
+        .live_sessions
+        .iter()
+        .map(|(id, name, _)| (name.clone(), id.clone()))
+        .collect();
+    let mut out = HashMap::new();
+    for item in &app.items {
+        let recipe = derive_recipe(
+            item.pid,
+            Some(&item.label),
+            item.session.as_deref(),
+            &snap,
+            &tmux_panes,
+            &session_ids,
+        );
+        out.insert(item.wid, recipe);
+    }
+    out
+}
+
 fn save_groups_to(path: &std::path::Path, groups: &[SavedGroup]) {
     let mut buf = String::new();
-    buf.push_str("v1\n");
+    buf.push_str("v2\n");
     for group in groups {
         let collapsed = if group.collapsed { "1" } else { "0" };
         let kind = match group.kind {
             GroupKind::Normal => "normal",
             GroupKind::TmuxSystem => "tmux_system",
         };
-        // Always emit 4-field GROUP so on-disk format stays predictable.
-        // Loader (T4.4a) tolerates the legacy 3-field shape, which is what
-        // makes downgrade safe.
+        // GROUP and MEMBER stay tab-joined raw (their fields existed in v1
+        // and were never percent-encoded; v2 keeps the contract so files
+        // round-trip across the version bump).
         buf.push_str(&format!("GROUP\t{}\t{}\t{}\n", group.name, collapsed, kind));
         for member in &group.members {
             buf.push_str(&format!(
                 "MEMBER\t{}\t{}\t{}\n",
                 member.label, member.wm_class, member.custom_prefix
             ));
+            if let Some(recipe) = &member.recipe {
+                emit_layer1_line(&mut buf, recipe);
+                if let Some(tmux) = &recipe.tmux {
+                    emit_tmux_line(&mut buf, tmux);
+                }
+                emit_layer2_line(&mut buf, &recipe.workload);
+            }
         }
     }
     let _ = write_atomic(path, buf.as_bytes());
 }
 
+fn emit_layer1_line(buf: &mut String, r: &LaunchRecipe) {
+    let exe = r
+        .exe
+        .as_deref()
+        .map(percent_encode_field)
+        .unwrap_or_default();
+    let cwd = r
+        .cwd
+        .as_deref()
+        .map(percent_encode_field)
+        .unwrap_or_default();
+    let pid = r
+        .pid_at_save
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+    let empty = Vec::new();
+    let cmdline: &Vec<String> = r.cmdline.as_ref().unwrap_or(&empty);
+    buf.push_str(&format!(
+        "LAYER1\t{}\t{}\t{}\t{}",
+        exe,
+        cwd,
+        pid,
+        cmdline.len()
+    ));
+    for arg in cmdline {
+        buf.push('\t');
+        buf.push_str(&percent_encode_field(arg));
+    }
+    buf.push('\n');
+}
+
+fn emit_tmux_line(buf: &mut String, t: &TmuxBinding) {
+    let name = percent_encode_field(&t.session_name);
+    let id = t
+        .session_id
+        .as_deref()
+        .map(percent_encode_field)
+        .unwrap_or_default();
+    let pane = percent_encode_field(&t.pane);
+    buf.push_str(&format!(
+        "TMUX\t{}\t{}\t{}\t{}\n",
+        name, id, pane, t.pane_pid
+    ));
+}
+
+fn emit_layer2_line(buf: &mut String, w: &WorkloadCapture) {
+    match w {
+        WorkloadCapture::Idle => buf.push_str("LAYER2\tidle\n"),
+        WorkloadCapture::Unreachable { reason } => {
+            buf.push_str(&format!(
+                "LAYER2\tunreachable\t{}\n",
+                percent_encode_field(reason)
+            ));
+        }
+        WorkloadCapture::Job { exe, cmdline, cwd } => {
+            let exe_s = exe
+                .as_deref()
+                .map(percent_encode_field)
+                .unwrap_or_default();
+            let cwd_s = cwd
+                .as_deref()
+                .map(percent_encode_field)
+                .unwrap_or_default();
+            buf.push_str(&format!(
+                "LAYER2\tjob\t{}\t{}\t{}",
+                exe_s,
+                cwd_s,
+                cmdline.len()
+            ));
+            for arg in cmdline {
+                buf.push('\t');
+                buf.push_str(&percent_encode_field(arg));
+            }
+            buf.push('\n');
+        }
+    }
+}
+
 fn save_groups(app: &App) {
-    let groups = extract_saved_state(app);
+    let recipes = capture_recipes_for_save(app);
+    let groups = extract_saved_state(app, &recipes);
     save_groups_to(&groups_path(), &groups);
 }
 
@@ -7239,7 +7380,7 @@ mod tests {
         app.add_to_group(0, 2);
         // Group 0 has windows 1, 2; window 3 is ungrouped
 
-        let saved = extract_saved_state(&app);
+        let saved = extract_saved_state(&app, &HashMap::new());
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].name, "Group 1");
         assert!(!saved[0].collapsed);
@@ -7600,7 +7741,7 @@ mod tests {
         });
         app.display_order.push(DisplaySlot::Group(gid));
 
-        let saved = extract_saved_state(&app);
+        let saved = extract_saved_state(&app, &HashMap::new());
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].members.len(), 1);
         assert_eq!(saved[0].members[0].label, "Vim");
@@ -10028,6 +10169,276 @@ mod tests {
     }
 
     #[test]
+    fn writer_emits_layer1_when_recipe_has_layer1_data() {
+        let dir = std::env::temp_dir().join("ptm_test_writer_layer1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "term".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    exe: Some("/usr/bin/xterm".to_string()),
+                    cwd: Some("/home/steve".to_string()),
+                    pid_at_save: Some(100),
+                    cmdline: Some(vec!["xterm".to_string(), "-e".to_string(), "bash".to_string()]),
+                    tmux: None,
+                    workload: super::WorkloadCapture::Idle,
+                }),
+            }],
+        }];
+        super::save_groups_to(&path, &saved);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("v2\n"));
+        assert!(body.contains("LAYER1\t/usr/bin/xterm\t/home/steve\t100\t3\txterm\t-e\tbash\n"));
+        assert!(body.contains("LAYER2\tidle\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_omits_tmux_line_when_no_binding() {
+        let dir = std::env::temp_dir().join("ptm_test_writer_no_tmux");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "term".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    exe: None,
+                    cwd: None,
+                    pid_at_save: None,
+                    cmdline: None,
+                    tmux: None,
+                    workload: super::WorkloadCapture::Idle,
+                }),
+            }],
+        }];
+        super::save_groups_to(&path, &saved);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("TMUX\t"), "TMUX line must be omitted when binding is None; got: {}", body);
+    }
+
+    #[test]
+    fn writer_encodes_tmux_pane_id_percent() {
+        let dir = std::env::temp_dir().join("ptm_test_writer_tmux_pane");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "term".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    exe: None,
+                    cwd: None,
+                    pid_at_save: None,
+                    cmdline: None,
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "dev".into(),
+                        session_id: Some("$3".into()),
+                        pane: "%5".into(),
+                        pane_pid: 500,
+                    }),
+                    workload: super::WorkloadCapture::Idle,
+                }),
+            }],
+        }];
+        super::save_groups_to(&path, &saved);
+        let body = std::fs::read_to_string(&path).unwrap();
+        // pane "%5" is encoded as "%255" since the encoder always
+        // percent-encodes the `%` character.
+        assert!(body.contains("TMUX\tdev\t$3\t%255\t500\n"), "got: {}", body);
+    }
+
+    #[test]
+    fn save_load_save_round_trip_with_full_recipe() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let original = vec![SavedGroup {
+            name: "Dev".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "claude — ~/dev".into(),
+                wm_class: "Gnome-terminal".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    exe: Some("/usr/libexec/gnome-terminal-server".to_string()),
+                    cwd: Some("/home/steve".to_string()),
+                    pid_at_save: Some(90468),
+                    cmdline: Some(vec!["gnome-terminal-server".to_string()]),
+                    tmux: Some(super::TmuxBinding {
+                        session_name: "ptm-dev".into(),
+                        session_id: Some("$3".into()),
+                        pane: "%5".into(),
+                        pane_pid: 500,
+                    }),
+                    workload: super::WorkloadCapture::Job {
+                        exe: Some("/home/steve/.local/bin/claude".to_string()),
+                        cmdline: vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()],
+                        cwd: Some("/home/steve/dev/process-tab-manager".to_string()),
+                    },
+                }),
+            }],
+        }];
+
+        super::save_groups_to(&path, &original);
+        let loaded = super::load_groups_from(&path).expect("loads back");
+        // Save once more — bytes should be identical to the first save.
+        let path2 = dir.join("groups2");
+        super::save_groups_to(&path2, &loaded);
+        let first = std::fs::read_to_string(&path).unwrap();
+        let second = std::fs::read_to_string(&path2).unwrap();
+        assert_eq!(first, second, "save→load→save must be byte-identical");
+        // Spot-check structural correctness
+        assert_eq!(loaded[0].members[0].recipe.as_ref().unwrap().pid_at_save, Some(90468));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_load_preserves_pid_sentinel_when_no_pid_recorded() {
+        let dir = std::env::temp_dir().join("ptm_test_pid_sentinel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+
+        let saved = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "x".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                recipe: Some(super::LaunchRecipe {
+                    exe: None,
+                    cwd: None,
+                    pid_at_save: None, // not recorded
+                    cmdline: None,
+                    tmux: None,
+                    workload: super::WorkloadCapture::Unreachable {
+                        reason: "no _NET_WM_PID".to_string(),
+                    },
+                }),
+            }],
+        }];
+        super::save_groups_to(&path, &saved);
+        let body = std::fs::read_to_string(&path).unwrap();
+        // pid field should be empty (between the cwd's tab and the argc tab)
+        assert!(body.contains("LAYER1\t\t\t\t0\n"), "expected empty-sentinel pid; got: {}", body);
+        let loaded = super::load_groups_from(&path).expect("loads back");
+        assert!(loaded[0].members[0].recipe.as_ref().unwrap().pid_at_save.is_none());
+    }
+
+    #[test]
+    fn extract_saved_state_ghost_preserves_member_recipe() {
+        // A ghost member (live_wid = None) with a runtime recipe should
+        // serialize with that recipe — the recipes map doesn't have an
+        // entry for it.
+        let mut app = make_app();
+        let gid = app.next_group_id;
+        app.next_group_id += 1;
+        app.groups.push(super::Group {
+            id: gid,
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![super::GroupMember {
+                label: "ghost".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                live_wid: None,
+                recipe: Some(super::LaunchRecipe {
+                    exe: Some("/old/path".to_string()),
+                    cwd: None,
+                    pid_at_save: Some(42),
+                    cmdline: None,
+                    tmux: None,
+                    workload: super::WorkloadCapture::Idle,
+                }),
+            }],
+        });
+        app.display_order.push(super::DisplaySlot::Group(gid));
+        let saved = super::extract_saved_state(&app, &HashMap::new());
+        let r = saved[0].members[0].recipe.as_ref().expect("ghost recipe survives");
+        assert_eq!(r.exe.as_deref(), Some("/old/path"));
+        assert_eq!(r.pid_at_save, Some(42));
+    }
+
+    #[test]
+    fn extract_saved_state_live_uses_fresh_recipe_from_map() {
+        // A live member: the recipes map's fresh entry wins over whatever
+        // member.recipe held from the prior save.
+        let mut app = make_app();
+        // Item with wid=10
+        app.items.push(super::Item {
+            wid: 10,
+            label: "live".into(),
+            wm_class: "x".into(),
+            accent_pixel: 0,
+            custom_prefix: "".into(),
+            session: None,
+            pid: Some(100),
+        });
+        let gid = app.next_group_id;
+        app.next_group_id += 1;
+        app.groups.push(super::Group {
+            id: gid,
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![super::GroupMember {
+                label: "live".into(),
+                wm_class: "x".into(),
+                custom_prefix: "".into(),
+                live_wid: Some(10),
+                recipe: Some(super::LaunchRecipe {
+                    exe: Some("/stale/exe".to_string()),
+                    ..Default::default()
+                }),
+            }],
+        });
+        app.display_order.push(super::DisplaySlot::Group(gid));
+
+        let mut recipes = HashMap::new();
+        recipes.insert(
+            10,
+            super::LaunchRecipe {
+                exe: Some("/fresh/exe".to_string()),
+                ..Default::default()
+            },
+        );
+        let saved = super::extract_saved_state(&app, &recipes);
+        let r = saved[0].members[0].recipe.as_ref().unwrap();
+        assert_eq!(
+            r.exe.as_deref(),
+            Some("/fresh/exe"),
+            "fresh recipe from map must win over stale member.recipe"
+        );
+    }
+
+    #[test]
     fn load_groups_v2_decodes_tab_in_cmdline_arg() {
         let dir = std::env::temp_dir().join("ptm_test_v2_tab_arg");
         // An arg containing a tab: encoded as `%09`. Round-trips through
@@ -10613,7 +11024,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_emits_4_field_group_line() {
+    fn writer_emits_v2_4_field_group_line() {
         // Belt-and-braces: verify the on-disk byte sequence so we catch
         // accidental field reorder / format drift.
         let dir = std::env::temp_dir().join("ptm_test_writer_format");
@@ -10629,7 +11040,7 @@ mod tests {
         }];
         super::save_groups_to(&path, &saved);
         let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body, "v1\nGROUP\tFoo\t1\ttmux_system\n");
+        assert_eq!(body, "v2\nGROUP\tFoo\t1\ttmux_system\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

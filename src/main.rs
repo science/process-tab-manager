@@ -313,6 +313,7 @@ struct Group {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 struct GroupMember {
     /// Window title at the time the member was added; used for matching
     /// when a window with the same identity reappears.
@@ -323,6 +324,12 @@ struct GroupMember {
     custom_prefix: String,
     /// Some(wid) when bound to a live X11 window; None for ghosts.
     live_wid: Option<u32>,
+    /// Most-recently-captured recipe for this member. Carried at runtime
+    /// (not just in `SavedMember`) so ghost members preserve their last
+    /// known recipe across saves until the live window reappears. Phase 5b
+    /// populates this on every save tick; Phase 5c reads it for the
+    /// recipe-tier matching cascade.
+    recipe: Option<LaunchRecipe>,
 }
 
 impl Group {
@@ -1043,12 +1050,14 @@ impl App {
                 wm_class: item.wm_class.clone(),
                 custom_prefix: item.custom_prefix.clone(),
                 live_wid: Some(wid),
+                recipe: None,
             },
             None => GroupMember {
                 label: String::new(),
                 wm_class: String::new(),
                 custom_prefix: String::new(),
                 live_wid: Some(wid),
+                recipe: None,
             },
         }
     }
@@ -2424,6 +2433,7 @@ fn sync_system_group_members(group: &mut Group, live_sessions: &[String]) {
                 wm_class: String::new(),
                 custom_prefix: String::new(),
                 live_wid: None,
+                recipe: None,
             });
         }
     }
@@ -2687,7 +2697,7 @@ impl ProcTree {
 /// Recipe captured from `/proc` for a single window. Layer 1 is the
 /// window's own controlling process; Layer 2 is the foreground job
 /// running inside any wrapping shell or tmux pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LaunchRecipe {
     /// `/proc/<window_pid>/exe`. None when unreadable.
     exe: Option<String>,
@@ -2696,6 +2706,11 @@ struct LaunchRecipe {
     cmdline: Option<Vec<String>>,
     /// `/proc/<window_pid>/cwd`. None when unreadable.
     cwd: Option<String>,
+    /// The window's `_NET_WM_PID` as observed at capture time. Stamped
+    /// here explicitly so the persisted recipe carries it forward and
+    /// Phase 5c's Tier 0b pid-match can resolve "this saved member was
+    /// pid X" without re-derivation.
+    pid_at_save: Option<u32>,
     /// Populated when the window is wrapped in a tmux session (per
     /// `Item::session`). The pane id and pane pid come from
     /// `tmux display-message`.
@@ -2730,6 +2745,18 @@ enum WorkloadCapture {
     /// reviewers can tell apart "no shell descendant found" from "ambiguous
     /// shell parentage" from "tmux pane query failed".
     Unreachable { reason: String },
+}
+
+impl Default for WorkloadCapture {
+    /// Default is `Unreachable { reason: "not captured" }` so a recipe
+    /// parsed from a v2 file that has a LAYER1 line but no LAYER2 line
+    /// surfaces honestly as "we don't know the workload" instead of
+    /// falsely claiming Idle.
+    fn default() -> Self {
+        WorkloadCapture::Unreachable {
+            reason: "not captured".to_string(),
+        }
+    }
 }
 
 /// Outcome of walking down from a window pid in search of a shell.
@@ -3383,6 +3410,7 @@ fn derive_recipe(
         exe,
         cmdline,
         cwd,
+        pid_at_save: window_pid,
         tmux,
         workload,
     }
@@ -5200,6 +5228,10 @@ struct SavedMember {
     label: String,
     wm_class: String,
     custom_prefix: String,
+    /// `LaunchRecipe` loaded from the v2 file's LAYER1/TMUX/LAYER2 lines.
+    /// `None` when the file is v1 or the member had no captured recipe at
+    /// save time. Phase 5c uses this for the recipe-tier match cascade.
+    recipe: Option<LaunchRecipe>,
 }
 
 struct SavedGroup {
@@ -5211,6 +5243,47 @@ struct SavedGroup {
 
 fn groups_path() -> std::path::PathBuf {
     data_dir().join("groups")
+}
+
+/// Encode a field value for the v2 groups file. Only three characters need
+/// escaping: `%` (the escape itself), `\t` (the field separator), `\n`
+/// (the line separator). Everything else passes through unchanged. The
+/// inverse is `percent_decode_field`.
+fn percent_encode_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'%' => out.push_str("%25"),
+            b'\t' => out.push_str("%09"),
+            b'\n' => out.push_str("%0a"),
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// Decode a v2-encoded field. Returns `None` if a `%` is not followed by
+/// exactly two ASCII-hex chars (malformed encoding rejects the whole
+/// load via the loader's `?` propagation).
+fn percent_decode_field(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
@@ -5228,6 +5301,7 @@ fn extract_saved_state(app: &App) -> Vec<SavedGroup> {
                         label: m.label.clone(),
                         wm_class: m.wm_class.clone(),
                         custom_prefix: m.custom_prefix.clone(),
+                        recipe: None,
                     })
                     .collect();
                 saved.push(SavedGroup {
@@ -5273,17 +5347,23 @@ fn save_groups(app: &App) {
 fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
     let data = std::fs::read_to_string(path).ok()?;
     let mut lines = data.lines();
-    if lines.next()? != "v1" {
-        return None;
-    }
+    let version = lines.next()?;
+    let is_v2 = match version {
+        "v1" => false,
+        "v2" => true,
+        _ => return None,
+    };
     let mut groups: Vec<SavedGroup> = Vec::new();
+    // Per-member layer-line presence flags, reset each MEMBER. A second
+    // LAYER1/TMUX/LAYER2 for the same member rejects the load (invariant:
+    // at most one of each per member).
+    let mut has_layer1 = false;
+    let mut has_tmux = false;
+    let mut has_layer2 = false;
     for line in lines {
         let parts: Vec<&str> = line.split('\t').collect();
         match parts.first() {
             Some(&"GROUP") => {
-                // 3-field GROUP lines remain valid (downgrade-friendly); the
-                // optional 4th field carries `kind`. Reject any other arity
-                // so corrupt files fail loudly rather than partially-loading.
                 if !matches!(parts.len(), 3 | 4) {
                     return None;
                 }
@@ -5296,9 +5376,6 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     match parts[3] {
                         "normal" => GroupKind::Normal,
                         "tmux_system" => GroupKind::TmuxSystem,
-                        // Unknown kind = corrupt or future-version data.
-                        // Fail the whole load rather than silently fall back —
-                        // partial-loads are how data gets quietly mangled.
                         _ => return None,
                     }
                 } else {
@@ -5310,6 +5387,9 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     kind,
                     members: Vec::new(),
                 });
+                has_layer1 = false;
+                has_tmux = false;
+                has_layer2 = false;
             }
             Some(&"MEMBER") => {
                 if parts.len() != 4 {
@@ -5322,12 +5402,180 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     label: parts[1].to_string(),
                     wm_class: parts[2].to_string(),
                     custom_prefix: parts[3].to_string(),
+                    recipe: None,
                 });
+                has_layer1 = false;
+                has_tmux = false;
+                has_layer2 = false;
             }
-            _ => return None,
+            Some(&"LAYER1") | Some(&"TMUX") | Some(&"LAYER2") if !is_v2 => {
+                // v1 files must never carry layer lines; if they do, the
+                // file is malformed.
+                return None;
+            }
+            Some(&"LAYER1") => {
+                if has_layer1 {
+                    return None;
+                }
+                let member = current_member_mut(&mut groups)?;
+                parse_layer1_into(&parts, member)?;
+                has_layer1 = true;
+            }
+            Some(&"TMUX") => {
+                if has_tmux {
+                    return None;
+                }
+                let member = current_member_mut(&mut groups)?;
+                parse_tmux_into(&parts, member)?;
+                has_tmux = true;
+            }
+            Some(&"LAYER2") => {
+                if has_layer2 {
+                    return None;
+                }
+                let member = current_member_mut(&mut groups)?;
+                parse_layer2_into(&parts, member)?;
+                has_layer2 = true;
+            }
+            // Skip unknown line types in v2 (forward-compat for a hypothetical
+            // future v3 that adds new line kinds). In v1 the format is frozen —
+            // unknown lines indicate corruption or unsupported data, so reject.
+            // The current-member pointer is preserved across skipped lines.
+            Some(_) => {
+                if is_v2 {
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+            None => continue,
         }
     }
     Some(groups)
+}
+
+/// Return a mutable reference to the most recent member of the most recent
+/// group, or `None` when no member exists yet (which causes layer-line
+/// parsing to reject the load via `?` propagation).
+fn current_member_mut(groups: &mut [SavedGroup]) -> Option<&mut SavedMember> {
+    groups.last_mut()?.members.last_mut()
+}
+
+/// Ensure `member.recipe` exists, returning a `&mut` to it. Lazy init so
+/// members without any LAYER*/TMUX line stay with `recipe: None`.
+fn member_recipe_mut(member: &mut SavedMember) -> &mut LaunchRecipe {
+    member.recipe.get_or_insert_with(LaunchRecipe::default)
+}
+
+/// Parse a `LAYER1\t<exe>\t<cwd>\t<pid>\t<argc>[\t<arg0>...]` line into
+/// the member's recipe. Empty fields are treated as `None` for exe/cwd/pid.
+fn parse_layer1_into(parts: &[&str], member: &mut SavedMember) -> Option<()> {
+    if parts.len() < 5 {
+        return None;
+    }
+    let exe = decode_field_or_none(parts[1])?;
+    let cwd = decode_field_or_none(parts[2])?;
+    let pid_at_save = if parts[3].is_empty() {
+        None
+    } else {
+        Some(parts[3].parse::<u32>().ok()?)
+    };
+    let argc: usize = parts[4].parse().ok()?;
+    if parts.len() != 5 + argc {
+        return None;
+    }
+    let mut cmdline = Vec::with_capacity(argc);
+    for arg in &parts[5..5 + argc] {
+        cmdline.push(percent_decode_field(arg)?);
+    }
+    let recipe = member_recipe_mut(member);
+    recipe.exe = exe;
+    recipe.cwd = cwd;
+    recipe.pid_at_save = pid_at_save;
+    recipe.cmdline = Some(cmdline);
+    Some(())
+}
+
+/// Parse `TMUX\t<session_name>\t<session_id>\t<pane>\t<pane_pid>` into
+/// the member's recipe.tmux. session_id of empty string → None.
+fn parse_tmux_into(parts: &[&str], member: &mut SavedMember) -> Option<()> {
+    if parts.len() != 5 {
+        return None;
+    }
+    let session_name = percent_decode_field(parts[1])?;
+    let session_id = if parts[2].is_empty() {
+        None
+    } else {
+        Some(percent_decode_field(parts[2])?)
+    };
+    let pane = percent_decode_field(parts[3])?;
+    let pane_pid: u32 = parts[4].parse().ok()?;
+    let recipe = member_recipe_mut(member);
+    recipe.tmux = Some(TmuxBinding {
+        session_name,
+        session_id,
+        pane,
+        pane_pid,
+    });
+    Some(())
+}
+
+/// Parse `LAYER2\t<variant>\t...` into the member's recipe.workload.
+/// Variants and arities:
+///   * `idle` — exactly 2 fields.
+///   * `unreachable\t<reason>` — exactly 3 fields.
+///   * `job\t<exe>\t<cwd>\t<argc>[\t<arg0>...]` — at least 5 fields,
+///     total = 5 + argc.
+fn parse_layer2_into(parts: &[&str], member: &mut SavedMember) -> Option<()> {
+    if parts.len() < 2 {
+        return None;
+    }
+    let workload = match parts[1] {
+        "idle" => {
+            if parts.len() != 2 {
+                return None;
+            }
+            WorkloadCapture::Idle
+        }
+        "unreachable" => {
+            if parts.len() != 3 {
+                return None;
+            }
+            WorkloadCapture::Unreachable {
+                reason: percent_decode_field(parts[2])?,
+            }
+        }
+        "job" => {
+            if parts.len() < 5 {
+                return None;
+            }
+            let exe = decode_field_or_none(parts[2])?;
+            let cwd = decode_field_or_none(parts[3])?;
+            let argc: usize = parts[4].parse().ok()?;
+            if parts.len() != 5 + argc {
+                return None;
+            }
+            let mut cmdline = Vec::with_capacity(argc);
+            for arg in &parts[5..5 + argc] {
+                cmdline.push(percent_decode_field(arg)?);
+            }
+            WorkloadCapture::Job { exe, cmdline, cwd }
+        }
+        _ => return None,
+    };
+    let recipe = member_recipe_mut(member);
+    recipe.workload = workload;
+    Some(())
+}
+
+/// Decode a field; empty string → `None`. Used for nullable string fields
+/// (exe, cwd, etc.) where the empty-tab sentinel means "no value recorded".
+fn decode_field_or_none(s: &str) -> Option<Option<String>> {
+    if s.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(percent_decode_field(s)?))
+    }
 }
 
 fn load_groups() -> Option<Vec<SavedGroup>> {
@@ -5384,6 +5632,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
                 wm_class: sm.wm_class.clone(),
                 custom_prefix: sm.custom_prefix.clone(),
                 live_wid,
+                recipe: sm.recipe.clone(),
             });
         }
 
@@ -6895,11 +7144,13 @@ mod tests {
                         label: "Firefox".to_string(),
                         wm_class: "Navigator".to_string(),
                         custom_prefix: "FF".to_string(),
+                        recipe: None,
                     },
                     SavedMember {
                         label: "Chrome".to_string(),
                         wm_class: "google-chrome".to_string(),
                         custom_prefix: String::new(),
+                        recipe: None,
                     },
                 ],
             },
@@ -6911,6 +7162,7 @@ mod tests {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal-server".to_string(),
                     custom_prefix: "Dev".to_string(),
+                    recipe: None,
                 }],
             },
         ];
@@ -6949,8 +7201,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = groups_path_in(&dir);
 
-        // Wrong version
-        std::fs::write(&path, "v2\nGROUP\tFoo\t0\n").unwrap();
+        // Wrong version — v99 isn't a recognized header (v1 and v2 are).
+        std::fs::write(&path, "v99\nGROUP\tFoo\t0\n").unwrap();
         assert!(load_groups_from(&path).is_none());
 
         // Bad collapsed value
@@ -7014,6 +7266,7 @@ mod tests {
                 label: "Firefox".to_string(),
                 wm_class: "Navigator".to_string(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
 
@@ -7044,16 +7297,19 @@ mod tests {
                     label: "Firefox".to_string(),
                     wm_class: "Navigator".to_string(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
                 SavedMember {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal".to_string(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
                 SavedMember {
                     label: "Code".to_string(),
                     wm_class: "code".to_string(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
             ],
         }];
@@ -7083,6 +7339,7 @@ mod tests {
                 label: "Terminal".to_string(),
                 wm_class: "gnome-terminal".to_string(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
 
@@ -7115,18 +7372,21 @@ mod tests {
                     wm_class: "ac".into(),
                     custom_prefix: "".into(),
                     live_wid: Some(11),
+                    recipe: None,
                 },
                 GroupMember {
                     label: "B".into(),
                     wm_class: "bc".into(),
                     custom_prefix: "".into(),
                     live_wid: None,
+                    recipe: None,
                 },
                 GroupMember {
                     label: "C".into(),
                     wm_class: "cc".into(),
                     custom_prefix: "".into(),
                     live_wid: Some(33),
+                    recipe: None,
                 },
             ],
         };
@@ -7150,11 +7410,13 @@ mod tests {
                     label: "Firefox".into(),
                     wm_class: "Navigator".into(),
                     custom_prefix: "FF".into(),
+                    recipe: None,
                 },
                 SavedMember {
                     label: "Slack".into(),
                     wm_class: "Slack".into(),
                     custom_prefix: "Chat".into(),
+                    recipe: None,
                 },
             ],
         }];
@@ -7188,6 +7450,7 @@ mod tests {
                 label: "claude - process-tab-manager".into(),
                 wm_class: "Gnome-terminal".into(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -7215,6 +7478,7 @@ mod tests {
                 label: "different".into(),
                 wm_class: "Gnome-terminal".into(), // not Firefox
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -7244,11 +7508,13 @@ mod tests {
                     label: "UAT-window-B".into(),
                     wm_class: "Gnome-terminal".into(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
                 SavedMember {
                     label: "UAT-window-A".into(),
                     wm_class: "Gnome-terminal".into(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
             ],
         }];
@@ -7293,6 +7559,7 @@ mod tests {
                 label: "ptm-test-window".into(),
                 wm_class: "Gnome-terminal".into(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -7328,6 +7595,7 @@ mod tests {
                 wm_class: "vim".into(),
                 custom_prefix: String::new(),
                 live_wid: None, // ghost
+                recipe: None,
             }],
         });
         app.display_order.push(DisplaySlot::Group(gid));
@@ -7353,6 +7621,7 @@ mod tests {
                 label: "Terminal".to_string(),
                 wm_class: "xterm".to_string(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
 
@@ -7377,11 +7646,13 @@ mod tests {
                     label: "Firefox".to_string(),
                     wm_class: "Navigator".to_string(),
                     custom_prefix: "Browser".to_string(),
+                    recipe: None,
                 },
                 SavedMember {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal".to_string(),
                     custom_prefix: String::new(),
+                    recipe: None,
                 },
             ],
         }];
@@ -8130,6 +8401,7 @@ mod tests {
             wm_class: String::new(),
             custom_prefix: String::new(),
             live_wid: None,
+            recipe: None,
         });
         app.build_display_rows();
     }
@@ -9169,6 +9441,7 @@ mod tests {
                 label: "Foo".to_string(),
                 wm_class: "FooClass".to_string(),
                 custom_prefix: String::new(),
+                recipe: None,
             }],
         }];
         super::restore_groups(&mut app, &saved);
@@ -9528,6 +9801,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── Phase 5b: v2 reader, percent-coding, LAYER1/TMUX/LAYER2 parsing ──
+
+    #[test]
+    fn percent_encode_round_trip_basic() {
+        assert_eq!(super::percent_encode_field("hello"), "hello");
+        assert_eq!(super::percent_decode_field("hello"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn percent_encode_round_trip_special_chars() {
+        let s = "tab\there\nnewline\0and 100% real";
+        let encoded = super::percent_encode_field(s);
+        // tab → %09, newline → %0a, % → %25 (the literal NUL byte stays as is)
+        assert!(encoded.contains("%09"));
+        assert!(encoded.contains("%0a"));
+        assert!(encoded.contains("%25"));
+        let decoded = super::percent_decode_field(&encoded).unwrap();
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn percent_decode_rejects_malformed() {
+        // %XY where XY isn't hex
+        assert_eq!(super::percent_decode_field("oops%XY"), None);
+        // % at end with no follow-up
+        assert_eq!(super::percent_decode_field("oops%"), None);
+        // % followed by one char
+        assert_eq!(super::percent_decode_field("oops%2"), None);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_with_no_layer_lines() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_no_layers");
+        let path = write_groups_file(
+            &dir,
+            "v2\nGROUP\tWork\t0\tnormal\nMEMBER\tFox\tfirefox\t\n",
+        );
+        let loaded = super::load_groups_from(&path).expect("v2 with no layers should load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].members.len(), 1);
+        assert!(loaded[0].members[0].recipe.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_layer1_only() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_layer1");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tFox\tfirefox\t\n\
+                    LAYER1\t/usr/bin/firefox\t/home/steve\t5023\t1\tfirefox\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("v2 LAYER1-only should load");
+        let m = &loaded[0].members[0];
+        let r = m.recipe.as_ref().expect("recipe populated");
+        assert_eq!(r.exe.as_deref(), Some("/usr/bin/firefox"));
+        assert_eq!(r.cwd.as_deref(), Some("/home/steve"));
+        assert_eq!(r.pid_at_save, Some(5023));
+        assert_eq!(r.cmdline.as_ref().map(|v| v.as_slice()), Some(&["firefox".to_string()][..]));
+        assert!(r.tmux.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_tmux_binding() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_tmux");
+        // tmux pane ids start with `%` which is the percent-encoding
+        // escape character — the writer encodes them as `%255`, `%250`,
+        // etc. so the unencoded value round-trips. session_id starts with
+        // `$` which has no special meaning and passes through.
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    TMUX\tptm-dev\t$3\t%255\t500\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("v2 TMUX should load");
+        let r = loaded[0].members[0].recipe.as_ref().unwrap();
+        let t = r.tmux.as_ref().expect("tmux binding populated");
+        assert_eq!(t.session_name, "ptm-dev");
+        assert_eq!(t.session_id.as_deref(), Some("$3"));
+        assert_eq!(t.pane, "%5");
+        assert_eq!(t.pane_pid, 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_tmux_empty_session_id_is_none() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_tmux_no_id");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    TMUX\tmysession\t\t%250\t100\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("empty session_id should load");
+        let t = loaded[0].members[0].recipe.as_ref().unwrap().tmux.as_ref().unwrap();
+        assert!(t.session_id.is_none());
+        assert_eq!(t.pane, "%0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_layer2_job() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_l2_job");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER2\tjob\t/home/steve/.local/bin/claude\t/home/steve/dev\t2\tclaude\t--dangerously-skip-permissions\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("LAYER2 job should load");
+        match &loaded[0].members[0].recipe.as_ref().unwrap().workload {
+            super::WorkloadCapture::Job { exe, cmdline, cwd } => {
+                assert_eq!(exe.as_deref(), Some("/home/steve/.local/bin/claude"));
+                assert_eq!(cmdline, &vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()]);
+                assert_eq!(cwd.as_deref(), Some("/home/steve/dev"));
+            }
+            other => panic!("expected Job, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_layer2_idle() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_l2_idle");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER2\tidle\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("LAYER2 idle should load");
+        assert_eq!(
+            loaded[0].members[0].recipe.as_ref().unwrap().workload,
+            super::WorkloadCapture::Idle
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_loads_layer2_unreachable() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_l2_unreach");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tfox\tfirefox\t\n\
+                    LAYER2\tunreachable\tno shell descendant under window pid 999\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("LAYER2 unreachable should load");
+        match &loaded[0].members[0].recipe.as_ref().unwrap().workload {
+            super::WorkloadCapture::Unreachable { reason } => {
+                assert_eq!(reason, "no shell descendant under window pid 999");
+            }
+            other => panic!("expected Unreachable, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_two_layer1_under_one_member_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_two_l1");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER1\t/usr/bin/xterm\t/home/steve\t100\t1\txterm\n\
+                    LAYER1\t/usr/bin/zsh\t/home/steve\t200\t1\tzsh\n";
+        let path = write_groups_file(&dir, body);
+        assert!(super::load_groups_from(&path).is_none(),
+            "two LAYER1 lines for one member must reject");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_layer1_before_any_member_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_l1_orphan");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    LAYER1\t/usr/bin/xterm\t/home/steve\t100\t1\txterm\n";
+        let path = write_groups_file(&dir, body);
+        assert!(super::load_groups_from(&path).is_none(),
+            "LAYER1 before any MEMBER must reject");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_unknown_line_type_skipped() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_unknown");
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    FUTURE\tsome\tfuture\tline\n\
+                    LAYER1\t/usr/bin/xterm\t/home/steve\t100\t1\txterm\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path)
+            .expect("unknown line type in v2 should skip, not reject");
+        // The FUTURE line should not have disturbed the current-member pointer:
+        // LAYER1 still attaches to the (only) MEMBER.
+        assert!(loaded[0].members[0].recipe.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v1_with_layer_line_rejects() {
+        // v1 is frozen; LAYER* lines must not appear there. If they do,
+        // the file is malformed.
+        let dir = std::env::temp_dir().join("ptm_test_v1_layer_line");
+        let body = "v1\n\
+                    GROUP\tWork\t0\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER1\t/usr/bin/xterm\t/home/steve\t100\t1\txterm\n";
+        let path = write_groups_file(&dir, body);
+        assert!(super::load_groups_from(&path).is_none(),
+            "v1 with a layer line must reject");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_layer1_argc_mismatch_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_argc_bad");
+        // argc=3 but only 1 arg follows.
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER1\t/usr/bin/xterm\t/home/steve\t100\t3\txterm\n";
+        let path = write_groups_file(&dir, body);
+        assert!(super::load_groups_from(&path).is_none(),
+            "argc mismatch must reject");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_groups_v2_decodes_tab_in_cmdline_arg() {
+        let dir = std::env::temp_dir().join("ptm_test_v2_tab_arg");
+        // An arg containing a tab: encoded as `%09`. Round-trips through
+        // the field-level percent-decoder.
+        let body = "v2\n\
+                    GROUP\tWork\t0\tnormal\n\
+                    MEMBER\tterm\tGnome-terminal\t\n\
+                    LAYER1\t/bin/echo\t/tmp\t100\t2\techo\thi%09there\n";
+        let path = write_groups_file(&dir, body);
+        let loaded = super::load_groups_from(&path).expect("tab-in-arg should decode");
+        let cmd = loaded[0].members[0].recipe.as_ref().unwrap().cmdline.as_ref().unwrap();
+        assert_eq!(cmd[1], "hi\tthere");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── T4.4: TmuxSystem group derivation + rendering ──
 
     fn make_system_group(app: &mut App, sessions: &[&str]) -> u32 {
@@ -9540,6 +10055,7 @@ mod tests {
                 wm_class: String::new(),
                 custom_prefix: String::new(),
                 live_wid: None,
+                recipe: None,
             })
             .collect();
         app.groups.push(super::Group {
@@ -9587,12 +10103,14 @@ mod tests {
                     wm_class: String::new(),
                     custom_prefix: String::new(),
                     live_wid: None,
+                    recipe: None,
                 },
                 super::GroupMember {
                     label: "b".into(),
                     wm_class: String::new(),
                     custom_prefix: String::new(),
                     live_wid: None,
+                    recipe: None,
                 },
             ],
         };
@@ -9614,12 +10132,14 @@ mod tests {
                     wm_class: String::new(),
                     custom_prefix: String::new(),
                     live_wid: None,
+                    recipe: None,
                 },
                 super::GroupMember {
                     label: "b".into(),
                     wm_class: String::new(),
                     custom_prefix: String::new(),
                     live_wid: None,
+                    recipe: None,
                 },
             ],
         };
@@ -10883,6 +11403,7 @@ mod tests {
             exe: Some("/usr/bin/firefox".to_string()),
             cmdline: Some(vec!["firefox".to_string()]),
             cwd: Some("/home/steve".to_string()),
+            pid_at_save: Some(999),
             tmux: None,
             workload: super::WorkloadCapture::Unreachable {
                 reason: reason.to_string(),
@@ -10895,6 +11416,7 @@ mod tests {
             exe: Some("/usr/bin/gnome-terminal-server".to_string()),
             cmdline: Some(vec!["gnome-terminal-server".to_string()]),
             cwd: Some("/home/steve".to_string()),
+            pid_at_save: Some(999),
             tmux: Some(super::TmuxBinding {
                 session_name: "ptm-dev".to_string(),
                 session_id: Some("$3".to_string()),
@@ -10914,6 +11436,7 @@ mod tests {
             exe: Some("/usr/bin/xterm".to_string()),
             cmdline: Some(vec!["xterm".to_string()]),
             cwd: Some("/home/steve".to_string()),
+            pid_at_save: Some(999),
             tmux: None,
             workload: super::WorkloadCapture::Idle,
         }
@@ -11042,6 +11565,7 @@ mod tests {
                 wm_class: "xterm".into(),
                 custom_prefix: String::new(),
                 live_wid: Some(30),
+                recipe: None,
             }],
         });
         app.next_group_id = 1;

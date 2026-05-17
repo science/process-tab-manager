@@ -30,6 +30,14 @@ const CHAR_WIDTH: i16 = 8; // approximate for Nimbus Mono L 13px
 /// truncation uses this same width as its right-edge reserve.
 const SESSION_CLOSE_BAND_WIDTH: i16 = 16;
 
+/// Sidebar health banner sits ABOVE the "+ New terminal" header row when
+/// PTM has detected a spawn-related problem. Hidden (zero-height) when
+/// `HealthState::Healthy`, so a healthy PTM keeps the same layout as
+/// pre-Cluster-6.
+const HEALTH_BANNER_H: u16 = 18;
+/// Gap between banner row and the header button row below it.
+const HEALTH_BANNER_GAP: i16 = 2;
+
 // How long a pending attach claim stays live waiting for its new window to
 // appear before giving up. Cheap upper bound — typical gnome-terminal launch
 // is ~300 ms on this machine; anything past a few seconds means the spawn
@@ -59,6 +67,13 @@ const SELECTION_BG_COLOR: u32 = 0x3a5a7e;
 // Accent colors for left-edge stripe (OneDark)
 const ACCENT_COLORS: &[u32] = &[0xe06c75, 0x98c379, 0x61afef, 0xc678dd, 0xe5c07b, 0x56b6c2];
 const GROUP_COLORS: &[u32] = &[0x61afef, 0xe06c75, 0x98c379, 0xc678dd, 0xe5c07b, 0x56b6c2];
+
+// Health banner colors (Cluster 6). Amber for Degraded, red for Broken.
+// Foreground text colors are chosen to keep contrast against the background.
+const HEALTH_AMBER_BG: u32 = 0xc88a2a;
+const HEALTH_AMBER_FG: u32 = 0x111111;
+const HEALTH_RED_BG: u32 = 0xc0392b;
+const HEALTH_RED_FG: u32 = 0xffffff;
 
 
 // ── Atoms ──
@@ -776,6 +791,288 @@ fn emit_watchdog_event(event: &WatchdogEvent) {
     append_to_warnings_log(&s);
 }
 
+// ── Health board (Cluster 6) ──
+//
+// Sidebar-visible state machine that summarises whether terminal spawns
+// are working. Click-driven (the watchdog feeds it) plus a one-shot
+// PATH-resolve check at startup. See docs/spawn-failure-diagnostics.md
+// Part C for the design rationale.
+
+/// Visible health states. `Healthy` is the default and renders no banner;
+/// `Degraded` shows an amber banner; `Broken` shows a red banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthState {
+    Healthy,
+    Degraded,
+    Broken,
+}
+
+impl HealthState {
+    fn as_str(self) -> &'static str {
+        match self {
+            HealthState::Healthy => "Healthy",
+            HealthState::Degraded => "Degraded",
+            HealthState::Broken => "Broken",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Healthy" => Some(HealthState::Healthy),
+            "Degraded" => Some(HealthState::Degraded),
+            "Broken" => Some(HealthState::Broken),
+            _ => None,
+        }
+    }
+}
+
+/// Kinds of events the health board records. Mirrors `WatchdogEvent`
+/// plus `TerminalUnavailable` (synthesised at startup when PATH resolve
+/// fails) so a single sink covers both signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthEventKind {
+    SpawnSlow,
+    SpawnWedged,
+    SpawnExitedNonZero,
+    QueueFull,
+    TerminalUnavailable,
+}
+
+impl HealthEventKind {
+    #[allow(dead_code)] // wired up by Commit 2 (watchdog → state machine)
+    fn as_str(self) -> &'static str {
+        match self {
+            HealthEventKind::SpawnSlow => "SpawnSlow",
+            HealthEventKind::SpawnWedged => "SpawnWedged",
+            HealthEventKind::SpawnExitedNonZero => "SpawnExitedNonZero",
+            HealthEventKind::QueueFull => "QueueFull",
+            HealthEventKind::TerminalUnavailable => "TerminalUnavailable",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "SpawnSlow" => Some(HealthEventKind::SpawnSlow),
+            "SpawnWedged" => Some(HealthEventKind::SpawnWedged),
+            "SpawnExitedNonZero" => Some(HealthEventKind::SpawnExitedNonZero),
+            "QueueFull" => Some(HealthEventKind::QueueFull),
+            "TerminalUnavailable" => Some(HealthEventKind::TerminalUnavailable),
+            _ => None,
+        }
+    }
+}
+
+/// A single observation. `at` is seconds since the Unix epoch (chosen
+/// because it serialises cheaply and lets the popup format relative
+/// strings like "2 minutes ago"). `terminal` is the argv[0] we tried to
+/// spawn, when known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthEvent {
+    at: u64,
+    kind: HealthEventKind,
+    terminal: Option<String>,
+}
+
+/// Cap on `HealthBoard::recent_events`. The popup only needs the most
+/// recent handful for its "what PTM noticed" line; keeping the vec
+/// bounded prevents a tight wedge loop from growing the persisted file
+/// without limit.
+#[allow(dead_code)] // used by Commit 2 once watchdog events feed the board
+const HEALTH_EVENTS_CAP: usize = 20;
+
+/// Window over which repeated `SpawnSlow` events escalate Degraded →
+/// Broken. Matches the plan's "2× SpawnSlow within 5 min" rule.
+#[allow(dead_code)] // used by Commit 2's transition logic
+const HEALTH_ESCALATION_WINDOW_SECS: u64 = 5 * 60;
+
+/// Persisted health-board snapshot. Loaded once at App::new; rewritten
+/// on every state transition + every dismissal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthBoard {
+    state: HealthState,
+    last_transition_at: Option<u64>,
+    last_reason_short: String,
+    recent_events: Vec<HealthEvent>,
+}
+
+impl HealthBoard {
+    fn healthy() -> Self {
+        Self {
+            state: HealthState::Healthy,
+            last_transition_at: None,
+            last_reason_short: String::new(),
+            recent_events: Vec::new(),
+        }
+    }
+}
+
+/// Persisted-format version. Bump if the on-disk schema changes; the
+/// reader treats any other value as a missing file (load returns
+/// `HealthBoard::healthy()`).
+const HEALTH_STATE_VERSION: &str = "v1";
+
+/// Where the health board is persisted. Mirrors `warnings_log_path` so
+/// PTM keeps all its cache state under `$XDG_CACHE_HOME/ptm/`.
+fn health_state_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".cache");
+            p
+        });
+    let mut p = base;
+    p.push("ptm");
+    p.push("health-state");
+    p
+}
+
+/// Serialise a HealthBoard to the tab-separated key=value format
+/// (consistent with the v2 groups file). String fields are
+/// percent-encoded so embedded tabs / newlines round-trip safely.
+#[allow(dead_code)] // called by save_health_board, wired up in Commit 2
+fn serialize_health_board(board: &HealthBoard) -> String {
+    let mut out = String::new();
+    out.push_str(HEALTH_STATE_VERSION);
+    out.push('\n');
+    out.push_str(&format!("STATE\t{}\n", board.state.as_str()));
+    if let Some(at) = board.last_transition_at {
+        out.push_str(&format!("LAST_TRANSITION_AT\t{}\n", at));
+    }
+    if !board.last_reason_short.is_empty() {
+        out.push_str(&format!(
+            "LAST_REASON_SHORT\t{}\n",
+            percent_encode_field(&board.last_reason_short)
+        ));
+    }
+    for ev in &board.recent_events {
+        let term = ev
+            .terminal
+            .as_deref()
+            .map(percent_encode_field)
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "EVENT\t{}\t{}\t{}\n",
+            ev.at,
+            ev.kind.as_str(),
+            term
+        ));
+    }
+    out
+}
+
+/// Parse the on-disk health board. Returns `None` for any kind of
+/// malformation — a missing header, unknown version, unparseable line —
+/// so the loader can fall back to `HealthBoard::healthy()`. Unknown
+/// line types are silently skipped (forward-compat hatch).
+fn parse_health_board(contents: &str) -> Option<HealthBoard> {
+    let mut lines = contents.lines();
+    let header = lines.next()?.trim();
+    if header != HEALTH_STATE_VERSION {
+        return None;
+    }
+    let mut state = HealthState::Healthy;
+    let mut last_transition_at: Option<u64> = None;
+    let mut last_reason_short = String::new();
+    let mut events = Vec::new();
+    for raw in lines {
+        let line = raw.trim_end_matches('\n');
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let key = parts.next()?;
+        match key {
+            "STATE" => {
+                let v = parts.next()?;
+                state = HealthState::parse(v)?;
+            }
+            "LAST_TRANSITION_AT" => {
+                let v = parts.next()?;
+                last_transition_at = Some(v.parse().ok()?);
+            }
+            "LAST_REASON_SHORT" => {
+                let v = parts.next()?;
+                last_reason_short = percent_decode_field(v)?;
+            }
+            "EVENT" => {
+                let at: u64 = parts.next()?.parse().ok()?;
+                let kind = HealthEventKind::parse(parts.next()?)?;
+                let term_raw = parts.next().unwrap_or("");
+                let terminal = if term_raw.is_empty() {
+                    None
+                } else {
+                    Some(percent_decode_field(term_raw)?)
+                };
+                events.push(HealthEvent {
+                    at,
+                    kind,
+                    terminal,
+                });
+            }
+            _ => {
+                // Unknown line type — ignore for forward compatibility.
+            }
+        }
+    }
+    Some(HealthBoard {
+        state,
+        last_transition_at,
+        last_reason_short,
+        recent_events: events,
+    })
+}
+
+/// Load the persisted health board, returning a Healthy default if the
+/// file is missing or malformed (any parse error → log + reset). This
+/// is the behaviour the plan requires: "load-with-malformed-json
+/// (recover to Healthy + log)".
+fn load_health_board() -> HealthBoard {
+    let path = health_state_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HealthBoard::healthy(),
+        Err(e) => {
+            eprintln!(
+                "[ptm] failed to read health state {}: {}",
+                path.display(),
+                e
+            );
+            return HealthBoard::healthy();
+        }
+    };
+    parse_health_board(&contents).unwrap_or_else(|| {
+        eprintln!(
+            "[ptm] malformed health state file {}; resetting to Healthy",
+            path.display()
+        );
+        HealthBoard::healthy()
+    })
+}
+
+/// Persist the health board atomically. Errors are swallowed (matching
+/// `append_to_warnings_log`'s no-crash discipline — losing the file is
+/// preferable to crashing PTM mid-event).
+#[allow(dead_code)] // wired up by Commit 2 (transition triggers save)
+fn save_health_board(board: &HealthBoard) {
+    let path = health_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = write_atomic(&path, serialize_health_board(board).as_bytes());
+}
+
+/// Seconds since the Unix epoch. Wrapper around `SystemTime::now()` so
+/// callers don't repeat the conversion.
+#[allow(dead_code)] // wired up by Commit 2 transitions
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// If the queue head is Queued, dispatch it: call the right spawn fn for
 /// its kind, attach the resulting `Child` via `record_dispatch`. Called
 /// from `refresh_items` after `claim_pending_spawns` / `tick_watchdog`
@@ -1151,6 +1448,13 @@ struct App {
     /// implicitly: after DROP_HIGHLIGHT_DURATION elapses, the renderer
     /// stops drawing the highlight even if the field is still set.
     last_drop_highlight: Option<(u32, std::time::Instant)>,
+    /// Persisted health board (Cluster 6). Loaded at startup; rewritten
+    /// on every transition or dismissal. Drives the sidebar banner row.
+    health: HealthBoard,
+    /// `Dismiss until restart` flag. In-memory only — by definition the
+    /// user clearing this in process A doesn't extend to process B, so
+    /// it never hits disk. Reset on every `App::new`.
+    health_dismissed_this_session: bool,
 }
 
 /// How long a successful-drop row highlight stays visible before fading out.
@@ -1188,6 +1492,8 @@ impl App {
             first_dirty_at: None,
             last_dirty_at: None,
             last_drop_highlight: None,
+            health: HealthBoard::healthy(),
+            health_dismissed_this_session: false,
         }
     }
 
@@ -1203,7 +1509,41 @@ impl App {
     }
 
     fn hit_test_header_button(&self, y: i16) -> bool {
-        y >= 0 && y < HEADER_H as i16
+        let off = self.banner_height();
+        y >= off && y < off + HEADER_H as i16
+    }
+
+    /// Vertical offset that all sidebar content sits below. Zero when
+    /// the health board is `Healthy` (no banner — layout unchanged);
+    /// otherwise the banner row height plus a small bottom gap.
+    fn banner_height(&self) -> i16 {
+        if self.banner_visible() {
+            HEALTH_BANNER_H as i16 + HEALTH_BANNER_GAP
+        } else {
+            0
+        }
+    }
+
+    /// Centralised visibility predicate so render + hit-test +
+    /// notification paths all agree on when the banner is shown. The
+    /// in-session dismissal flag suppresses the banner until the next
+    /// PTM restart (cf. plan's "Don't show until restart" button).
+    fn banner_visible(&self) -> bool {
+        if self.health_dismissed_this_session {
+            return false;
+        }
+        !matches!(self.health.state, HealthState::Healthy)
+    }
+
+    /// Returns true when (x, y) lands in the health banner row. Always
+    /// false when the banner is hidden (the row has zero height).
+    #[allow(dead_code)] // popup dispatch wired up by Commit 3
+    fn hit_test_health_banner(&self, x: i16, y: i16) -> bool {
+        if !self.banner_visible() {
+            return false;
+        }
+        let w = self.width as i16;
+        x >= 0 && x < w && y >= 0 && y < HEALTH_BANNER_H as i16
     }
 
     /// Queue a spawn request. If the queue was empty, returns
@@ -1261,7 +1601,11 @@ impl App {
         if !self.hit_test_header_button(y) {
             return None;
         }
-        let (left, right_opt) = top_buttons_layout(self.tmux_available, self.width);
+        let (left, right_opt) = top_buttons_layout(
+            self.tmux_available,
+            self.width,
+            self.banner_height(),
+        );
         if point_in_rect(x, y, &left) {
             return Some(TopButton::NewTerminal);
         }
@@ -1346,7 +1690,9 @@ impl App {
     }
 
     fn row_y(&self, index: usize) -> i16 {
-        ITEM_Y_START + (index as i16) * (ITEM_H as i16 + ITEM_SPACING)
+        ITEM_Y_START
+            + self.banner_height()
+            + (index as i16) * (ITEM_H as i16 + ITEM_SPACING)
     }
 
     fn hit_test_row(&self, y: i16) -> Option<usize> {
@@ -2051,7 +2397,7 @@ fn is_target_system_group(app: &App, gid: u32) -> bool {
 fn indicator_y_for_target(app: &App, target: &DropTarget) -> i16 {
     let last_row_bottom = || {
         if app.display_rows.is_empty() {
-            ITEM_Y_START
+            ITEM_Y_START + app.banner_height()
         } else {
             app.row_y(app.display_rows.len() - 1) + ITEM_H as i16 + (ITEM_SPACING / 2)
         }
@@ -2800,10 +3146,16 @@ fn refresh_items(
 
 /// Layout for the top-row buttons. Returns the left button's rect and the
 /// right button's rect (None when tmux isn't installed — left button takes
-/// the full width). Pure: width comes in as a parameter so tests can pin
-/// behavior without constructing an App.
-fn top_buttons_layout(tmux_available: bool, width: u16) -> (Rectangle, Option<Rectangle>) {
-    let y: i16 = 4;
+/// the full width). Pure: width and banner_offset come in as parameters
+/// so tests can pin behavior without constructing an App. `banner_offset`
+/// is 0 when the health banner is hidden, otherwise the banner row height
+/// + bottom gap (so the buttons sit *below* the banner).
+fn top_buttons_layout(
+    tmux_available: bool,
+    width: u16,
+    banner_offset: i16,
+) -> (Rectangle, Option<Rectangle>) {
+    let y: i16 = 4 + banner_offset;
     let total_w = (width as i16 - ITEM_MARGIN * 2).max(20);
     let h = HEADER_H;
     if !tmux_available {
@@ -4234,6 +4586,10 @@ struct Renderer {
     group_color_pixels: Vec<u32>,
     session_marker_pixel: u32,
     selection_bg_pixel: u32,
+    health_amber_bg_pixel: u32,
+    health_amber_fg_pixel: u32,
+    health_red_bg_pixel: u32,
+    health_red_fg_pixel: u32,
 }
 
 impl Renderer {
@@ -4260,6 +4616,10 @@ impl Renderer {
         let group_header_pixel = alloc_color(conn, colormap, GROUP_HEADER_COLOR)?;
         let session_marker_pixel = alloc_color(conn, colormap, SESSION_MARKER_COLOR)?;
         let selection_bg_pixel = alloc_color(conn, colormap, SELECTION_BG_COLOR)?;
+        let health_amber_bg_pixel = alloc_color(conn, colormap, HEALTH_AMBER_BG)?;
+        let health_amber_fg_pixel = alloc_color(conn, colormap, HEALTH_AMBER_FG)?;
+        let health_red_bg_pixel = alloc_color(conn, colormap, HEALTH_RED_BG)?;
+        let health_red_fg_pixel = alloc_color(conn, colormap, HEALTH_RED_FG)?;
 
         let mut group_color_pixels = Vec::new();
         for &c in GROUP_COLORS {
@@ -4312,6 +4672,10 @@ impl Renderer {
             group_color_pixels,
             session_marker_pixel,
             selection_bg_pixel,
+            health_amber_bg_pixel,
+            health_amber_fg_pixel,
+            health_red_bg_pixel,
+            health_red_fg_pixel,
         })
     }
 
@@ -4353,6 +4717,10 @@ impl Renderer {
                 height: app.height,
             }],
         )?;
+
+        // Draw the health banner (Cluster 6) — sits ABOVE the header
+        // button row. No-op when state is Healthy (zero-height).
+        self.draw_health_banner(conn, pix, app)?;
 
         // Draw the "+ New terminal" header button above the item list.
         self.draw_top_buttons(conn, pix, app)?;
@@ -4560,13 +4928,69 @@ impl Renderer {
         Ok(())
     }
 
+    /// Paint the health banner at the very top of the sidebar. No-op
+    /// when `app.banner_visible()` is false (state is Healthy or the
+    /// user dismissed this session).
+    fn draw_health_banner(
+        &self,
+        conn: &impl Connection,
+        drawable: Drawable,
+        app: &App,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !app.banner_visible() {
+            return Ok(());
+        }
+        let (bg_pixel, fg_pixel, label) = match app.health.state {
+            HealthState::Healthy => return Ok(()),
+            HealthState::Degraded => (
+                self.health_amber_bg_pixel,
+                self.health_amber_fg_pixel,
+                "! Terminal spawn slow - click for details",
+            ),
+            HealthState::Broken => (
+                self.health_red_bg_pixel,
+                self.health_red_fg_pixel,
+                "X Terminals not opening - click for fix",
+            ),
+        };
+        let rect = Rectangle {
+            x: 0,
+            y: 0,
+            width: app.width,
+            height: HEALTH_BANNER_H,
+        };
+        conn.change_gc(self.gc, &ChangeGCAux::new().foreground(bg_pixel))?;
+        conn.poly_fill_rectangle(drawable, self.gc, &[rect])?;
+        // Reset bg too — image_text8 paints each glyph cell using the
+        // GC's background, so without this the text would land on a
+        // BG_COLOR cell instead of the banner-coloured one.
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().foreground(fg_pixel).background(bg_pixel),
+        )?;
+        let max_chars = ((app.width as i16 - 12) / CHAR_WIDTH).max(0) as usize;
+        let display: String = label.chars().take(max_chars).collect();
+        if !display.is_empty() {
+            // Centre the label vertically inside the banner band.
+            let text_y = (HEALTH_BANNER_H as i16 / 2) + 4;
+            conn.image_text8(drawable, self.gc, 6, text_y, display.as_bytes())?;
+        }
+        // Restore default bg so downstream draws aren't tinted.
+        conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new().background(self.bg_pixel),
+        )?;
+        Ok(())
+    }
+
     fn draw_top_buttons(
         &self,
         conn: &impl Connection,
         drawable: Drawable,
         app: &App,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (left, right_opt) = top_buttons_layout(app.tmux_available, app.width);
+        let (left, right_opt) =
+            top_buttons_layout(app.tmux_available, app.width, app.banner_height());
         self.draw_top_button(
             conn,
             drawable,
@@ -5802,7 +6226,12 @@ fn percent_encode_field(s: &str) -> String {
             b'%' => out.push_str("%25"),
             b'\t' => out.push_str("%09"),
             b'\n' => out.push_str("%0a"),
-            _ => out.push(b as char),
+            // Pass through printable ASCII verbatim; percent-encode every
+            // non-ASCII byte (>=0x80) so multi-byte UTF-8 sequences round
+            // trip byte-for-byte. Without this, the em-dash in a saved
+            // label would become "â\u{80}\u{94}" on the next load.
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("%{:02x}", b)),
         }
     }
     out
@@ -7008,6 +7437,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut app = App::new(window);
+    // Hydrate health board from disk before the first paint so the
+    // banner reflects the last persisted state (Cluster 6).
+    app.health = load_health_board();
     let mut renderer = Renderer::new(&conn, screen, window)?;
 
     conn.map_window(window)?;
@@ -12770,7 +13202,7 @@ mod tests {
 
     #[test]
     fn top_buttons_layout_one_button_when_tmux_unavailable() {
-        let (left, right_opt) = super::top_buttons_layout(false, 250);
+        let (left, right_opt) = super::top_buttons_layout(false, 250, 0);
         assert!(right_opt.is_none(), "no right button when tmux unavailable");
         assert_eq!(left.x, ITEM_MARGIN);
         // Full width minus margins.
@@ -12779,7 +13211,7 @@ mod tests {
 
     #[test]
     fn top_buttons_layout_two_buttons_when_tmux_available() {
-        let (left, right_opt) = super::top_buttons_layout(true, 250);
+        let (left, right_opt) = super::top_buttons_layout(true, 250, 0);
         let right = right_opt.expect("expected right button when tmux available");
         // Side-by-side, separated by TOP_BUTTON_GAP.
         assert_eq!(right.x, left.x + left.width as i16 + super::TOP_BUTTON_GAP);
@@ -12794,11 +13226,20 @@ mod tests {
     }
 
     #[test]
+    fn top_buttons_layout_offsets_by_banner_height() {
+        let (without, _) = super::top_buttons_layout(false, 250, 0);
+        let (with, _) = super::top_buttons_layout(false, 250, 20);
+        assert_eq!(with.y - without.y, 20, "banner offset must push buttons down");
+        assert_eq!(with.x, without.x);
+        assert_eq!(with.width, without.width);
+    }
+
+    #[test]
     fn hit_test_top_buttons_routes_left_to_new_terminal() {
         let mut app = make_app();
         app.tmux_available = true;
         app.width = 250;
-        let (left, _) = super::top_buttons_layout(true, 250);
+        let (left, _) = super::top_buttons_layout(true, 250, 0);
         let center_x = left.x + (left.width as i16 / 2);
         let center_y = left.y + (left.height as i16 / 2);
         assert_eq!(
@@ -12812,7 +13253,7 @@ mod tests {
         let mut app = make_app();
         app.tmux_available = true;
         app.width = 250;
-        let (_, right_opt) = super::top_buttons_layout(true, 250);
+        let (_, right_opt) = super::top_buttons_layout(true, 250, 0);
         let right = right_opt.unwrap();
         let center_x = right.x + (right.width as i16 / 2);
         let center_y = right.y + (right.height as i16 / 2);
@@ -13044,7 +13485,7 @@ mod tests {
         let mut app = make_app();
         app.tmux_available = true;
         app.width = 250;
-        let (left, _) = super::top_buttons_layout(true, 250);
+        let (left, _) = super::top_buttons_layout(true, 250, 0);
         // The gap is between the two buttons.
         let gap_x = left.x + left.width as i16 + 1;
         let gap_y = left.y + (left.height as i16 / 2);
@@ -14028,5 +14469,210 @@ mod tests {
         // Index is 1-based.
         assert_eq!(report[0].index, 1);
         assert_eq!(report[2].index, 3);
+    }
+
+    // ── Cluster 6: HealthBoard persistence + banner geometry ──
+
+    fn sample_health_board() -> super::HealthBoard {
+        super::HealthBoard {
+            state: super::HealthState::Broken,
+            last_transition_at: Some(1_715_898_324),
+            last_reason_short: "spawn wedged: + New Terminal — 10.1s".to_string(),
+            recent_events: vec![
+                super::HealthEvent {
+                    at: 1_715_898_191,
+                    kind: super::HealthEventKind::SpawnWedged,
+                    terminal: Some("x-terminal-emulator".to_string()),
+                },
+                super::HealthEvent {
+                    at: 1_715_898_242,
+                    kind: super::HealthEventKind::SpawnSlow,
+                    terminal: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn health_board_serialize_starts_with_version_header() {
+        let s = super::serialize_health_board(&sample_health_board());
+        assert!(
+            s.starts_with("v1\n"),
+            "expected v1 header, got: {:?}",
+            &s[..s.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn health_board_round_trips_through_persistence_format() {
+        let original = sample_health_board();
+        let s = super::serialize_health_board(&original);
+        let parsed = super::parse_health_board(&s).expect("round trip parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn health_board_round_trips_with_tabs_in_reason() {
+        // Tabs inside fields would otherwise collide with the line
+        // delimiter; percent-encoding must survive a round trip.
+        let mut b = sample_health_board();
+        b.last_reason_short = "weird\treason\nwith newline".to_string();
+        let s = super::serialize_health_board(&b);
+        let parsed = super::parse_health_board(&s).unwrap();
+        assert_eq!(parsed.last_reason_short, b.last_reason_short);
+    }
+
+    #[test]
+    fn health_board_round_trips_with_no_optional_fields() {
+        let b = super::HealthBoard::healthy();
+        let s = super::serialize_health_board(&b);
+        let parsed = super::parse_health_board(&s).unwrap();
+        assert_eq!(parsed, b);
+    }
+
+    #[test]
+    fn health_board_parse_unknown_version_returns_none() {
+        let parsed = super::parse_health_board("v999\nSTATE\tBroken\n");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn health_board_parse_unknown_line_is_ignored() {
+        // Forward-compat: a v3-only line type shouldn't reject the file.
+        let s = "v1\nSTATE\tDegraded\nFROM_THE_FUTURE\tblah\n";
+        let parsed = super::parse_health_board(s).unwrap();
+        assert_eq!(parsed.state, super::HealthState::Degraded);
+    }
+
+    #[test]
+    fn health_board_parse_garbage_returns_none() {
+        assert!(super::parse_health_board("not a health board").is_none());
+        assert!(super::parse_health_board("").is_none());
+        // Bad state value rejects.
+        assert!(super::parse_health_board("v1\nSTATE\tEhhh\n").is_none());
+    }
+
+    #[test]
+    fn load_health_board_returns_healthy_when_file_missing() {
+        // Point XDG_CACHE_HOME at a guaranteed-empty dir.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let loaded = super::load_health_board();
+        match prior {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert_eq!(loaded, super::HealthBoard::healthy());
+    }
+
+    #[test]
+    fn save_load_health_board_round_trip_on_disk() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let original = sample_health_board();
+        super::save_health_board(&original);
+        let loaded = super::load_health_board();
+        match prior {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn load_health_board_recovers_to_healthy_on_malformed_file() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        // Write garbage where the loader expects the v1 file.
+        let dir = tmp.path().join("ptm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("health-state"), b"completely-not-valid").unwrap();
+        let loaded = super::load_health_board();
+        match prior {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert_eq!(loaded, super::HealthBoard::healthy());
+    }
+
+    #[test]
+    fn banner_height_zero_when_healthy() {
+        let app = make_app();
+        assert_eq!(app.health.state, super::HealthState::Healthy);
+        assert_eq!(app.banner_height(), 0);
+        assert!(!app.banner_visible());
+    }
+
+    #[test]
+    fn banner_height_nonzero_when_degraded_or_broken() {
+        let mut app = make_app();
+        app.health.state = super::HealthState::Degraded;
+        let degraded_h = app.banner_height();
+        assert!(degraded_h > 0);
+        assert!(app.banner_visible());
+        app.health.state = super::HealthState::Broken;
+        assert_eq!(app.banner_height(), degraded_h);
+        assert!(app.banner_visible());
+    }
+
+    #[test]
+    fn banner_visible_suppressed_by_dismissal_flag() {
+        let mut app = make_app();
+        app.health.state = super::HealthState::Broken;
+        assert!(app.banner_visible());
+        app.health_dismissed_this_session = true;
+        assert!(!app.banner_visible());
+        assert_eq!(app.banner_height(), 0);
+    }
+
+    #[test]
+    fn row_y_shifts_down_by_banner_height_when_banner_visible() {
+        let mut app = make_app();
+        let healthy_y = app.row_y(0);
+        app.health.state = super::HealthState::Broken;
+        let broken_y = app.row_y(0);
+        assert_eq!(broken_y - healthy_y, app.banner_height());
+    }
+
+    #[test]
+    fn hit_test_health_banner_inside_when_visible() {
+        let mut app = make_app();
+        app.health.state = super::HealthState::Broken;
+        app.width = 250;
+        // Centre of the banner band.
+        assert!(app.hit_test_health_banner(125, super::HEALTH_BANNER_H as i16 / 2));
+    }
+
+    #[test]
+    fn hit_test_health_banner_outside_when_below_or_above() {
+        let mut app = make_app();
+        app.health.state = super::HealthState::Broken;
+        app.width = 250;
+        // Below the banner row.
+        assert!(!app.hit_test_health_banner(125, super::HEALTH_BANNER_H as i16 + 1));
+        // Above (negative y).
+        assert!(!app.hit_test_health_banner(125, -1));
+    }
+
+    #[test]
+    fn hit_test_health_banner_always_false_when_healthy() {
+        let app = make_app();
+        // Even at the centre of where the banner would be, no hit.
+        assert!(!app.hit_test_health_banner(125, 4));
+    }
+
+    #[test]
+    fn hit_test_header_button_offsets_for_banner() {
+        let mut app = make_app();
+        // Healthy: y=0 is in the header.
+        assert!(app.hit_test_header_button(0));
+        app.health.state = super::HealthState::Broken;
+        // Broken: y=0 is now in the banner; the header starts later.
+        assert!(!app.hit_test_header_button(0));
+        // A point at exactly banner_height should be the start of the header.
+        assert!(app.hit_test_header_button(app.banner_height()));
     }
 }

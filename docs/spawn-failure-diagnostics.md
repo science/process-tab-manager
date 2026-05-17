@@ -495,3 +495,381 @@ fix" — without any change to the sidebar UI.
 - **Auto-restarting `gnome-terminal-server`** without user consent.
   Even though it's user-process-only and reversible, silent fixes
   break the user's mental model.
+
+---
+
+## Part C — Agreed plan (locked 2026-05-16, ready for implementation)
+
+> **Audience:** the agent that picks up implementation (expected: dev-2
+> Claude session). This section is self-contained — read Part A for the
+> dev-1 findings that motivated it, Part B for the options considered,
+> and this section for the design we're actually building.
+
+### Context for the implementing agent (what got us here)
+
+1. dev-1 reported `+ New Terminal` / `+ New tmux` failing. Diag found
+   `gnome-terminal-server` (pid 2380, 29-day uptime) wedged for
+   new-window spawns; existing windows fine. Workaround for the user:
+   `pkill -f gnome-terminal-server` or `export PTM_TERMINAL_CMD=xterm`.
+2. dev-2 then shipped four commits (`0f5e6f6 → 641c91a`) implementing
+   **detection only**: symlink-canonicalize fix, spawn watchdog with
+   5s/10s thresholds, `ptm --diagnose` CLI, and `install.sh` terminal
+   nudge.
+3. User retested on dev-1 after the new binary installed: `+ New
+   Terminal` / `+ New tmux` **still appear to do nothing**. Reason: the
+   watchdog *correctly* writes warnings to `~/.cache/ptm/ptm-warnings.log`
+   and to stderr, but stderr is `/dev/null` for a detached PTM launch
+   and the user has no UI signal that anything is wrong. Detection
+   works; **surfacing is the gap.**
+4. This Part C closes that gap.
+
+### Locked decisions (please don't re-litigate)
+
+| Decision | Rationale |
+| --- | --- |
+| Detection is **click-driven only**, plus a single PATH-resolve check at startup. No periodic polling. | User only cares about spawn working at the moment of clicking. Idle-time daemon health has no user-visible consequence; the next click catches it within 10 s anyway. |
+| Surface via **sidebar banner + `notify-send` on state transitions + click-through popup**. | Banner is always-visible (sidebar is always-visible). Notification grabs attention on the Healthy→Degraded and Degraded→Broken edges only. Popup carries the diagnosis + actions. |
+| Each fix has **two buttons: `[Show command]` and `[Run it]`** — show is non-destructive; run requires a second click. | Explicit consent at each step. User can audit before granting execute. |
+| **No sudo, no auto-fix.** All actions run as the calling user; nothing happens without a click. | Silent remediation breaks the user's mental model. |
+| Persist banner state across PTM restarts via `~/.cache/ptm/health-state.json`. Persist user terminal overrides via `~/.config/ptm/overrides.toml`. | The user's #1 stated concern is "6 weeks later, go through this debug nonsense again." State has to outlive a PTM restart. |
+
+### Detection (two trigger points, one event stream)
+
+Both feed the same `WatchdogEvent` stream the existing watchdog already
+emits.
+
+**Trigger 1 — Click-driven (existing).** `tick_watchdog` in `src/main.rs`
+(around line 578) already emits `SpawnSlow` at 5 s and `SpawnWedged` at
+10 s. **No change needed to this path.** Just consume the events.
+
+**Trigger 2 — One-time PATH resolve at startup.** Right after PTM
+constructs its initial `App`, call something like:
+
+```rust
+fn resolve_terminal_argv0() -> Result<PathBuf, String> {
+    let argv = detect_terminal_command(/* env */, binary_on_path);
+    let name = argv.first().ok_or("empty argv")?.clone();
+    // PATH lookup (don't use canonicalize alone — see "Known bug")
+    binary_on_path_resolved(&name).ok_or(format!("{} not found in PATH", name))
+}
+```
+
+If `Err`, emit a synthetic `WatchdogEvent::TerminalUnavailable { name }`
+event into the same queue the watchdog uses. Banner transitions
+straight to Broken on startup. ~30 LOC.
+
+### State machine
+
+States: `Healthy → Degraded → Broken`. Two-way transitions:
+
+| From | To | Trigger |
+| --- | --- | --- |
+| `Healthy` | `Degraded` | First `SpawnSlow` in session |
+| `Healthy` | `Broken` | `SpawnWedged`, `TerminalUnavailable`, or 2× `SpawnSlow` within 5 min |
+| `Degraded` | `Broken` | `SpawnWedged` or second `SpawnSlow` within 5 min |
+| `Degraded` | `Healthy` | Successful spawn (a wid arrives that matches a `PendingSpawn`) |
+| `Broken` | `Healthy` | Successful spawn, OR user clicks `[Run it]` on a fix and the next spawn succeeds, OR user clicks `[Dismiss]` in the popup |
+
+Implementation: `enum HealthState { Healthy, Degraded, Broken }` on
+`App`, plus a `Vec<HealthEvent>` rolling buffer (cap ~20 — only used to
+populate the popup's "what PTM noticed" line). State changes call
+`persist_health_state()`.
+
+### Persistence
+
+**Health state** — `~/.cache/ptm/health-state.json` (alongside
+`recipes-snapshot.md` and `ptm-warnings.log`):
+
+```json
+{
+  "version": 1,
+  "state": "Broken",
+  "last_transition_at": "2026-05-16T18:25:24-07:00",
+  "last_reason_short": "spawn wedged: + New Terminal — no window after 10.1s",
+  "recent_events": [
+    { "at": "2026-05-16T18:23:11-07:00", "kind": "SpawnWedged", "terminal": "x-terminal-emulator" },
+    { "at": "2026-05-16T18:24:02-07:00", "kind": "SpawnWedged", "terminal": "x-terminal-emulator" }
+  ],
+  "dismissed_until_restart": false,
+  "dismissed_at_startup": null
+}
+```
+
+Loaded at `App::new`. If `dismissed_at_startup == current process startup
+time`, the banner stays hidden until a fresh event. Tests must cover:
+load-with-missing-file, load-with-malformed-json (recover to Healthy +
+log), version-mismatch (treat as missing).
+
+**User overrides** — `~/.config/ptm/overrides.toml`:
+
+```toml
+[terminal]
+# Wins over PTM_TERMINAL_CMD and TERMINAL env vars. Whitespace-split.
+# Empty/missing = no override.
+command = "xterm"
+```
+
+Read at startup; merged into `detect_terminal_command`'s precedence as
+**highest** (above `PTM_TERMINAL_CMD`). Tests: precedence over both env
+vars; empty value behaves like absent; whitespace splitting matches
+existing detect logic.
+
+### Surfacing
+
+**1. Sidebar banner row.** Reserve 16 px at the very top of the sidebar
+(*above* the `+ New Terminal` / `+ New tmux` button row — that placement
+puts it where the user's eye naturally lands on click). Layout:
+
+| State | Appearance | Text |
+| --- | --- | --- |
+| `Healthy` | Hidden (no row, no real-estate cost) | — |
+| `Degraded` | Amber background, dark text | `⚠ Terminal spawn slow — click for details` |
+| `Broken` | Red background, white text | `❌ Terminals not opening — click for fix` |
+
+Reuse the existing color palette in `src/main.rs` (OneDark). Click
+anywhere on the row → open the popup (reuses
+`open_context_menu`'s override-redirect + pointer-grab machinery —
+search `build_menu_entries` / `draw_context_menu` for the existing
+pattern).
+
+**2. `notify-send` on state transitions only.** Fire on
+`Healthy→Degraded` and `Healthy/Degraded→Broken`. Never per-event.
+Shell out:
+
+```rust
+let _ = std::process::Command::new("notify-send")
+    .args([
+        "--app-name=PTM",
+        if broken { "--urgency=critical" } else { "--urgency=normal" },
+        if broken { "PTM: terminals not opening" } else { "PTM: terminal spawn slow" },
+        &one_line_summary,
+    ])
+    .spawn();
+```
+
+`notify-send` may be absent (rare; it's in `libnotify-bin` on Debian /
+Ubuntu). Don't error if the binary's missing; the banner still works.
+
+**3. Popup** (override-redirect, pointer-grabbed, ESC/click-outside
+dismisses). Layout target — keep it ~360 px wide × ~280 px tall so it
+fits next to the sidebar without overlap. Rough wireframe:
+
+```
+┌──────────────────────────────────────────┐
+│ PTM noticed                              │
+│                                          │
+│ 3 terminal spawns failed in 10 minutes.  │
+│ Most likely: gnome-terminal-server is    │
+│ wedged (running 29 days; 12 stuck        │
+│ `gnome-terminal --wait` wrappers).       │
+│                                          │
+│ Fix 1: Restart gnome-terminal-server     │
+│   [Show command]  [Run it]               │
+│                                          │
+│ Fix 2: Use xterm instead                 │
+│   [Show command]  [Run it]               │
+│                                          │
+│ [Run `ptm --diagnose` for full report]   │
+│                                          │
+│ [Dismiss]   [Don't show until restart]   │
+└──────────────────────────────────────────┘
+```
+
+The "PTM noticed" body text is derived from `recent_events` +
+`format_watchdog_event` content (which already includes the
+copy-paste-safe fix lines — see `src/main.rs:656`). Reuse that
+formatter; don't fork the text.
+
+**`[Show command]`** expands a sub-row showing the literal shell line.
+No execution. Idempotent.
+
+**`[Run it]`** confirms once (the second click of `Show → Run` IS the
+confirmation; no extra dialog). Spawns the command via
+`Command::new("sh").arg("-c").arg(line)`, captures stdout+stderr, shows
+output in a sub-row for ~3 s, then closes the popup. State transitions
+when the next watchdog tick observes the result.
+
+### Diagnosis → fix table (the brain)
+
+A small in-source registry; expand as new symptoms come up.
+
+| Symptom (event pattern + sniff) | "PTM noticed" body | Fix 1 | Fix 2 |
+| --- | --- | --- | --- |
+| `SpawnWedged` × ≥1, argv[0] resolves to `*gnome-terminal*`, ≥1 stuck `gnome-terminal --wait` proc detected | "N terminal spawns failed; gnome-terminal-server appears unresponsive to new-window IPC (running N days, M stuck wrappers)." | Restart gnome-terminal-server → `pkill -f gnome-terminal-server` | Use xterm → write `overrides.toml` + apply in-memory |
+| `TerminalUnavailable` (startup PATH resolve failed) | "PTM's terminal command `<name>` isn't installed." | Install it → `apt show <pkg>` (no auto-install) | Use a different terminal → list of installed terminals from `binary_on_path` |
+| `SpawnWedged` × ≥1, argv[0] does NOT resolve to gnome-terminal | "Terminal `<name>` started but no window appeared." | Show `ptm --diagnose` output | Use xterm → as above |
+| `SpawnExitedNonZero` × ≥1 | "Terminal exited with code N before opening a window." | Show stderr from log | Use xterm → as above |
+
+Sniff helpers needed:
+- `count_stuck_gnome_terminal_wait()`: `pgrep -f 'gnome-terminal --wait'`
+  via `Command::new` + `wait_with_output`. ~15 LOC.
+- `gnome_terminal_server_uptime_days()`: read `/proc/<pid>/stat` field
+  22 (starttime) for the gnome-terminal-server pid (find via
+  `pgrep -x gnome-terminal-server`), convert via
+  `/proc/uptime` + `_SC_CLK_TCK`. PTM already has /proc walking code
+  (`ProcSnapshot::capture_all` and friends in `src/main.rs` around
+  line 2800+) — extend or sit alongside.
+
+### Action handlers
+
+**Restart gnome-terminal-server:**
+```bash
+pkill -f gnome-terminal-server
+```
+Runs as the calling user. Cinnamon auto-respawns the daemon on next
+gnome-terminal launch. Returns exit code 0 if any process was killed,
+1 if none matched. UI shows the exit code briefly.
+
+**Use xterm (permanent override):**
+1. Ensure `~/.config/ptm/` exists.
+2. Read `overrides.toml`, set `[terminal] command = "xterm"`, write back.
+3. Update PTM's in-memory `terminal_override` field so the next spawn
+   uses xterm without restart.
+4. State machine → Healthy. Banner clears. Popup closes after ~1 s
+   confirmation text.
+
+**Run `ptm --diagnose`:**
+```bash
+ptm --diagnose --output /tmp/ptm-diag-<ts>.md
+```
+PTM already implements this CLI (commit `135924b`). Write to a temp
+path; show path in popup so the user can copy it.
+
+### Implementation order (5 commits, each independently shippable)
+
+1. **`feat(health): state machine + persistence + banner row`** (~200 LOC)
+   - Add `HealthState` enum, `Vec<HealthEvent>` on App.
+   - Add `health_state_path()` + JSON load/save with version handling
+     (copy the pattern of `warnings_log_path` at `src/main.rs:713`).
+   - Draw the banner row in the existing sidebar render path. Hidden
+     when Healthy.
+   - **No popup, no notify-send, no fix actions yet.** Just visible
+     state.
+   - Unit tests: state transitions, persistence round-trip, malformed
+     JSON recovery, banner-row hit-testing.
+   - **Manual UAT before merging:** force-write a Broken health file to
+     `~/.cache/ptm/health-state.json` by hand; launch PTM; confirm red
+     banner appears at top of sidebar.
+
+2. **`feat(health): startup PATH check + watchdog → state wiring`** (~80 LOC)
+   - Add `binary_on_path_resolved(name) → Option<PathBuf>` (walk PATH,
+     return first executable match). **This also unblocks the
+     canonicalize bug fix below.**
+   - At `App::new` (or wherever startup finalizes), run the resolve
+     check; on failure emit `TerminalUnavailable` and transition to
+     Broken before the first event-loop iteration.
+   - Wire `tick_watchdog`'s emitted events into the state machine. The
+     watchdog already emits to stderr + log; add a *third* sink: a
+     channel/queue the main event loop drains and passes to the state
+     machine.
+   - Unit tests: TerminalUnavailable transitions, watchdog event →
+     state changes.
+   - **Bug to fix in this commit (don't punt):**
+     `terminal_argv_for_attach` at `src/main.rs:4114` calls
+     `std::fs::canonicalize(&term_argv[0])` directly on a PATH name
+     like `"x-terminal-emulator"`, which fails with ENOENT and
+     silently falls through to the unfixed basename match. (Visible in
+     `ptm --diagnose` output as `canonicalize failed: No such file or
+     directory (os error 2)`.) Replace with: PATH-resolve first via
+     the new helper, *then* canonicalize the resolved absolute path.
+
+3. **`feat(health): popup with Show-command buttons`** (~150 LOC)
+   - Reuse override-redirect popup machinery (search
+     `open_context_menu`, `draw_context_menu` in `src/main.rs`).
+   - Render the wireframe above. Buttons render but only `[Show
+     command]` and `[Dismiss]` / `[Don't show until restart]` do
+     anything.
+   - Symptom→fix table as a `const` slice of structs.
+   - Sniff helpers: stuck-wrapper count, gnome-terminal-server uptime.
+   - Unit tests: symptom matching produces expected fix entries;
+     formatting deterministic; sniff helpers parse synthetic
+     `/proc`-shaped input.
+   - **Manual UAT:** trigger Broken state, click the banner, verify
+     popup appears with the right "PTM noticed" text and two fix rows.
+
+4. **`feat(health): one-click Run-it action handlers + overrides.toml`**
+   (~150 LOC)
+   - Implement `overrides.toml` parser/writer (small enough to
+     hand-roll — see `src/main.rs:5500+` for similar text-format
+     handling, or add a single `toml` crate dep if the team prefers).
+   - Wire `[Run it]` for the two initial fixes.
+   - Update `detect_terminal_command` to consult the override file as
+     highest-precedence.
+   - Unit tests: overrides override env vars; malformed TOML doesn't
+     crash; `Run it` for restart returns expected outcomes (mock via
+     a Command-runner trait).
+   - **Manual UAT on dev-1 (which already has a wedged daemon):**
+     click `[Run it]` on Restart gnome-terminal-server; verify the
+     daemon dies; click `+ New Terminal`; verify a window opens.
+
+5. **`feat(health): notify-send on state transitions`** (~50 LOC)
+   - Fire `notify-send` on Healthy→Degraded and *→Broken transitions.
+   - Single-shot per transition; debounce on rapid event storms.
+   - Don't error if `notify-send` missing; log once that it's absent.
+   - Unit test for the debounce.
+   - **Manual UAT:** force-trigger a state transition; confirm the
+     notification appears in Cinnamon's notification tray and respects
+     urgency=critical (persists vs. auto-dismiss).
+
+### Testing strategy
+
+- **Tier 1 (preferred):** unit tests in `#[cfg(test)] mod tests` at the
+  bottom of `src/main.rs`. State machine, persistence I/O,
+  symptom-matching, override precedence, sniff parsers — all pure
+  logic.
+- **Tier 2 (Xvfb e2e):** add one new script under `tests/e2e/`:
+  `banner_appears_on_wedged_spawn.sh`. Spawn PTM under Xvfb with an
+  environment that resolves to a deliberately-hanging fake terminal
+  (a small shell script that just `sleep 9999`). Click `+ New
+  Terminal`. Verify after 11 s a banner row exists at the top of the
+  sidebar (red, click-able). Use `xdotool` for click + window
+  inspection (already an e2e dependency).
+- **No Tier 2 test** for the popup contents in the first pass — UI
+  text changes will churn it. Add later if popup logic becomes
+  load-bearing.
+
+### Files & code touchpoints
+
+- **Watchdog source of truth:** `src/main.rs:578` `tick_watchdog`,
+  `:656` `format_watchdog_event`, `:773` `emit_watchdog_event`,
+  `:737` `append_to_warnings_log`. Reuse the formatter; add a third
+  sink (state machine queue).
+- **Spawn paths to instrument:** `src/main.rs:3599`
+  `spawn_default_terminal`, `:3639` `spawn_attach_terminal`. Already
+  return `Option<Child>` after dev-2's refactor.
+- **Terminal detection:** `src/main.rs:3558` `detect_terminal_command`.
+  Add override precedence at the top of the chain.
+- **Canonicalize bug to fix:** `src/main.rs:4114`. See step 2.
+- **Sidebar rendering:** the renderer block at the top of `src/main.rs`
+  (after the data-model section). Banner row is a new `DisplayRow`
+  variant or a separate header-row code path — author's choice.
+- **Popup machinery to reuse:** `open_context_menu`,
+  `draw_context_menu`, `build_menu_entries`, plus the pointer-grab
+  pattern in the event loop. Search for "context menu" in `main.rs`.
+- **Persistence pattern to copy:**
+  `~/.cache/ptm/recipes-snapshot.md` writer (the SIGUSR1 path) and
+  `warnings_log_path` for the cache-dir convention; `XDG_CACHE_HOME`
+  → `~/.cache/ptm/` with fallback.
+
+### Things to verify before starting step 1
+
+- Read this entire Part C section.
+- Read Part A and Part B for context, but don't re-litigate decisions
+  in the "Locked" table above.
+- Run `ptm --diagnose --output /tmp/diag.md` on dev-2 and confirm the
+  watchdog logfile path matches `warnings_log_path()` in source.
+- Confirm the canonicalize bug still exists in `src/main.rs:4114`
+  (it does as of 2026-05-16; if a later commit fixed it, skip that
+  part of step 2).
+- Confirm there's no in-flight branch on dev-2 already starting this
+  work — coordinate before duplicating effort.
+
+### What is **not** in this plan (out of scope for this iteration)
+
+- Periodic / background health probes. Click-driven only by design
+  decision above.
+- Auto-execution of any fix without an explicit `[Run it]` click.
+- Settings dialog or preferences UI beyond `overrides.toml`.
+- Surfacing for failures *other than* terminal/tmux spawn (e.g.
+  rendering bugs, X11 errors) — same machinery could be extended later
+  but isn't in this commit set.

@@ -1227,6 +1227,266 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// ── Cluster 6: diagnosis + sniff helpers (popup brain) ──
+
+/// What the user actually clicks. Each enum case identifies the action
+/// run when `[Run it]` is pressed; the `Show command` button is purely
+/// display and doesn't need an enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HealthFixAction {
+    /// Run the embedded shell command via `sh -c`. No sudo; no extra
+    /// arguments threaded through. Used for "Restart gnome-terminal-
+    /// server" (`pkill -f gnome-terminal-server`).
+    RunShell(String),
+    /// Write `[terminal] command = "xterm"` to `overrides.toml` and
+    /// reload the in-memory override. Wired in Commit 4.
+    UseXtermOverride,
+    /// Run `ptm --diagnose --output <path>` and show the path. Wired
+    /// in Commit 4.
+    RunDiagnose,
+}
+
+/// A single suggested fix. `command_display` is what `[Show command]`
+/// expands to — for `RunShell`, identical to the command string; for
+/// `UseXtermOverride`, the toml fragment we'd write; for `RunDiagnose`,
+/// the ptm invocation. Always a string the user can audit before
+/// clicking `[Run it]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthFix {
+    title: String,
+    command_display: String,
+    action: HealthFixAction,
+}
+
+/// What the popup will render. `body` is the "PTM noticed ..." block;
+/// `fixes` is the ordered list of suggested actions. Empty `fixes`
+/// means we know something's wrong but don't have a recipe — popup
+/// still renders the body + the dismiss buttons.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HealthDiagnosis {
+    body: String,
+    fixes: Vec<HealthFix>,
+}
+
+/// Live system observations consulted by `diagnose_health`. Probed
+/// once when the popup opens. Kept separate from the HealthBoard so
+/// `diagnose_health` stays pure and unit-testable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HealthSniff {
+    /// `pgrep -f 'gnome-terminal --wait'` count. Non-zero means past
+    /// click attempts have left wrappers hanging — a strong wedge
+    /// signal.
+    stuck_gnome_terminal_wait: usize,
+    /// Days since `gnome-terminal-server` started. None when the
+    /// process isn't running or /proc parse fails. Long-running
+    /// daemons are more likely to be the wedge source.
+    gnome_terminal_server_uptime_days: Option<u64>,
+}
+
+impl HealthSniff {
+    /// Probe live system state. Best-effort: a failure to probe leaves
+    /// the corresponding field at its zero value (no surprise).
+    fn capture() -> Self {
+        Self {
+            stuck_gnome_terminal_wait: count_stuck_gnome_terminal_wait(),
+            gnome_terminal_server_uptime_days: gnome_terminal_server_uptime_days(),
+        }
+    }
+}
+
+/// Shell out to `pgrep -f 'gnome-terminal --wait'` and count
+/// distinct PIDs. Returns 0 on any failure.
+fn count_stuck_gnome_terminal_wait() -> usize {
+    let output = match std::process::Command::new("pgrep")
+        .args(["-f", "gnome-terminal --wait"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
+/// Read /proc/uptime field 1 — wall-clock seconds since boot.
+fn parse_proc_uptime(s: &str) -> Option<f64> {
+    s.split_whitespace().next()?.parse().ok()
+}
+
+/// Read /proc/<pid>/stat field 22 — process starttime in clock ticks
+/// since boot. Field 2 (the comm) is parenthesised and may contain
+/// spaces, so we anchor on the closing paren before counting fields.
+fn parse_proc_stat_starttime(s: &str) -> Option<u64> {
+    let after_comm = s.rsplit_once(") ")?.1;
+    // From "state ppid pgrp session tty_nr tpgid flags minflt cminflt
+    // majflt cmajflt utime stime cutime cstime priority nice
+    // num_threads itrealvalue starttime" — starttime is the 22nd
+    // field, but after stripping pid+comm we're at field 3, so
+    // starttime is the 20th token (22 - 2).
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Days since `gnome-terminal-server` started. Two-step: pgrep -x to
+/// find the pid, then /proc parsing for start time vs boot uptime.
+/// `_SC_CLK_TCK` is usually 100 on Linux; we assume that rather than
+/// shelling out to `getconf` because being off by 2× still gives a
+/// reasonable "old" / "new" signal.
+fn gnome_terminal_server_uptime_days() -> Option<u64> {
+    const CLK_TCK: u64 = 100;
+    let pgrep = std::process::Command::new("pgrep")
+        .args(["-x", "gnome-terminal-server"])
+        .output()
+        .ok()?;
+    if !pgrep.status.success() {
+        return None;
+    }
+    let pid: u32 = String::from_utf8_lossy(&pgrep.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()?;
+    let uptime_s = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs = parse_proc_uptime(&uptime_s)?;
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let starttime_ticks = parse_proc_stat_starttime(&stat)?;
+    let starttime_secs = starttime_ticks as f64 / CLK_TCK as f64;
+    let age_secs = (uptime_secs - starttime_secs).max(0.0);
+    Some((age_secs / 86_400.0) as u64)
+}
+
+/// Map a `HealthBoard` + live `HealthSniff` to the popup payload.
+/// Pure — caller is responsible for capturing the sniff. Picks the
+/// best-matching symptom from a fixed table, then falls back to a
+/// generic "PTM noticed N failures" body when no pattern matches.
+fn diagnose_health(board: &HealthBoard, sniff: &HealthSniff) -> HealthDiagnosis {
+    let failures = board
+        .recent_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                HealthEventKind::SpawnWedged
+                    | HealthEventKind::SpawnExitedNonZero
+                    | HealthEventKind::TerminalUnavailable
+            )
+        })
+        .count();
+    let argv0 = board
+        .recent_events
+        .iter()
+        .rev()
+        .find_map(|e| e.terminal.clone())
+        .unwrap_or_else(|| "your terminal".to_string());
+
+    // Symptom 1: TerminalUnavailable — chosen terminal not on PATH.
+    let unavailable = board
+        .recent_events
+        .iter()
+        .any(|e| matches!(e.kind, HealthEventKind::TerminalUnavailable));
+    if unavailable {
+        let body = format!(
+            "PTM noticed\n\
+             PTM's terminal command `{}` is not installed (or not on PATH).",
+            argv0
+        );
+        let fixes = vec![HealthFix {
+            title: "Use xterm instead".to_string(),
+            command_display:
+                "[overrides.toml] [terminal] command = \"xterm\"".to_string(),
+            action: HealthFixAction::UseXtermOverride,
+        }];
+        return HealthDiagnosis { body, fixes };
+    }
+
+    // Symptom 2: Wedged gnome-terminal-server — argv[0] is some
+    // gnome-terminal flavour AND we've seen at least one spawn wedge
+    // AND `gnome-terminal --wait` wrappers are stuck around.
+    let argv0_is_gnome = argv0.contains("gnome-terminal")
+        || argv0 == "x-terminal-emulator";
+    let wedge_event = board
+        .recent_events
+        .iter()
+        .any(|e| matches!(e.kind, HealthEventKind::SpawnWedged));
+    if argv0_is_gnome && wedge_event {
+        let mut body = format!(
+            "PTM noticed\n\
+             {} terminal spawn{} did not produce a window. \
+             gnome-terminal-server appears unresponsive to new-window IPC",
+            failures.max(1),
+            if failures > 1 { "s" } else { "" },
+        );
+        match (
+            sniff.gnome_terminal_server_uptime_days,
+            sniff.stuck_gnome_terminal_wait,
+        ) {
+            (Some(d), s) if s > 0 => {
+                body.push_str(&format!(
+                    " (running {}d; {} stuck wrappers).",
+                    d, s
+                ));
+            }
+            (Some(d), _) => {
+                body.push_str(&format!(" (running {}d).", d));
+            }
+            (None, s) if s > 0 => {
+                body.push_str(&format!(" ({} stuck wrappers).", s));
+            }
+            _ => body.push('.'),
+        }
+        let fixes = vec![
+            HealthFix {
+                title: "Restart gnome-terminal-server".to_string(),
+                command_display: "pkill -f gnome-terminal-server".to_string(),
+                action: HealthFixAction::RunShell(
+                    "pkill -f gnome-terminal-server".to_string(),
+                ),
+            },
+            HealthFix {
+                title: "Use xterm instead".to_string(),
+                command_display:
+                    "[overrides.toml] [terminal] command = \"xterm\""
+                        .to_string(),
+                action: HealthFixAction::UseXtermOverride,
+            },
+        ];
+        return HealthDiagnosis { body, fixes };
+    }
+
+    // Symptom 3: generic wedge / exited / slow — unknown root cause.
+    let body = if failures > 0 {
+        format!(
+            "PTM noticed\n\
+             {} terminal spawn{} failed recently. The cause is not a known pattern; \
+             ptm --diagnose may help.",
+            failures,
+            if failures > 1 { "s" } else { "" },
+        )
+    } else {
+        format!(
+            "PTM noticed\nA terminal spawn was slower than expected. \
+             If it keeps happening, the diagnose report below will help track it down."
+        )
+    };
+    let fixes = vec![
+        HealthFix {
+            title: "Run ptm --diagnose for a full report".to_string(),
+            command_display: "ptm --diagnose --output /tmp/ptm-diag-<ts>.md"
+                .to_string(),
+            action: HealthFixAction::RunDiagnose,
+        },
+        HealthFix {
+            title: "Use xterm instead".to_string(),
+            command_display:
+                "[overrides.toml] [terminal] command = \"xterm\"".to_string(),
+            action: HealthFixAction::UseXtermOverride,
+        },
+    ];
+    HealthDiagnosis { body, fixes }
+}
+
 /// If the queue head is Queued, dispatch it: call the right spawn fn for
 /// its kind, attach the resulting `Child` via `record_dispatch`. Called
 /// from `refresh_items` after `claim_pending_spawns` / `tick_watchdog`
@@ -1268,6 +1528,43 @@ struct ConfirmPopup {
     yes_rect: Rectangle,
     no_rect: Rectangle,
     hover_button: Option<ConfirmButton>,
+}
+
+/// Per-popup hover identifier so `MotionNotify` knows which button
+/// to highlight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthPopupHover {
+    /// `[Show command]` for fix at index N.
+    Show(usize),
+    /// `[Run it]` for fix at index N. Renders but is wired in Commit 4.
+    Run(usize),
+    /// The dismiss button (closes the popup, no state change).
+    Dismiss,
+    /// The "Don't show until restart" button (closes + sets the
+    /// in-session dismissal flag).
+    DismissUntilRestart,
+}
+
+/// Visible health popup. Always over-redirect + pointer-grabbed,
+/// modelled on `ConfirmPopup`. `expanded` tracks which fixes have had
+/// `[Show command]` clicked; clicking again collapses (idempotent).
+struct HealthPopup {
+    window: Window,
+    pixmap: Pixmap,
+    diagnosis: HealthDiagnosis,
+    expanded: HashSet<usize>,
+    width: u16,
+    height: u16,
+    /// Hit rectangles for each fix's two buttons; vectors are
+    /// per-fix-index parallel to `diagnosis.fixes`.
+    fix_show_rects: Vec<Rectangle>,
+    fix_run_rects: Vec<Rectangle>,
+    /// Y coordinate where each fix's expanded command line is
+    /// rendered. Parallel to `diagnosis.fixes`.
+    fix_command_y: Vec<i16>,
+    dismiss_rect: Rectangle,
+    dismiss_until_restart_rect: Rectangle,
+    hover: Option<HealthPopupHover>,
 }
 
 /// Identity for the buttons in the header row above the item list. When tmux
@@ -1609,6 +1906,10 @@ struct App {
     /// user clearing this in process A doesn't extend to process B, so
     /// it never hits disk. Reset on every `App::new`.
     health_dismissed_this_session: bool,
+    /// Active health-popup window (None when no popup is showing).
+    /// Mutually exclusive with `context_menu` / `confirm` / `rename`
+    /// via the event-loop mode dispatch.
+    health_popup: Option<HealthPopup>,
 }
 
 /// How long a successful-drop row highlight stays visible before fading out.
@@ -1648,6 +1949,7 @@ impl App {
             last_drop_highlight: None,
             health: HealthBoard::healthy(),
             health_dismissed_this_session: false,
+            health_popup: None,
         }
     }
 
@@ -6260,6 +6562,473 @@ fn draw_confirm_popup(
     Ok(())
 }
 
+// ── Cluster 6: health popup (override-redirect, pointer-grabbed) ──
+
+const HEALTH_POPUP_W: u16 = 380;
+const HEALTH_POPUP_PADDING: i16 = 12;
+const HEALTH_POPUP_LINE_H: i16 = 18;
+const HEALTH_POPUP_FIX_BUTTON_H: u16 = 24;
+const HEALTH_POPUP_FIX_BUTTON_W: u16 = 130;
+const HEALTH_POPUP_DISMISS_BUTTON_H: u16 = 26;
+const HEALTH_POPUP_GAP: i16 = 8;
+/// Rough cap on chars per body line. CHAR_WIDTH = 8 means we get
+/// ~44 chars for HEALTH_POPUP_W=380 minus 2*padding (24px).
+const HEALTH_POPUP_BODY_COLS: usize = 44;
+
+/// Greedy word-wrap; never splits mid-word. Returns one entry per
+/// rendered line. `\n` in the input forces a hard break. Pure.
+fn wrap_text(text: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if cols == 0 {
+        return out;
+    }
+    for raw_line in text.split('\n') {
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.len() + 1 + word.len() <= cols {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        out.push(current);
+    }
+    out
+}
+
+/// Compute the popup layout from its diagnosis + expansion state.
+/// Returns: width, height, per-fix Show / Run rects, per-fix expanded
+/// command line Y, dismiss rect, dismiss-until-restart rect. Pure.
+#[allow(clippy::type_complexity)]
+fn health_popup_layout(
+    diag: &HealthDiagnosis,
+    expanded: &HashSet<usize>,
+) -> (
+    u16,
+    u16,
+    Vec<Rectangle>,
+    Vec<Rectangle>,
+    Vec<i16>,
+    Rectangle,
+    Rectangle,
+) {
+    let w = HEALTH_POPUP_W;
+    let mut y: i16 = HEALTH_POPUP_PADDING;
+    // Body lines.
+    let body_lines = wrap_text(&diag.body, HEALTH_POPUP_BODY_COLS);
+    y += body_lines.len() as i16 * HEALTH_POPUP_LINE_H;
+    y += HEALTH_POPUP_GAP;
+
+    let mut show_rects = Vec::with_capacity(diag.fixes.len());
+    let mut run_rects = Vec::with_capacity(diag.fixes.len());
+    let mut command_y = Vec::with_capacity(diag.fixes.len());
+    for (i, fix) in diag.fixes.iter().enumerate() {
+        // Title line.
+        y += HEALTH_POPUP_LINE_H;
+        // Button row.
+        let bx = HEALTH_POPUP_PADDING;
+        let by = y;
+        let show = Rectangle {
+            x: bx,
+            y: by,
+            width: HEALTH_POPUP_FIX_BUTTON_W,
+            height: HEALTH_POPUP_FIX_BUTTON_H,
+        };
+        let run = Rectangle {
+            x: bx + HEALTH_POPUP_FIX_BUTTON_W as i16 + HEALTH_POPUP_GAP,
+            y: by,
+            width: HEALTH_POPUP_FIX_BUTTON_W.min(80),
+            height: HEALTH_POPUP_FIX_BUTTON_H,
+        };
+        show_rects.push(show);
+        run_rects.push(run);
+        y += HEALTH_POPUP_FIX_BUTTON_H as i16 + 4;
+        // Expanded command line (if any).
+        let mut this_command_y = -1;
+        if expanded.contains(&i) {
+            let wrapped =
+                wrap_text(&fix.command_display, HEALTH_POPUP_BODY_COLS);
+            this_command_y = y;
+            y += wrapped.len() as i16 * HEALTH_POPUP_LINE_H;
+        }
+        command_y.push(this_command_y);
+        y += HEALTH_POPUP_GAP;
+    }
+    // Dismiss row.
+    let dy = y;
+    let dismiss = Rectangle {
+        x: HEALTH_POPUP_PADDING,
+        y: dy,
+        width: 90,
+        height: HEALTH_POPUP_DISMISS_BUTTON_H,
+    };
+    let dismiss_ur = Rectangle {
+        x: dismiss.x + dismiss.width as i16 + HEALTH_POPUP_GAP,
+        y: dy,
+        width: 180,
+        height: HEALTH_POPUP_DISMISS_BUTTON_H,
+    };
+    y += HEALTH_POPUP_DISMISS_BUTTON_H as i16 + HEALTH_POPUP_PADDING;
+    let h = y as u16;
+    (
+        w,
+        h,
+        show_rects,
+        run_rects,
+        command_y,
+        dismiss,
+        dismiss_ur,
+    )
+}
+
+fn open_health_popup(
+    conn: &impl Connection,
+    screen: &Screen,
+    renderer: &Renderer,
+    app: &mut App,
+    diagnosis: HealthDiagnosis,
+    root_x: i16,
+    root_y: i16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if app.health_popup.is_some() {
+        close_health_popup(conn, app)?;
+    }
+    let expanded: HashSet<usize> = HashSet::new();
+    let (width, height, show, run, cmd_y, dismiss, dismiss_ur) =
+        health_popup_layout(&diagnosis, &expanded);
+    let x = root_x
+        .min((screen.width_in_pixels as i16) - width as i16)
+        .max(0);
+    let y = root_y
+        .min((screen.height_in_pixels as i16) - height as i16)
+        .max(0);
+
+    let win = conn.generate_id()?;
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        win,
+        screen.root,
+        x,
+        y,
+        width,
+        height,
+        1,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new()
+            .override_redirect(1u32)
+            .background_pixel(renderer.menu_bg_pixel)
+            .border_pixel(renderer.menu_border_pixel)
+            .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS),
+    )?;
+    let pix = conn.generate_id()?;
+    conn.create_pixmap(screen.root_depth, pix, win, width, height)?;
+    conn.map_window(win)?;
+    let _ = conn
+        .grab_pointer(
+            false,
+            win,
+            EventMask::BUTTON_PRESS
+                | EventMask::BUTTON_RELEASE
+                | EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            0u32,
+            0u32,
+            0u32,
+        )?
+        .reply()?;
+    let _ = conn
+        .grab_keyboard(false, win, 0u32, GrabMode::ASYNC, GrabMode::ASYNC)?
+        .reply()?;
+    conn.flush()?;
+
+    app.health_popup = Some(HealthPopup {
+        window: win,
+        pixmap: pix,
+        diagnosis,
+        expanded,
+        width,
+        height,
+        fix_show_rects: show,
+        fix_run_rects: run,
+        fix_command_y: cmd_y,
+        dismiss_rect: dismiss,
+        dismiss_until_restart_rect: dismiss_ur,
+        hover: None,
+    });
+    draw_health_popup(conn, renderer, app)?;
+    Ok(())
+}
+
+fn close_health_popup(
+    conn: &impl Connection,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(popup) = app.health_popup.take() {
+        conn.ungrab_keyboard(0u32)?;
+        conn.ungrab_pointer(0u32)?;
+        conn.free_pixmap(popup.pixmap)?;
+        conn.destroy_window(popup.window)?;
+        conn.flush()?;
+    }
+    Ok(())
+}
+
+/// Re-layout the open popup in place. Called after toggling
+/// `expanded` so the window grows / shrinks without a flicker-cycle
+/// of close-and-reopen.
+fn relayout_health_popup(
+    conn: &impl Connection,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let popup = match app.health_popup.as_mut() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let (w, h, show, run, cmd_y, dismiss, dismiss_ur) =
+        health_popup_layout(&popup.diagnosis, &popup.expanded);
+    popup.fix_show_rects = show;
+    popup.fix_run_rects = run;
+    popup.fix_command_y = cmd_y;
+    popup.dismiss_rect = dismiss;
+    popup.dismiss_until_restart_rect = dismiss_ur;
+    let resized = w != popup.width || h != popup.height;
+    if resized {
+        popup.width = w;
+        popup.height = h;
+        conn.configure_window(
+            popup.window,
+            &ConfigureWindowAux::new()
+                .width(w as u32)
+                .height(h as u32),
+        )?;
+        conn.free_pixmap(popup.pixmap)?;
+        let pix = conn.generate_id()?;
+        conn.create_pixmap(
+            COPY_DEPTH_FROM_PARENT,
+            pix,
+            popup.window,
+            w,
+            h,
+        )?;
+        popup.pixmap = pix;
+    }
+    conn.flush()?;
+    Ok(())
+}
+
+fn draw_health_popup(
+    conn: &impl Connection,
+    renderer: &Renderer,
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let popup = match app.health_popup.as_ref() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let pix = popup.pixmap;
+    let gc = renderer.gc;
+
+    conn.change_gc(
+        gc,
+        &ChangeGCAux::new()
+            .foreground(renderer.menu_bg_pixel)
+            .background(renderer.menu_bg_pixel),
+    )?;
+    conn.poly_fill_rectangle(
+        pix,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: popup.width,
+            height: popup.height,
+        }],
+    )?;
+
+    // Body text.
+    let body_lines = wrap_text(&popup.diagnosis.body, HEALTH_POPUP_BODY_COLS);
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(renderer.text_pixel))?;
+    let mut y = HEALTH_POPUP_PADDING + HEALTH_POPUP_LINE_H - 4;
+    for line in &body_lines {
+        if !line.is_empty() {
+            conn.image_text8(
+                pix,
+                gc,
+                HEALTH_POPUP_PADDING,
+                y,
+                line.as_bytes(),
+            )?;
+        }
+        y += HEALTH_POPUP_LINE_H;
+    }
+
+    // Fixes.
+    for (i, fix) in popup.diagnosis.fixes.iter().enumerate() {
+        // Title.
+        let title_y = popup.fix_show_rects[i].y - 4;
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(renderer.text_pixel))?;
+        let title = format!("Fix {}: {}", i + 1, fix.title);
+        let max_chars =
+            ((popup.width as i16 - HEALTH_POPUP_PADDING * 2) / CHAR_WIDTH).max(0) as usize;
+        let title_display: String = title.chars().take(max_chars).collect();
+        conn.image_text8(
+            pix,
+            gc,
+            HEALTH_POPUP_PADDING,
+            title_y,
+            title_display.as_bytes(),
+        )?;
+        // Show button.
+        let show_label = if popup.expanded.contains(&i) {
+            "[ Hide command ]"
+        } else {
+            "[ Show command ]"
+        };
+        draw_health_popup_button(
+            conn,
+            renderer,
+            pix,
+            &popup.fix_show_rects[i],
+            show_label,
+            popup.hover == Some(HealthPopupHover::Show(i)),
+        )?;
+        // Run button.
+        draw_health_popup_button(
+            conn,
+            renderer,
+            pix,
+            &popup.fix_run_rects[i],
+            "[ Run it ]",
+            popup.hover == Some(HealthPopupHover::Run(i)),
+        )?;
+        // Expanded command (if shown).
+        if popup.expanded.contains(&i) && popup.fix_command_y[i] >= 0 {
+            let mut cy = popup.fix_command_y[i] + HEALTH_POPUP_LINE_H - 4;
+            for line in wrap_text(&fix.command_display, HEALTH_POPUP_BODY_COLS) {
+                if !line.is_empty() {
+                    conn.change_gc(
+                        gc,
+                        &ChangeGCAux::new().foreground(renderer.text_dim_pixel),
+                    )?;
+                    conn.image_text8(
+                        pix,
+                        gc,
+                        HEALTH_POPUP_PADDING + 8,
+                        cy,
+                        line.as_bytes(),
+                    )?;
+                }
+                cy += HEALTH_POPUP_LINE_H;
+            }
+        }
+    }
+
+    // Dismiss buttons.
+    draw_health_popup_button(
+        conn,
+        renderer,
+        pix,
+        &popup.dismiss_rect,
+        "Dismiss",
+        popup.hover == Some(HealthPopupHover::Dismiss),
+    )?;
+    draw_health_popup_button(
+        conn,
+        renderer,
+        pix,
+        &popup.dismiss_until_restart_rect,
+        "Dismiss until restart",
+        popup.hover == Some(HealthPopupHover::DismissUntilRestart),
+    )?;
+
+    conn.copy_area(
+        pix,
+        popup.window,
+        gc,
+        0,
+        0,
+        0,
+        0,
+        popup.width,
+        popup.height,
+    )?;
+    conn.flush()?;
+    Ok(())
+}
+
+fn draw_health_popup_button(
+    conn: &impl Connection,
+    renderer: &Renderer,
+    drawable: Drawable,
+    rect: &Rectangle,
+    label: &str,
+    hovered: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bg = if hovered {
+        renderer.menu_hover_pixel
+    } else {
+        renderer.item_pixel
+    };
+    conn.change_gc(renderer.gc, &ChangeGCAux::new().foreground(bg).background(bg))?;
+    conn.poly_fill_rectangle(drawable, renderer.gc, &[*rect])?;
+    conn.change_gc(
+        renderer.gc,
+        &ChangeGCAux::new().foreground(renderer.menu_border_pixel),
+    )?;
+    conn.poly_rectangle(
+        drawable,
+        renderer.gc,
+        &[Rectangle {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width.saturating_sub(1),
+            height: rect.height.saturating_sub(1),
+        }],
+    )?;
+    let max_chars = ((rect.width as i16 - 8) / CHAR_WIDTH).max(0) as usize;
+    let display: String = label.chars().take(max_chars).collect();
+    let lbl_w = display.len() as i16 * CHAR_WIDTH;
+    let lx = rect.x + (rect.width as i16 - lbl_w) / 2;
+    let ly = rect.y + (rect.height as i16 / 2) + 4;
+    conn.change_gc(
+        renderer.gc,
+        &ChangeGCAux::new().foreground(renderer.text_pixel).background(bg),
+    )?;
+    conn.image_text8(drawable, renderer.gc, lx, ly, display.as_bytes())?;
+    Ok(())
+}
+
+/// Hit-test the popup. Returns `None` when (x, y) is in dead space.
+fn health_popup_hit_test(
+    popup: &HealthPopup,
+    x: i16,
+    y: i16,
+) -> Option<HealthPopupHover> {
+    for (i, r) in popup.fix_show_rects.iter().enumerate() {
+        if point_in_rect(x, y, r) {
+            return Some(HealthPopupHover::Show(i));
+        }
+    }
+    for (i, r) in popup.fix_run_rects.iter().enumerate() {
+        if point_in_rect(x, y, r) {
+            return Some(HealthPopupHover::Run(i));
+        }
+    }
+    if point_in_rect(x, y, &popup.dismiss_rect) {
+        return Some(HealthPopupHover::Dismiss);
+    }
+    if point_in_rect(x, y, &popup.dismiss_until_restart_rect) {
+        return Some(HealthPopupHover::DismissUntilRestart);
+    }
+    None
+}
+
 // ── Keyboard helpers ──
 
 fn keysym_from_keycode(
@@ -7760,7 +8529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Cheap idle tick: just check whether the dirty-flag debounce
                 // has elapsed. Skip during user gestures so a drag/rename
                 // bursting through a save tick doesn't write a half-state.
-                if app.drag.is_none() && app.rename.is_none() && app.confirm.is_none() {
+                if app.drag.is_none() && app.rename.is_none() && app.confirm.is_none() && app.health_popup.is_none() {
                     let now = std::time::Instant::now();
                     if should_save_now(app.first_dirty_at, app.last_dirty_at, now) {
                         save_groups(&app);
@@ -7798,6 +8567,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && app.context_menu.is_none()
                     && app.rename.is_none()
                     && app.confirm.is_none()
+                    && app.health_popup.is_none()
                 {
                     refresh_items(&conn, root, &atoms, &mut app, colormap)?;
                     renderer.redraw(&conn, &app)?;
@@ -7824,6 +8594,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && app.context_menu.is_none()
                         && app.rename.is_none()
                         && app.confirm.is_none()
+                        && app.health_popup.is_none()
                     {
                         refresh_items(&conn, root, &atoms, &mut app, colormap)?;
                         renderer.redraw(&conn, &app)?;
@@ -7832,7 +8603,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PropertyAction::UpdateActiveWindow => {
                     app.active_wid =
                         get_active_window(&conn, root, &atoms).unwrap_or(None);
-                    if app.context_menu.is_none() && app.rename.is_none() && app.confirm.is_none() {
+                    if app.context_menu.is_none()
+                        && app.rename.is_none()
+                        && app.confirm.is_none()
+                        && app.health_popup.is_none()
+                    {
                         renderer.redraw(&conn, &app)?;
                     }
                 }
@@ -7848,6 +8623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && app.context_menu.is_none()
                         && app.rename.is_none()
                         && app.confirm.is_none()
+                        && app.health_popup.is_none()
                     {
                         renderer.redraw(&conn, &app)?;
                     }
@@ -7924,6 +8700,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         draw_context_menu(&conn, &renderer, &app)?;
                     }
                     if ev.window == window {
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // ── Health popup mode (pointer + keyboard grab routes here) ──
+        if app.health_popup.is_some() {
+            match event {
+                Event::ButtonPress(ev) => {
+                    let in_popup = {
+                        let p = app.health_popup.as_ref().unwrap();
+                        ev.event_x >= 0
+                            && ev.event_y >= 0
+                            && (ev.event_x as u16) < p.width
+                            && (ev.event_y as u16) < p.height
+                    };
+                    if ev.detail != 1 {
+                        renderer.redraw(&conn, &app)?;
+                        continue;
+                    }
+                    if !in_popup {
+                        close_health_popup(&conn, &mut app)?;
+                        renderer.redraw(&conn, &app)?;
+                        continue;
+                    }
+                    let hit = {
+                        let p = app.health_popup.as_ref().unwrap();
+                        health_popup_hit_test(p, ev.event_x, ev.event_y)
+                    };
+                    match hit {
+                        Some(HealthPopupHover::Show(i)) => {
+                            if let Some(p) = app.health_popup.as_mut() {
+                                if !p.expanded.insert(i) {
+                                    p.expanded.remove(&i);
+                                }
+                            }
+                            relayout_health_popup(&conn, &mut app)?;
+                            draw_health_popup(&conn, &renderer, &app)?;
+                        }
+                        Some(HealthPopupHover::Run(_)) => {
+                            // Wired in Commit 4. For now, just expand the
+                            // command line so the user sees what would run.
+                        }
+                        Some(HealthPopupHover::Dismiss) => {
+                            close_health_popup(&conn, &mut app)?;
+                            renderer.redraw(&conn, &app)?;
+                        }
+                        Some(HealthPopupHover::DismissUntilRestart) => {
+                            app.health_dismissed_this_session = true;
+                            close_health_popup(&conn, &mut app)?;
+                            renderer.redraw(&conn, &app)?;
+                        }
+                        None => {}
+                    }
+                }
+                Event::MotionNotify(ev) => {
+                    let new_hover = {
+                        let p = app.health_popup.as_ref().unwrap();
+                        health_popup_hit_test(p, ev.event_x, ev.event_y)
+                    };
+                    let needs_redraw = {
+                        let p = app.health_popup.as_mut().unwrap();
+                        if new_hover != p.hover {
+                            p.hover = new_hover;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if needs_redraw {
+                        draw_health_popup(&conn, &renderer, &app)?;
+                    }
+                }
+                Event::KeyPress(ev) => {
+                    let sym = keysym_from_keycode(&conn, ev.detail, ev.state)?;
+                    // Esc dismisses without setting the suppression flag.
+                    if sym == 0xff1b {
+                        close_health_popup(&conn, &mut app)?;
+                        renderer.redraw(&conn, &app)?;
+                    }
+                }
+                Event::Expose(ex) if ex.count == 0 => {
+                    if Some(ex.window) == app.health_popup.as_ref().map(|p| p.window) {
+                        draw_health_popup(&conn, &renderer, &app)?;
+                    }
+                    if ex.window == window {
                         renderer.redraw(&conn, &app)?;
                     }
                 }
@@ -8120,7 +8985,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::ButtonPress(ev) if ev.event == window => {
                 match ev.detail {
                     1 => {
-                        if let Some(button) = app.hit_test_top_buttons(ev.event_x, ev.event_y) {
+                        if app.hit_test_health_banner(ev.event_x, ev.event_y) {
+                            // Banner click → open the diagnosis popup
+                            // anchored just below the banner (so the
+                            // body text is reading-flow-adjacent to the
+                            // banner that summoned it).
+                            let diagnosis = diagnose_health(
+                                &app.health,
+                                &HealthSniff::capture(),
+                            );
+                            let anchor_x = app.x;
+                            let anchor_y = app.y + app.banner_height();
+                            open_health_popup(
+                                &conn,
+                                screen,
+                                &renderer,
+                                &mut app,
+                                diagnosis,
+                                anchor_x,
+                                anchor_y,
+                            )?;
+                        } else if let Some(button) = app.hit_test_top_buttons(ev.event_x, ev.event_y) {
                             match button {
                                 TopButton::NewTerminal => {
                                     // Enqueue Terminal kind. If the queue was
@@ -15176,6 +16061,212 @@ mod tests {
     }
 
     // ── Canonicalize-then-PATH-resolve fix (the bug dev-1 caught) ──
+
+    // ── Cluster 6 Commit 3: diagnose + sniff parsers + popup layout ──
+
+    #[test]
+    fn wrap_text_no_split_mid_word() {
+        let out = super::wrap_text("the quick brown fox jumps", 12);
+        // Each line <= 12 chars and only spaces broken.
+        for line in &out {
+            assert!(line.len() <= 12, "line too long: {:?}", line);
+        }
+        let joined = out.join(" ");
+        assert_eq!(joined, "the quick brown fox jumps");
+    }
+
+    #[test]
+    fn wrap_text_respects_hard_newlines() {
+        let out = super::wrap_text("first\nsecond is longer wrap", 20);
+        assert_eq!(out[0], "first");
+        // "second is longer" fits in 20; "wrap" stands alone or joins.
+        assert!(out.iter().any(|l| l.contains("second")));
+    }
+
+    #[test]
+    fn wrap_text_handles_empty_input() {
+        let out = super::wrap_text("", 10);
+        assert_eq!(out, vec![""]);
+    }
+
+    #[test]
+    fn parse_proc_uptime_extracts_first_field() {
+        assert_eq!(super::parse_proc_uptime("12345.67 89012.34"), Some(12345.67));
+        assert_eq!(super::parse_proc_uptime("0.50 0.10"), Some(0.50));
+        assert_eq!(super::parse_proc_uptime(""), None);
+    }
+
+    #[test]
+    fn parse_proc_stat_starttime_anchors_on_close_paren() {
+        // Synthetic /proc/<pid>/stat. Field 22 is the 22nd whitespace
+        // token, but field 2 ("comm") is parenthesised and may contain
+        // spaces — so we anchor on ") " first.
+        let stat = "12345 (gnome-terminal-server) S 1 12345 12345 0 -1 \
+            4194304 1234 0 0 0 100 200 0 0 20 0 5 0 \
+            8675309 ...rest_unused...";
+        // Token after `)` is "S" → state. After that 19 more tokens
+        // brings us to the starttime "8675309".
+        assert_eq!(super::parse_proc_stat_starttime(stat), Some(8675309));
+    }
+
+    #[test]
+    fn parse_proc_stat_starttime_rejects_no_paren() {
+        assert_eq!(
+            super::parse_proc_stat_starttime("no parens here at all"),
+            None
+        );
+    }
+
+    #[test]
+    fn diagnose_terminal_unavailable_yields_xterm_fix() {
+        let mut board = super::HealthBoard::healthy();
+        board.recent_events.push(super::HealthEvent {
+            at: 0,
+            kind: super::HealthEventKind::TerminalUnavailable,
+            terminal: Some("not-a-real-term".to_string()),
+        });
+        let diag = super::diagnose_health(&board, &super::HealthSniff::default());
+        assert!(diag.body.contains("not-a-real-term"));
+        assert_eq!(diag.fixes.len(), 1);
+        assert_eq!(
+            diag.fixes[0].action,
+            super::HealthFixAction::UseXtermOverride
+        );
+    }
+
+    #[test]
+    fn diagnose_gnome_terminal_wedge_yields_two_fixes() {
+        let mut board = super::HealthBoard::healthy();
+        board.recent_events.push(super::HealthEvent {
+            at: 100,
+            kind: super::HealthEventKind::SpawnWedged,
+            terminal: Some("gnome-terminal".to_string()),
+        });
+        let sniff = super::HealthSniff {
+            stuck_gnome_terminal_wait: 6,
+            gnome_terminal_server_uptime_days: Some(29),
+        };
+        let diag = super::diagnose_health(&board, &sniff);
+        assert!(diag.body.contains("gnome-terminal-server"));
+        assert!(diag.body.contains("29d"), "expected uptime in body: {}", diag.body);
+        assert!(diag.body.contains("6 stuck"), "expected stuck wrapper count: {}", diag.body);
+        assert_eq!(diag.fixes.len(), 2);
+        assert!(matches!(
+            diag.fixes[0].action,
+            super::HealthFixAction::RunShell(_)
+        ));
+        assert_eq!(
+            diag.fixes[1].action,
+            super::HealthFixAction::UseXtermOverride
+        );
+    }
+
+    #[test]
+    fn diagnose_x_terminal_emulator_wedge_recognised_as_gnome() {
+        // The Debian default — argv[0] is x-terminal-emulator but it
+        // points at gnome-terminal under the hood. The diagnosis should
+        // recognise the wedge pattern even with this name.
+        let mut board = super::HealthBoard::healthy();
+        board.recent_events.push(super::HealthEvent {
+            at: 100,
+            kind: super::HealthEventKind::SpawnWedged,
+            terminal: Some("x-terminal-emulator".to_string()),
+        });
+        let diag = super::diagnose_health(&board, &super::HealthSniff::default());
+        assert!(diag.body.contains("gnome-terminal-server"));
+        assert!(diag.fixes.iter().any(|f| matches!(
+            f.action,
+            super::HealthFixAction::RunShell(ref cmd) if cmd.contains("pkill")
+        )));
+    }
+
+    #[test]
+    fn diagnose_unknown_terminal_wedge_falls_back_to_diagnose_action() {
+        let mut board = super::HealthBoard::healthy();
+        board.recent_events.push(super::HealthEvent {
+            at: 100,
+            kind: super::HealthEventKind::SpawnWedged,
+            terminal: Some("alacritty".to_string()),
+        });
+        let diag = super::diagnose_health(&board, &super::HealthSniff::default());
+        assert!(diag
+            .fixes
+            .iter()
+            .any(|f| matches!(f.action, super::HealthFixAction::RunDiagnose)));
+    }
+
+    #[test]
+    fn diagnose_no_events_still_returns_some_body() {
+        let board = super::HealthBoard::healthy();
+        let diag = super::diagnose_health(&board, &super::HealthSniff::default());
+        assert!(!diag.body.is_empty());
+    }
+
+    #[test]
+    fn health_popup_layout_returns_rects_in_bounds() {
+        let diag = super::HealthDiagnosis {
+            body: "Test body line 1\nTest body line 2".to_string(),
+            fixes: vec![
+                super::HealthFix {
+                    title: "First fix".to_string(),
+                    command_display: "do-thing".to_string(),
+                    action: super::HealthFixAction::RunShell("do-thing".to_string()),
+                },
+                super::HealthFix {
+                    title: "Second fix".to_string(),
+                    command_display: "do-other-thing".to_string(),
+                    action: super::HealthFixAction::UseXtermOverride,
+                },
+            ],
+        };
+        let (w, h, show, run, _cmd_y, dismiss, dismiss_ur) =
+            super::health_popup_layout(&diag, &HashSet::new());
+        assert_eq!(w, super::HEALTH_POPUP_W);
+        assert!(h > 0);
+        assert_eq!(show.len(), 2);
+        assert_eq!(run.len(), 2);
+        // Buttons fully inside the popup rect.
+        for r in show.iter().chain(run.iter()).chain([&dismiss, &dismiss_ur]) {
+            assert!(r.x >= 0);
+            assert!(r.y >= 0);
+            assert!((r.x + r.width as i16) <= w as i16);
+            assert!((r.y + r.height as i16) <= h as i16);
+        }
+        // Show and Run buttons never overlap horizontally.
+        for i in 0..2 {
+            assert!(show[i].x + show[i].width as i16 <= run[i].x);
+        }
+    }
+
+    #[test]
+    fn health_popup_layout_grows_when_a_fix_is_expanded() {
+        let diag = super::HealthDiagnosis {
+            body: "body".to_string(),
+            fixes: vec![super::HealthFix {
+                title: "Restart gnome-terminal-server".to_string(),
+                command_display: "pkill -f gnome-terminal-server".to_string(),
+                action: super::HealthFixAction::RunShell(
+                    "pkill -f gnome-terminal-server".to_string(),
+                ),
+            }],
+        };
+        let (_w_collapsed, h_collapsed, _, _, _, _, _) =
+            super::health_popup_layout(&diag, &HashSet::new());
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+        let (_w_expanded, h_expanded, _, _, cmd_y, _, _) =
+            super::health_popup_layout(&diag, &expanded);
+        assert!(
+            h_expanded > h_collapsed,
+            "expanded popup must be taller (collapsed {}, expanded {})",
+            h_collapsed,
+            h_expanded
+        );
+        assert!(
+            cmd_y[0] >= 0,
+            "expanded fix should have a non-sentinel command_y"
+        );
+    }
 
     #[test]
     fn terminal_argv_for_attach_resolves_path_then_canonicalizes_for_x_term_emu() {

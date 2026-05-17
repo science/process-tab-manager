@@ -15,3 +15,8 @@ x11rb = { version = "0.13", features = ["extra-traits"] }
 # ubiquitous, no transitive risk. Only used by the signal thread; the
 # rest of the code is libc-free.
 libc = "0.2"
+
+[dev-dependencies]
+# Used in tests/symlink-resolution integration tests for
+# terminal_argv_for_attach. Dev-only — no runtime dep impact.
+tempfile = "3"

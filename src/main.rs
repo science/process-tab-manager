@@ -3610,20 +3610,45 @@ fn spawn_default_terminal() {
         .spawn();
 }
 
+// Extract the basename of a path, then strip a single `.wrapper` or
+// `.real` suffix. On Debian/Ubuntu, `gnome-terminal` is shipped as two
+// files — `gnome-terminal.wrapper` (a python compat shim that's the
+// `x-terminal-emulator` alternative) and `gnome-terminal.real` (the
+// actual binary). Stripping these gets us back to `"gnome-terminal"`
+// for separator matching.
+fn terminal_basename_for_match(path: &str) -> String {
+    let base = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let s1 = base.strip_suffix(".wrapper").unwrap_or(base);
+    let s2 = s1.strip_suffix(".real").unwrap_or(s1);
+    s2.to_string()
+}
+
 // Build the argv for launching a terminal attached to an existing tmux
 // session. Different terminal emulators use different separators before
 // the command: gnome-terminal / ptyxis need `--`, almost everything else
 // (xterm, urxvt, alacritty, kitty, st, konsole) uses `-e`. Unknown
 // terminals fall through to `-e` as a reasonable default.
+//
+// We canonicalize argv[0] first so that the Debian symlink chain
+// (`x-terminal-emulator` → `/etc/alternatives/x-terminal-emulator` →
+// `/usr/bin/gnome-terminal.wrapper`) resolves to the real binary, then
+// strip `.wrapper`/`.real` suffixes to recover `"gnome-terminal"`.
+// If canonicalize fails (dangling symlink, or a synthetic name like
+// `"xterm"` that doesn't exist relative to CWD), fall back to the raw
+// path — `Path::file_name` on the raw string still yields a workable
+// basename for everything except the Debian chain case.
 fn terminal_argv_for_attach(term_argv: &[String], session_name: &str) -> Vec<String> {
     if term_argv.is_empty() {
         return Vec::new();
     }
-    let term_name = std::path::Path::new(&term_argv[0])
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let separator = match term_name {
+    let resolved = std::fs::canonicalize(&term_argv[0])
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| term_argv[0].clone());
+    let term_name = terminal_basename_for_match(&resolved);
+    let separator = match term_name.as_str() {
         "gnome-terminal" | "ptyxis" => "--",
         _ => "-e",
     };
@@ -9104,6 +9129,86 @@ mod tests {
     fn terminal_argv_for_attach_empty_term_returns_empty() {
         let argv = terminal_argv_for_attach(&[], "demo");
         assert!(argv.is_empty());
+    }
+
+    // ── Separator-symlink fix (Phase 1) ──
+    //
+    // On Debian/Ubuntu, `detect_terminal_command` often returns
+    // `["x-terminal-emulator"]`, which is a symlink chain ending in
+    // `gnome-terminal.wrapper` (a python shim). The basename of the
+    // chain head is `"x-terminal-emulator"` — not a recognised terminal —
+    // so the old code picked `-e`. It happened to work because Debian's
+    // wrapper translates `-e CMD` → `-- CMD`, but that's not what PTM
+    // intends and breaks if `update-alternatives` ever points elsewhere.
+    // Fix: canonicalize the path before basename-matching, then strip
+    // `.wrapper` / `.real` suffixes.
+
+    #[test]
+    fn terminal_basename_strips_wrapper_suffix() {
+        assert_eq!(
+            terminal_basename_for_match("/usr/bin/gnome-terminal.wrapper"),
+            "gnome-terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_basename_strips_real_suffix() {
+        assert_eq!(
+            terminal_basename_for_match("/usr/bin/gnome-terminal.real"),
+            "gnome-terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_basename_preserves_unrelated_names() {
+        assert_eq!(
+            terminal_basename_for_match("/usr/bin/alacritty"),
+            "alacritty"
+        );
+        assert_eq!(terminal_basename_for_match("xterm"), "xterm");
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_resolves_symlink_chain() {
+        // Build: link → wrapper file. canonicalize() follows the symlink
+        // and the basename strip gives us "gnome-terminal", so `--` wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wrapper = dir.path().join("gnome-terminal.wrapper");
+        std::fs::write(&wrapper, "#!/bin/true\n").expect("touch wrapper");
+        let link = dir.path().join("x-terminal-emulator");
+        std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
+        let argv = terminal_argv_for_attach(
+            &[link.to_string_lossy().into_owned()],
+            "demo",
+        );
+        assert_eq!(
+            argv.get(1).map(String::as_str),
+            Some("--"),
+            "x-terminal-emulator → *.wrapper should pick `--`, got {:?}",
+            argv
+        );
+    }
+
+    #[test]
+    fn terminal_argv_for_attach_dangling_symlink_falls_back_safely() {
+        // canonicalize() returns Err for dangling symlinks. The fallback
+        // path keeps the raw argv[0] and uses Path::file_name on it.
+        // Asserts: no panic, and the resulting separator is sensible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nonexistent = dir.path().join("does-not-exist");
+        let dangling = dir.path().join("dangle");
+        std::os::unix::fs::symlink(&nonexistent, &dangling).expect("symlink");
+        let argv = terminal_argv_for_attach(
+            &[dangling.to_string_lossy().into_owned()],
+            "demo",
+        );
+        assert!(!argv.is_empty(), "should not return empty on dangling symlink");
+        assert_eq!(
+            argv.get(1).map(String::as_str),
+            Some("-e"),
+            "basename `dangle` should fall through to -e default, got {:?}",
+            argv
+        );
     }
 
     // ── Session context menu + inline rename ──

@@ -5014,16 +5014,23 @@ fn claim_pending_spawns(
     pending: &mut Vec<PendingSpawn>,
     prior_wids: &HashSet<u32>,
     new_items: &mut [Item],
-    timeout: std::time::Duration,
-    now: std::time::Instant,
+    _timeout: std::time::Duration,
+    _now: std::time::Instant,
 ) -> Option<PendingClaim> {
+    // Timing-based lifecycle is owned by `tick_watchdog` (see
+    // docs/spawn-failure-diagnostics.md Cluster 6). claim only attempts
+    // attribution; it removes the head iff it successfully attributes a
+    // new wid. If the user's terminal spawn is wedged, the watchdog
+    // wedge-removes the entry at WATCHDOG_WEDGE_THRESHOLD (10s).
+    // Previously this function dropped entries at PENDING_ATTACH_TIMEOUT
+    // (5s) which silently truncated the watchdog escalation — the SLOW
+    // event still fired (also at 5s) but the WEDGE event never did, so
+    // the banner stayed Healthy forever on a real wedged-server. The
+    // `_timeout` and `_now` parameters are retained so call-sites and
+    // tests don't churn; they're unused now.
     let head = pending.first()?;
     // Queued entries aren't active yet; nothing to claim against.
     if matches!(head.state, WatchdogState::Queued) {
-        return None;
-    }
-    if now.saturating_duration_since(head.spawned_at) > timeout {
-        pending.remove(0);
         return None;
     }
     let new_wids: Vec<u32> = new_items
@@ -11669,12 +11676,24 @@ mod tests {
     }
 
     #[test]
-    fn pending_spawn_times_out() {
+    fn pending_spawn_does_not_time_out_in_claim() {
+        // Cluster 6 fix: claim_pending_spawns no longer drops entries
+        // on its own timeout — the watchdog owns lifecycle. A spawn
+        // that never produces a new wid stays in the queue until
+        // tick_watchdog wedges and removes it at WATCHDOG_WEDGE_THRESHOLD.
+        // (Previously this test asserted the opposite, which masked
+        // the bug where watchdog SpawnWedged never fired because the
+        // entry was dropped at PENDING_ATTACH_TIMEOUT first.)
+        //
+        // Setup: prior has wid 1 and items still contains only wid 1.
+        // No new wid has appeared — the spawn has wedged. The 10s
+        // simulated wait used to clear the queue (5s timeout); now it
+        // shouldn't.
         let spawn = std::time::Instant::now();
         let later = spawn + std::time::Duration::from_secs(10);
         let mut pending = pending_attach("demo", spawn);
         let prior: HashSet<u32> = [1].iter().copied().collect();
-        let mut items = vec![mk_item(1), mk_item(2)];
+        let mut items = vec![mk_item(1)];
         let claim = claim_pending_spawns(
             &mut pending,
             &prior,
@@ -11682,9 +11701,11 @@ mod tests {
             std::time::Duration::from_secs(5),
             later,
         );
-        assert!(claim.is_none());
-        assert!(items[1].session.is_none());
-        assert!(pending.is_empty(), "timed-out pending should be cleared");
+        assert!(claim.is_none(), "no new wid → no claim");
+        assert!(
+            !pending.is_empty(),
+            "entry must stay for the watchdog to escalate (was dropped here pre-Cluster-6, masking SpawnWedged)"
+        );
     }
 
     #[test]
@@ -16814,6 +16835,76 @@ mod tests {
         let d = super::decide_notify(super::HealthState::Broken, marker, t1);
         assert!(d.fire, "different state within debounce should still fire");
         assert_eq!(d.new_marker, Some((super::HealthState::Broken, t1)));
+    }
+
+    #[test]
+    fn claim_then_watchdog_escalates_to_wedge_when_no_wid_appears() {
+        // The dev-1 bug: a wedged terminal spawn (no new wid ever
+        // arrives) must transition through SpawnSlow at 5s and
+        // SpawnWedged at 10s. Prior to the fix, claim_pending_spawns
+        // dropped the entry at 5s, leaving the watchdog with an empty
+        // queue and no events to emit past 5s.
+        let spawn_at = std::time::Instant::now();
+        let mut pending = vec![{
+            let mut p = super::PendingSpawn::queued(super::PendingSpawnKind::Terminal);
+            p.spawned_at = spawn_at;
+            p.state = super::WatchdogState::Fresh;
+            p
+        }];
+        let prior_wids: HashSet<u32> = HashSet::new();
+        let mut items: Vec<super::Item> = vec![];
+
+        // Simulate two poll cycles: T=5.5s (past SLOW) and T=10.5s (past WEDGE).
+        let t1 = spawn_at + std::time::Duration::from_millis(5500);
+        let t2 = spawn_at + std::time::Duration::from_millis(10500);
+
+        // T=5.5s: claim runs, no new wid, watchdog should escalate SLOW.
+        let _claim = super::claim_pending_spawns(
+            &mut pending,
+            &prior_wids,
+            &mut items,
+            super::PENDING_ATTACH_TIMEOUT,
+            t1,
+        );
+        assert!(
+            !pending.is_empty(),
+            "claim must NOT drop the entry — watchdog needs it for SLOW"
+        );
+        let events_t1 = super::tick_watchdog(
+            &mut pending,
+            t1,
+            |_| super::ChildPollResult::Running,
+            |_| {},
+        );
+        let saw_slow = events_t1
+            .iter()
+            .any(|e| matches!(e, super::WatchdogEvent::SpawnSlow { .. }));
+        assert!(saw_slow, "expected SpawnSlow at T=5.5s, got events: {:?}", events_t1);
+        assert!(!pending.is_empty(), "entry stays after SLOW");
+
+        // T=10.5s: same sequence, should now WEDGE.
+        let _claim = super::claim_pending_spawns(
+            &mut pending,
+            &prior_wids,
+            &mut items,
+            super::PENDING_ATTACH_TIMEOUT,
+            t2,
+        );
+        assert!(
+            !pending.is_empty(),
+            "claim still must NOT drop the entry"
+        );
+        let events_t2 = super::tick_watchdog(
+            &mut pending,
+            t2,
+            |_| super::ChildPollResult::Running,
+            |_| {},
+        );
+        let saw_wedge = events_t2
+            .iter()
+            .any(|e| matches!(e, super::WatchdogEvent::SpawnWedged { .. }));
+        assert!(saw_wedge, "expected SpawnWedged at T=10.5s, got events: {:?}", events_t2);
+        assert!(pending.is_empty(), "watchdog wedge-removes the entry");
     }
 
     #[test]

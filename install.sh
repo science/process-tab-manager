@@ -37,6 +37,40 @@ else
     echo "Linked $dst -> $src"
 fi
 
+# Surface the terminal PTM will pick so the user sees it at install time.
+# Probing the terminal itself is intentionally NOT done here: running
+# `gnome-terminal --wait -- /bin/true` would flash a real window on every
+# healthy install, and the dev-1 evidence showed DBus introspect on a
+# wedged daemon returned normally — so there's no clean install-time
+# check that catches wedge without UX cost. The runtime spawn watchdog
+# (see src/main.rs tick_watchdog) handles live failures with a stderr +
+# log message naming the fix, and `ptm --diagnose` lets the user collect
+# telemetry on demand.
+echo
+echo "== PTM terminal selection =="
+PICK="$("$INSTALL_DIR/ptm" --print-terminal-command 2>/dev/null || true)"
+if [[ -n "$PICK" ]]; then
+    echo "PTM will spawn terminals as: $PICK"
+    # Use `command -v` (PATH-aware) BEFORE readlink so we don't resolve a
+    # bare name like "x-terminal-emulator" relative to CWD. Only print
+    # the resolved path if it's an absolute target different from the
+    # original — keeps the output uncluttered when PICK is already a
+    # full path or when resolution adds no info.
+    PICK_BIN="$(echo "$PICK" | awk '{print $1}')"
+    PATH_TARGET="$(command -v "$PICK_BIN" 2>/dev/null || true)"
+    if [[ -n "$PATH_TARGET" ]]; then
+        RESOLVED="$(readlink -f "$PATH_TARGET" 2>/dev/null || echo "$PATH_TARGET")"
+        if [[ -n "$RESOLVED" && "$RESOLVED" != "$PICK" ]]; then
+            echo "                  resolved: $RESOLVED"
+        fi
+    fi
+fi
+echo
+echo "If terminals don't open when you click + New Terminal, run:"
+echo "    ptm --diagnose --output /tmp/ptm-diag.md"
+echo "and share /tmp/ptm-diag.md (or paste its contents) for support."
+echo
+
 # Install icon into the freedesktop hicolor theme so Icon=ptm in the
 # .desktop file resolves by name (the standard pattern). We also keep the
 # legacy ~/.local/share/icons/ptm.svg path for any tools that bypass the

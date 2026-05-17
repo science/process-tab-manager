@@ -838,7 +838,6 @@ enum HealthEventKind {
 }
 
 impl HealthEventKind {
-    #[allow(dead_code)] // wired up by Commit 2 (watchdog → state machine)
     fn as_str(self) -> &'static str {
         match self {
             HealthEventKind::SpawnSlow => "SpawnSlow",
@@ -875,12 +874,10 @@ struct HealthEvent {
 /// recent handful for its "what PTM noticed" line; keeping the vec
 /// bounded prevents a tight wedge loop from growing the persisted file
 /// without limit.
-#[allow(dead_code)] // used by Commit 2 once watchdog events feed the board
 const HEALTH_EVENTS_CAP: usize = 20;
 
 /// Window over which repeated `SpawnSlow` events escalate Degraded →
 /// Broken. Matches the plan's "2× SpawnSlow within 5 min" rule.
-#[allow(dead_code)] // used by Commit 2's transition logic
 const HEALTH_ESCALATION_WINDOW_SECS: u64 = 5 * 60;
 
 /// Persisted health-board snapshot. Loaded once at App::new; rewritten
@@ -931,7 +928,6 @@ fn health_state_path() -> std::path::PathBuf {
 /// Serialise a HealthBoard to the tab-separated key=value format
 /// (consistent with the v2 groups file). String fields are
 /// percent-encoded so embedded tabs / newlines round-trip safely.
-#[allow(dead_code)] // called by save_health_board, wired up in Commit 2
 fn serialize_health_board(board: &HealthBoard) -> String {
     let mut out = String::new();
     out.push_str(HEALTH_STATE_VERSION);
@@ -1024,13 +1020,12 @@ fn parse_health_board(contents: &str) -> Option<HealthBoard> {
     })
 }
 
-/// Load the persisted health board, returning a Healthy default if the
-/// file is missing or malformed (any parse error → log + reset). This
-/// is the behaviour the plan requires: "load-with-malformed-json
-/// (recover to Healthy + log)".
-fn load_health_board() -> HealthBoard {
-    let path = health_state_path();
-    let contents = match std::fs::read_to_string(&path) {
+/// Load a HealthBoard from an explicit path. Returns Healthy on
+/// missing-file (the common new-install case) and on any parse error
+/// (lenient recovery). Split from `load_health_board` so tests can
+/// pass an isolated tempdir-rooted path without poking $XDG_CACHE_HOME.
+fn load_health_board_from(path: &std::path::Path) -> HealthBoard {
+    let contents = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HealthBoard::healthy(),
         Err(e) => {
@@ -1051,21 +1046,180 @@ fn load_health_board() -> HealthBoard {
     })
 }
 
-/// Persist the health board atomically. Errors are swallowed (matching
+/// Production wrapper: load from `health_state_path()`. The persistent
+/// behaviour the plan requires: "load-with-malformed-json (recover to
+/// Healthy + log)".
+fn load_health_board() -> HealthBoard {
+    load_health_board_from(&health_state_path())
+}
+
+/// Atomic write to an explicit path. Errors are swallowed (matching
 /// `append_to_warnings_log`'s no-crash discipline — losing the file is
 /// preferable to crashing PTM mid-event).
-#[allow(dead_code)] // wired up by Commit 2 (transition triggers save)
-fn save_health_board(board: &HealthBoard) {
-    let path = health_state_path();
+fn save_health_board_to(path: &std::path::Path, board: &HealthBoard) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = write_atomic(&path, serialize_health_board(board).as_bytes());
+    let _ = write_atomic(path, serialize_health_board(board).as_bytes());
+}
+
+/// Production wrapper: write to `health_state_path()`.
+fn save_health_board(board: &HealthBoard) {
+    save_health_board_to(&health_state_path(), board);
+}
+
+/// Translate a `WatchdogEvent` (operational signal) into a
+/// `HealthEvent` (user-visible record). Returns `None` for events that
+/// shouldn't influence the banner — currently `QueueFull` is rate-limit
+/// noise, but a downstream consumer could surface it later.
+fn health_event_from_watchdog(event: &WatchdogEvent) -> Option<HealthEvent> {
+    let at = unix_now_secs();
+    let (kind, terminal) = match event {
+        WatchdogEvent::SpawnSlow { .. } => (
+            HealthEventKind::SpawnSlow,
+            current_terminal_argv0(),
+        ),
+        WatchdogEvent::SpawnWedged { .. } => (
+            HealthEventKind::SpawnWedged,
+            current_terminal_argv0(),
+        ),
+        WatchdogEvent::SpawnExitedNonZero { .. } => (
+            HealthEventKind::SpawnExitedNonZero,
+            current_terminal_argv0(),
+        ),
+        // Queue overflow is a self-inflicted user-rage signal (clicking
+        // faster than spawns can complete); not currently shown in the
+        // banner. Keeping the path open in case Commit 3's popup decides
+        // to surface it.
+        WatchdogEvent::QueueFull { .. } => return None,
+    };
+    Some(HealthEvent { at, kind, terminal })
+}
+
+/// Best-effort lookup of the terminal command PTM is currently set up
+/// to spawn. Useful for tagging health events with the offender's name
+/// so the popup can say "x-terminal-emulator failed" rather than just
+/// "a terminal failed". Returns argv[0] from detect_terminal_command;
+/// errors swallowed to `None` because logging shouldn't crash PTM.
+fn current_terminal_argv0() -> Option<String> {
+    let argv = detect_terminal_command(
+        std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
+        std::env::var("TERMINAL").ok().as_deref(),
+        binary_on_path,
+    );
+    argv.into_iter().next()
+}
+
+/// One-shot probe at startup: would `detect_terminal_command`'s
+/// argv[0] resolve to something runnable on $PATH? If not, synthesise
+/// a `TerminalUnavailable` health event so the banner is Broken before
+/// the user gets a chance to click and wait 10s for the watchdog to
+/// catch it.
+///
+/// Skipped entirely when argv[0] is absolute / contains `/` — that's
+/// a user-specified path, not a PATH-resolved name, and the failure
+/// mode (file missing) is the same shape the watchdog would surface
+/// once they actually click.
+fn check_startup_terminal_availability(app: &mut App) {
+    let Some(name) = current_terminal_argv0() else {
+        return;
+    };
+    if name.contains('/') {
+        return;
+    }
+    if binary_on_path_resolved(&name).is_some() {
+        return;
+    }
+    app.record_health_failure(HealthEvent {
+        at: unix_now_secs(),
+        kind: HealthEventKind::TerminalUnavailable,
+        terminal: Some(name),
+    });
+}
+
+/// Pure transition function. Returns the next state after applying
+/// `ev` to a board currently at `current`. Never downgrades — only
+/// `note_successful_spawn` / explicit dismissal lower the state.
+///
+/// `prior_history` is the slice of events recorded *before* `ev`. It
+/// must NOT contain `ev`; the caller is responsible for ordering the
+/// "compute new state, then push" steps. Keeping `ev` out of the
+/// history avoids brittle pointer-equality checks and makes the
+/// function trivially testable.
+///
+/// Rules (from Part C of docs/spawn-failure-diagnostics.md):
+/// - SpawnWedged / TerminalUnavailable → Broken
+/// - SpawnExitedNonZero → Degraded (single-shot failure, not a wedge)
+/// - SpawnSlow → Degraded on first; Broken on 2nd within
+///   HEALTH_ESCALATION_WINDOW_SECS.
+fn next_state_after_event(
+    current: HealthState,
+    ev: &HealthEvent,
+    prior_history: &[HealthEvent],
+) -> HealthState {
+    use HealthEventKind::*;
+    use HealthState::*;
+    let candidate = match ev.kind {
+        SpawnWedged | TerminalUnavailable => Broken,
+        SpawnExitedNonZero => Degraded,
+        QueueFull => current,
+        SpawnSlow => {
+            let window_start = ev.at.saturating_sub(HEALTH_ESCALATION_WINDOW_SECS);
+            // Count prior SpawnSlow events within the escalation window
+            // — they're strictly before `ev` (caller contract).
+            let mut prior_slow_in_window = 0usize;
+            for prior in prior_history.iter().rev() {
+                if prior.at < window_start {
+                    break;
+                }
+                if matches!(prior.kind, SpawnSlow) {
+                    prior_slow_in_window += 1;
+                }
+            }
+            if prior_slow_in_window >= 1 {
+                Broken
+            } else {
+                Degraded
+            }
+        }
+    };
+    // Never downgrade. The board only steps down via successful spawn
+    // or explicit dismissal — see App::note_successful_spawn /
+    // App::dismiss_health_banner.
+    max_state(current, candidate)
+}
+
+fn max_state(a: HealthState, b: HealthState) -> HealthState {
+    fn rank(s: HealthState) -> u8 {
+        match s {
+            HealthState::Healthy => 0,
+            HealthState::Degraded => 1,
+            HealthState::Broken => 2,
+        }
+    }
+    if rank(a) >= rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// One-line user-facing summary for a HealthEvent. Drives
+/// `last_reason_short`, which is what shows in the popup's "PTM
+/// noticed" line until Commit 3 builds the full diagnosis renderer.
+fn short_reason_for_event(ev: &HealthEvent) -> String {
+    let term = ev.terminal.as_deref().unwrap_or("terminal");
+    match ev.kind {
+        HealthEventKind::SpawnSlow => format!("{} spawn slow", term),
+        HealthEventKind::SpawnWedged => format!("{} spawn wedged", term),
+        HealthEventKind::SpawnExitedNonZero => format!("{} spawn exited non-zero", term),
+        HealthEventKind::QueueFull => "spawn queue full".to_string(),
+        HealthEventKind::TerminalUnavailable => format!("{} not in PATH", term),
+    }
 }
 
 /// Seconds since the Unix epoch. Wrapper around `SystemTime::now()` so
 /// callers don't repeat the conversion.
-#[allow(dead_code)] // wired up by Commit 2 transitions
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1544,6 +1698,57 @@ impl App {
         }
         let w = self.width as i16;
         x >= 0 && x < w && y >= 0 && y < HEALTH_BANNER_H as i16
+    }
+
+    /// Apply a failure observation to the health board. Computes the
+    /// next state from the *prior* history, then pushes onto
+    /// `recent_events` (capped at HEALTH_EVENTS_CAP), persists, and
+    /// returns `Some(new_state)` if the state actually changed.
+    fn record_health_failure(&mut self, ev: HealthEvent) -> Option<HealthState> {
+        let prior = self.health.state;
+        // Transition uses prior history only — caller contract requires
+        // ev to not yet be in the slice.
+        let new_state =
+            next_state_after_event(prior, &ev, &self.health.recent_events);
+        self.health.recent_events.push(ev.clone());
+        if self.health.recent_events.len() > HEALTH_EVENTS_CAP {
+            let drop = self.health.recent_events.len() - HEALTH_EVENTS_CAP;
+            self.health.recent_events.drain(..drop);
+        }
+        if new_state != prior {
+            self.health.state = new_state;
+            self.health.last_transition_at = Some(ev.at);
+            self.health.last_reason_short = short_reason_for_event(&ev);
+            // A fresh failure event always re-shows the banner — the
+            // per-session dismissal only suppresses until the *next*
+            // problem (cf. plan's "Don't show until restart" semantics
+            // of "until-restart-or-next-event").
+            self.health_dismissed_this_session = false;
+            save_health_board(&self.health);
+            return Some(new_state);
+        }
+        // Persist even without a state change so recent_events stays
+        // durable for the popup across PTM restarts.
+        save_health_board(&self.health);
+        None
+    }
+
+    /// Note that a spawn succeeded. Lowers the state to Healthy when
+    /// the board was Degraded or Broken; returns the new state if it
+    /// changed.
+    fn note_successful_spawn(&mut self) -> Option<HealthState> {
+        if matches!(self.health.state, HealthState::Healthy) {
+            return None;
+        }
+        let new_state = HealthState::Healthy;
+        self.health.state = new_state;
+        self.health.last_transition_at = Some(unix_now_secs());
+        self.health.last_reason_short = "spawn succeeded".to_string();
+        // Successful spawn invalidates the dismissal too — though it
+        // doesn't matter because the banner won't be drawn for Healthy.
+        self.health_dismissed_this_session = false;
+        save_health_board(&self.health);
+        Some(new_state)
     }
 
     /// Queue a spawn request. If the queue was empty, returns
@@ -2926,6 +3131,12 @@ fn refresh_items(
             pre_assigned.insert(name.clone());
         }
     }
+    // A wid claim is a successful spawn — feed it into the health
+    // board so a Degraded/Broken state can recover automatically when
+    // the next spawn works (e.g., after gnome-terminal-server restart).
+    if claim.is_some() {
+        app.note_successful_spawn();
+    }
     // Watchdog tick: catches timeouts on the active spawn (slow @5s,
     // wedge @10s). Emits events for stderr + the rolling log. If the
     // head was removed by either claim above or the watchdog here, and
@@ -2946,6 +3157,9 @@ fn refresh_items(
     );
     for ev in &events {
         emit_watchdog_event(ev);
+        if let Some(hev) = health_event_from_watchdog(ev) {
+            app.record_health_failure(hev);
+        }
     }
     dispatch_head_if_queued(app);
     app.sync_poll_interval();
@@ -4394,9 +4608,18 @@ fn detect_terminal_command(
 }
 
 fn binary_on_path(name: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
+    binary_on_path_resolved(name).is_some()
+}
+
+/// Walk `$PATH` and return the first absolute path where `name` is a
+/// regular file. Unlike `std::fs::canonicalize`, this does *not* require
+/// the path-relative file to exist in the current working directory —
+/// the watchdog's startup PATH check and `terminal_argv_for_attach`'s
+/// symlink-canonicalisation step both need to take a bare binary name
+/// (e.g. `"x-terminal-emulator"`) and turn it into something
+/// `canonicalize` can follow.
+fn binary_on_path_resolved(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var("PATH").ok()?;
     for dir in path.split(':') {
         if dir.is_empty() {
             continue;
@@ -4404,10 +4627,10 @@ fn binary_on_path(name: &str) -> bool {
         let mut p = std::path::PathBuf::from(dir);
         p.push(name);
         if p.is_file() {
-            return true;
+            return Some(p);
         }
     }
-    false
+    None
 }
 
 /// Spawn the user's default terminal. Returns the `Child` handle so the
@@ -4455,17 +4678,31 @@ fn terminal_basename_for_match(path: &str) -> String {
 // (`x-terminal-emulator` → `/etc/alternatives/x-terminal-emulator` →
 // `/usr/bin/gnome-terminal.wrapper`) resolves to the real binary, then
 // strip `.wrapper`/`.real` suffixes to recover `"gnome-terminal"`.
-// If canonicalize fails (dangling symlink, or a synthetic name like
-// `"xterm"` that doesn't exist relative to CWD), fall back to the raw
-// path — `Path::file_name` on the raw string still yields a workable
-// basename for everything except the Debian chain case.
+//
+// `canonicalize` is the only call that follows symlinks, but it
+// requires an already-locatable path — passing a bare name like
+// `"x-terminal-emulator"` makes it try to resolve relative to the
+// current working directory, where it fails with ENOENT and triggers
+// the basename-only fallback (the bug dev-1 caught in the diagnose
+// report). When argv[0] is bare and has no `/`, we PATH-resolve first
+// so canonicalize sees an absolute path to start the symlink chain
+// from. Absolute / relative paths skip the PATH step and canonicalize
+// directly. If both steps fail (truly missing binary, dangling
+// symlink), we fall back to the raw argv[0] — basename matching still
+// picks `-e` for unknown terminals.
 fn terminal_argv_for_attach(term_argv: &[String], session_name: &str) -> Vec<String> {
     if term_argv.is_empty() {
         return Vec::new();
     }
-    let resolved = std::fs::canonicalize(&term_argv[0])
+    let raw = &term_argv[0];
+    let path_for_canonicalize: std::path::PathBuf = if raw.contains('/') {
+        std::path::PathBuf::from(raw)
+    } else {
+        binary_on_path_resolved(raw).unwrap_or_else(|| std::path::PathBuf::from(raw))
+    };
+    let resolved = std::fs::canonicalize(&path_for_canonicalize)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| term_argv[0].clone());
+        .unwrap_or_else(|_| raw.clone());
     let term_name = terminal_basename_for_match(&resolved);
     let separator = match term_name.as_str() {
         "gnome-terminal" | "ptyxis" => "--",
@@ -7440,6 +7677,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Hydrate health board from disk before the first paint so the
     // banner reflects the last persisted state (Cluster 6).
     app.health = load_health_board();
+    // Synthetic startup health check: if PTM's chosen terminal isn't
+    // reachable via $PATH, surface that immediately rather than waiting
+    // for the user's first click to time out 10s later.
+    check_startup_terminal_availability(&mut app);
     let mut renderer = Renderer::new(&conn, screen, window)?;
 
     conn.map_window(window)?;
@@ -14554,47 +14795,27 @@ mod tests {
 
     #[test]
     fn load_health_board_returns_healthy_when_file_missing() {
-        // Point XDG_CACHE_HOME at a guaranteed-empty dir.
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let prior = std::env::var("XDG_CACHE_HOME").ok();
-        std::env::set_var("XDG_CACHE_HOME", tmp.path());
-        let loaded = super::load_health_board();
-        match prior {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
+        let loaded = super::load_health_board_from(&tmp.path().join("health-state"));
         assert_eq!(loaded, super::HealthBoard::healthy());
     }
 
     #[test]
     fn save_load_health_board_round_trip_on_disk() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let prior = std::env::var("XDG_CACHE_HOME").ok();
-        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let path = tmp.path().join("health-state");
         let original = sample_health_board();
-        super::save_health_board(&original);
-        let loaded = super::load_health_board();
-        match prior {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
+        super::save_health_board_to(&path, &original);
+        let loaded = super::load_health_board_from(&path);
         assert_eq!(loaded, original);
     }
 
     #[test]
     fn load_health_board_recovers_to_healthy_on_malformed_file() {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let prior = std::env::var("XDG_CACHE_HOME").ok();
-        std::env::set_var("XDG_CACHE_HOME", tmp.path());
-        // Write garbage where the loader expects the v1 file.
-        let dir = tmp.path().join("ptm");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("health-state"), b"completely-not-valid").unwrap();
-        let loaded = super::load_health_board();
-        match prior {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
+        let path = tmp.path().join("health-state");
+        std::fs::write(&path, b"completely-not-valid").unwrap();
+        let loaded = super::load_health_board_from(&path);
         assert_eq!(loaded, super::HealthBoard::healthy());
     }
 
@@ -14674,5 +14895,327 @@ mod tests {
         assert!(!app.hit_test_header_button(0));
         // A point at exactly banner_height should be the start of the header.
         assert!(app.hit_test_header_button(app.banner_height()));
+    }
+
+    // ── Cluster 6: state transitions + startup PATH check (Commit 2) ──
+
+    fn make_event(at: u64, kind: super::HealthEventKind) -> super::HealthEvent {
+        super::HealthEvent {
+            at,
+            kind,
+            terminal: Some("xterm".to_string()),
+        }
+    }
+
+    #[test]
+    fn next_state_after_event_promotes_healthy_to_degraded_on_slow() {
+        let recent = vec![];
+        let ev = make_event(1000, super::HealthEventKind::SpawnSlow);
+        let next = super::next_state_after_event(
+            super::HealthState::Healthy,
+            &ev,
+            &recent,
+        );
+        assert_eq!(next, super::HealthState::Degraded);
+    }
+
+    #[test]
+    fn next_state_after_event_promotes_to_broken_on_wedge() {
+        let recent = vec![];
+        let ev = make_event(1000, super::HealthEventKind::SpawnWedged);
+        let next = super::next_state_after_event(
+            super::HealthState::Healthy,
+            &ev,
+            &recent,
+        );
+        assert_eq!(next, super::HealthState::Broken);
+    }
+
+    #[test]
+    fn next_state_after_event_terminal_unavailable_breaks() {
+        let recent = vec![];
+        let ev = make_event(1000, super::HealthEventKind::TerminalUnavailable);
+        let next = super::next_state_after_event(
+            super::HealthState::Healthy,
+            &ev,
+            &recent,
+        );
+        assert_eq!(next, super::HealthState::Broken);
+    }
+
+    #[test]
+    fn next_state_after_event_two_slows_within_window_break() {
+        // First SpawnSlow already in prior_history; second SpawnSlow
+        // within 5 min escalates Degraded → Broken.
+        let prior_history = vec![make_event(500, super::HealthEventKind::SpawnSlow)];
+        let now = make_event(600, super::HealthEventKind::SpawnSlow);
+        let next = super::next_state_after_event(
+            super::HealthState::Degraded,
+            &now,
+            &prior_history,
+        );
+        assert_eq!(next, super::HealthState::Broken);
+    }
+
+    #[test]
+    fn next_state_after_event_two_slows_outside_window_stays_degraded() {
+        // Prior slow at t=0; current slow at t=360 (6 min later — outside
+        // 5-min escalation window).
+        let prior_history = vec![make_event(0, super::HealthEventKind::SpawnSlow)];
+        let now = make_event(360, super::HealthEventKind::SpawnSlow);
+        let next = super::next_state_after_event(
+            super::HealthState::Degraded,
+            &now,
+            &prior_history,
+        );
+        assert_eq!(next, super::HealthState::Degraded);
+    }
+
+    #[test]
+    fn next_state_after_event_never_downgrades() {
+        // A QueueFull on Broken stays Broken.
+        let ev = make_event(1000, super::HealthEventKind::QueueFull);
+        let next = super::next_state_after_event(
+            super::HealthState::Broken,
+            &ev,
+            &[],
+        );
+        assert_eq!(next, super::HealthState::Broken);
+        // A SpawnSlow on Broken also stays Broken (no downgrade).
+        let slow = make_event(1000, super::HealthEventKind::SpawnSlow);
+        let next = super::next_state_after_event(
+            super::HealthState::Broken,
+            &slow,
+            &[],
+        );
+        assert_eq!(next, super::HealthState::Broken);
+    }
+
+    /// Serialise tests that mutate $XDG_CACHE_HOME / $PATH /
+    /// $PTM_TERMINAL_CMD against each other so parallel runs don't see
+    /// each other's writes. Production code never grabs this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `XDG_CACHE_HOME` pointed at an isolated tempdir.
+    /// Restores the prior value (or removes the var) afterwards. Holds
+    /// `ENV_LOCK` for the duration so other env-touching tests don't
+    /// race.
+    fn with_isolated_cache_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let result = f(tmp.path());
+        match prior {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        result
+    }
+
+    #[test]
+    fn record_health_failure_transitions_and_persists() {
+        with_isolated_cache_home(|cache| {
+            let mut app = make_app();
+            assert_eq!(app.health.state, super::HealthState::Healthy);
+            let outcome = app.record_health_failure(make_event(
+                1000,
+                super::HealthEventKind::SpawnWedged,
+            ));
+            assert_eq!(outcome, Some(super::HealthState::Broken));
+            assert_eq!(app.health.state, super::HealthState::Broken);
+            // Side-effect persistence: load via the same isolated dir.
+            let loaded = super::load_health_board_from(
+                &cache.join("ptm").join("health-state"),
+            );
+            assert_eq!(loaded.state, super::HealthState::Broken);
+        });
+    }
+
+    #[test]
+    fn record_health_failure_caps_recent_events() {
+        with_isolated_cache_home(|_cache| {
+            let mut app = make_app();
+            // Push HEALTH_EVENTS_CAP + 5 events — vec must stay at cap.
+            for i in 0..super::HEALTH_EVENTS_CAP + 5 {
+                app.record_health_failure(make_event(
+                    i as u64,
+                    super::HealthEventKind::SpawnSlow,
+                ));
+            }
+            assert_eq!(app.health.recent_events.len(), super::HEALTH_EVENTS_CAP);
+            // Oldest event drained.
+            let oldest_at = app.health.recent_events.first().unwrap().at;
+            assert!(oldest_at >= 5);
+        });
+    }
+
+    #[test]
+    fn note_successful_spawn_lowers_broken_to_healthy() {
+        with_isolated_cache_home(|_cache| {
+            let mut app = make_app();
+            app.health.state = super::HealthState::Broken;
+            let outcome = app.note_successful_spawn();
+            assert_eq!(outcome, Some(super::HealthState::Healthy));
+            assert_eq!(app.health.state, super::HealthState::Healthy);
+        });
+    }
+
+    #[test]
+    fn note_successful_spawn_no_op_when_already_healthy() {
+        let mut app = make_app();
+        assert_eq!(app.health.state, super::HealthState::Healthy);
+        let outcome = app.note_successful_spawn();
+        assert!(outcome.is_none(), "no-op should return None");
+    }
+
+    #[test]
+    fn health_event_from_watchdog_slow_maps_to_health_slow() {
+        let wev = super::WatchdogEvent::SpawnSlow {
+            kind: super::PendingSpawnKind::Terminal,
+            elapsed: std::time::Duration::from_secs(5),
+            child_pid: Some(123),
+        };
+        let hev = super::health_event_from_watchdog(&wev).unwrap();
+        assert_eq!(hev.kind, super::HealthEventKind::SpawnSlow);
+    }
+
+    #[test]
+    fn health_event_from_watchdog_queue_full_is_swallowed() {
+        let wev = super::WatchdogEvent::QueueFull {
+            dropped_kind: super::PendingSpawnKind::Terminal,
+        };
+        assert!(super::health_event_from_watchdog(&wev).is_none());
+    }
+
+    #[test]
+    fn binary_on_path_resolved_finds_known_binary() {
+        // `ls` is on every POSIX system this code runs on; if this test
+        // ever flakes on a stripped container, swap to `sh`.
+        let p = super::binary_on_path_resolved("ls");
+        assert!(p.is_some(), "expected to find ls on PATH");
+        let p = p.unwrap();
+        assert!(p.is_absolute(), "expected absolute path, got {:?}", p);
+        assert!(p.is_file(), "expected regular file, got {:?}", p);
+    }
+
+    #[test]
+    fn binary_on_path_resolved_returns_none_for_missing() {
+        let p = super::binary_on_path_resolved("definitely-not-a-real-binary-name-xyzqq");
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn check_startup_terminal_availability_breaks_on_missing_binary() {
+        // ENV_LOCK gates against parallel PATH writes.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior_cache = std::env::var("XDG_CACHE_HOME").ok();
+        let prior_path = std::env::var("PATH").ok();
+        let prior_ptm = std::env::var("PTM_TERMINAL_CMD").ok();
+        let prior_term = std::env::var("TERMINAL").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        // Empty PATH so nothing resolves; PTM_TERMINAL_CMD points at
+        // an obvious nonexistent name.
+        std::env::set_var("PATH", "");
+        std::env::set_var("PTM_TERMINAL_CMD", "not-a-real-terminal-xyzqq");
+        std::env::remove_var("TERMINAL");
+
+        let mut app = make_app();
+        super::check_startup_terminal_availability(&mut app);
+        let resulting_state = app.health.state;
+
+        // Restore env before asserting so even a panic leaves the
+        // process in a sane state.
+        match prior_cache {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match prior_ptm {
+            Some(v) => std::env::set_var("PTM_TERMINAL_CMD", v),
+            None => std::env::remove_var("PTM_TERMINAL_CMD"),
+        }
+        if let Some(v) = prior_term {
+            std::env::set_var("TERMINAL", v);
+        }
+        assert_eq!(resulting_state, super::HealthState::Broken);
+    }
+
+    #[test]
+    fn check_startup_terminal_availability_skips_absolute_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let prior_cache = std::env::var("XDG_CACHE_HOME").ok();
+        let prior_ptm = std::env::var("PTM_TERMINAL_CMD").ok();
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        // Absolute path with /, even if nonexistent — the PATH check
+        // shouldn't apply (user explicitly chose a path).
+        std::env::set_var("PTM_TERMINAL_CMD", "/nonexistent/path/term");
+
+        let mut app = make_app();
+        super::check_startup_terminal_availability(&mut app);
+        let resulting_state = app.health.state;
+
+        match prior_cache {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_ptm {
+            Some(v) => std::env::set_var("PTM_TERMINAL_CMD", v),
+            None => std::env::remove_var("PTM_TERMINAL_CMD"),
+        }
+        assert_eq!(
+            resulting_state,
+            super::HealthState::Healthy,
+            "absolute paths skip the PATH check"
+        );
+    }
+
+    // ── Canonicalize-then-PATH-resolve fix (the bug dev-1 caught) ──
+
+    #[test]
+    fn terminal_argv_for_attach_resolves_path_then_canonicalizes_for_x_term_emu() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Build a fake bin dir on PATH with x-terminal-emulator →
+        // *.wrapper symlink. After the fix, terminal_argv_for_attach
+        // should pick `--` (gnome-terminal separator), not `-e`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wrapper = dir.path().join("gnome-terminal.wrapper");
+        std::fs::write(&wrapper, "#!/bin/true\n").expect("touch wrapper");
+        let link = dir.path().join("x-terminal-emulator");
+        std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
+
+        let prior_path = std::env::var("PATH").ok();
+        // Put our fake dir FIRST so binary_on_path_resolved picks it
+        // ahead of any real /usr/bin/x-terminal-emulator.
+        let new_path = format!(
+            "{}:{}",
+            dir.path().display(),
+            prior_path.as_deref().unwrap_or("")
+        );
+        std::env::set_var("PATH", new_path);
+
+        // Pass the bare name — the original bug was that canonicalize
+        // was called on this and failed with ENOENT.
+        let argv = super::terminal_argv_for_attach(
+            &["x-terminal-emulator".to_string()],
+            "demo",
+        );
+
+        match prior_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(
+            argv.get(1).map(String::as_str),
+            Some("--"),
+            "PATH-resolved x-terminal-emulator → wrapper should pick `--`, got {:?}",
+            argv
+        );
     }
 }

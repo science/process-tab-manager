@@ -6487,7 +6487,462 @@ fn load_geometry_from(path: &std::path::Path) -> Option<(i16, i16, u16, u16)> {
 
 // ── Main ──
 
+/// CLI dispatch modes. Determined by `parse_cli_args` from argv-after-name.
+/// `Normal` is the default (fall through to the X11 event loop); all other
+/// variants exit early after running their side effect.
+#[derive(Debug, PartialEq, Eq)]
+enum CliMode {
+    Normal,
+    Version,
+    Help,
+    PrintTerminalCommand,
+    Diagnose { output: Option<String> },
+    Unknown(Vec<String>),
+}
+
+/// Pure flag parser. Stdlib-only — no clap dep. `args` is argv after the
+/// program name. Recognised flags:
+///   --version | -V                    print version and exit
+///   --help | -h                       print flag list and exit
+///   --print-terminal-command          print what spawn_default_terminal would run
+///   --diagnose [--output PATH]        run probes, write report, exit
+fn parse_cli_args(args: &[String]) -> CliMode {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match argv.as_slice() {
+        [] => CliMode::Normal,
+        ["--version"] | ["-V"] => CliMode::Version,
+        ["--help"] | ["-h"] => CliMode::Help,
+        ["--print-terminal-command"] => CliMode::PrintTerminalCommand,
+        ["--diagnose"] => CliMode::Diagnose { output: None },
+        ["--diagnose", "--output", path] => CliMode::Diagnose {
+            output: Some((*path).to_string()),
+        },
+        _ => CliMode::Unknown(args.to_vec()),
+    }
+}
+
+fn print_help() {
+    println!("ptm — vertical sidebar for managing X11 application windows");
+    println!();
+    println!("USAGE:");
+    println!("    ptm [FLAG]");
+    println!();
+    println!("FLAGS:");
+    println!("    -V, --version                  Print version and exit");
+    println!("    -h, --help                     Print this help and exit");
+    println!("        --print-terminal-command   Print the terminal argv PTM would spawn");
+    println!("        --diagnose                 Run environment probes, print markdown report");
+    println!("        --diagnose --output PATH   Same, but write report to PATH instead of stdout");
+    println!();
+    println!("With no flags, PTM opens the sidebar window. Most users want that.");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("    PTM_TERMINAL_CMD  Terminal argv used for `+ New Terminal` (overrides $TERMINAL)");
+    println!("    TERMINAL          Fallback terminal argv (used if PTM_TERMINAL_CMD is unset)");
+    println!();
+    println!("See ~/.cache/ptm/ptm-warnings.log for spawn-watchdog warnings.");
+}
+
+fn run_print_terminal_command() {
+    let argv = detect_terminal_command(
+        std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
+        std::env::var("TERMINAL").ok().as_deref(),
+        binary_on_path,
+    );
+    if argv.is_empty() {
+        println!();
+    } else {
+        println!("{}", argv.join(" "));
+    }
+}
+
+/// Build the markdown diagnose report. All sections appear even if some
+/// data is unavailable; missing fields show "n/a" or similar. Kept as a
+/// single function for testability: callers can assert the structure
+/// without writing to disk.
+fn build_diagnose_report() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "# PTM diagnostic report — {}", current_timestamp());
+    let _ = writeln!(out);
+    let _ = write!(out, "{}", diagnose_section_build());
+    let _ = write!(out, "{}", diagnose_section_env());
+    let _ = write!(out, "{}", diagnose_section_tmux());
+    let _ = write!(out, "{}", diagnose_section_terminals());
+    let _ = write!(out, "{}", diagnose_section_proc_state());
+    let _ = write!(out, "{}", diagnose_section_saved_state());
+    let _ = write!(out, "{}", diagnose_section_live_ptm());
+    out
+}
+
+fn diagnose_section_build() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 1. Build & invocation");
+    let _ = writeln!(s, "- ptm version: `{}`", env!("CARGO_PKG_VERSION"));
+    let exe = std::fs::read_link("/proc/self/exe")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "(unreadable)".to_string());
+    let _ = writeln!(s, "- /proc/self/exe: `{}`", exe);
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "(unreadable)".to_string());
+    let _ = writeln!(s, "- cwd: `{}`", cwd);
+    let _ = writeln!(s, "- pid: {}", std::process::id());
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_env() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 2. Environment");
+    for var in &[
+        "TERM",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "SHELL",
+        "LANG",
+        "PTM_TERMINAL_CMD",
+        "TERMINAL",
+        "DEFAULT_TERMINAL",
+    ] {
+        let val = std::env::var(var).unwrap_or_else(|_| "(unset)".to_string());
+        let _ = writeln!(s, "- {}: `{}`", var, val);
+    }
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_tmux() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 3. Tmux probes");
+    let socket_name = format!("ptm-diag-{}", std::process::id());
+    let _ = writeln!(s, "- Socket: `-L {}` (private — does not touch the user's tmux server)", socket_name);
+
+    fn capture(cmd: &mut std::process::Command, label: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        match cmd.output() {
+            Ok(o) => {
+                let _ = writeln!(out, "### {}", label);
+                let _ = writeln!(out, "- exit: {}", o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()));
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let _ = writeln!(out, "- stdout: `{}`", stdout.trim());
+                if !stderr.trim().is_empty() {
+                    let _ = writeln!(out, "- stderr: `{}`", stderr.trim());
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(out, "### {}", label);
+                let _ = writeln!(out, "- error: `{}`", e);
+            }
+        }
+        out
+    }
+
+    s.push_str(&capture(std::process::Command::new("tmux").arg("-V"), "tmux -V"));
+    s.push_str(&capture(
+        std::process::Command::new("tmux")
+            .args(["-L", &socket_name, "new-session", "-d", "-P", "-F", "#{session_name}"]),
+        "new-session",
+    ));
+    s.push_str(&capture(
+        std::process::Command::new("tmux").args([
+            "-L",
+            &socket_name,
+            "list-sessions",
+            "-F",
+            "#{session_id} #{session_name} #{session_attached}",
+        ]),
+        "list-sessions",
+    ));
+    // Cleanup
+    let _ = std::process::Command::new("tmux")
+        .args(["-L", &socket_name, "kill-server"])
+        .output();
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_terminals() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 4. Terminal probes");
+    let pick = detect_terminal_command(
+        std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
+        std::env::var("TERMINAL").ok().as_deref(),
+        binary_on_path,
+    );
+    let _ = writeln!(s, "- PTM would spawn: `{}`", pick.join(" "));
+    if let Some(arg0) = pick.first() {
+        match std::fs::canonicalize(arg0) {
+            Ok(p) => { let _ = writeln!(s, "- canonicalized: `{}`", p.display()); }
+            Err(e) => { let _ = writeln!(s, "- canonicalize failed: {}", e); }
+        }
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Probing installed terminal emulators (8s timeout each):");
+    for bin in &["gnome-terminal", "xterm", "alacritty", "kitty", "foot", "ptyxis", "konsole"] {
+        if !binary_on_path(bin) {
+            let _ = writeln!(s, "- `{}` — not installed", bin);
+            continue;
+        }
+        let bin_owned = (*bin).to_string();
+        let result = run_with_timeout(std::time::Duration::from_secs(8), move || {
+            std::process::Command::new(&bin_owned)
+                .arg("--version")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+        });
+        match result {
+            Some(Ok(o)) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let first_line = stdout.lines().next().unwrap_or("").trim();
+                let _ = writeln!(s, "- `{}` — {} ({})", bin, first_line, o.status);
+            }
+            Some(Err(e)) => {
+                let _ = writeln!(s, "- `{}` — spawn error: {}", bin, e);
+            }
+            None => {
+                let _ = writeln!(s, "- `{}` — TIMEOUT (>8s, likely wedged)", bin);
+            }
+        }
+    }
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_proc_state() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 5. Process state");
+    // Scan /proc for stuck gnome-terminal --wait wrappers + defunct ptm children.
+    let mut stuck: Vec<(u32, String, String)> = Vec::new();
+    let mut zombies: Vec<(u32, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let status_path = format!("/proc/{}/status", pid);
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            let status = match std::fs::read_to_string(&status_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let state_line = status.lines().find(|l| l.starts_with("State:")).unwrap_or("");
+            let cmdline = std::fs::read(&cmdline_path)
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+                .unwrap_or_default();
+            if cmdline.contains("gnome-terminal") && cmdline.contains("--wait") {
+                stuck.push((pid, state_line.to_string(), cmdline.clone()));
+            }
+            if state_line.contains("Z (zombie)") {
+                zombies.push((pid, cmdline));
+            }
+        }
+    }
+    let _ = writeln!(s, "- Stuck `gnome-terminal --wait` wrappers: {}", stuck.len());
+    for (pid, state, cmd) in &stuck {
+        let _ = writeln!(s, "  - pid {} {} — `{}`", pid, state.trim(), cmd);
+    }
+    let _ = writeln!(s, "- Zombie processes (system-wide): {}", zombies.len());
+    for (pid, cmd) in zombies.iter().take(10) {
+        let _ = writeln!(s, "  - pid {} — `{}`", pid, cmd);
+    }
+    if zombies.len() > 10 {
+        let _ = writeln!(s, "  - ... and {} more", zombies.len() - 10);
+    }
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_saved_state() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 6. Saved state");
+    let path = data_dir().join("groups");
+    if !path.exists() {
+        let _ = writeln!(s, "- No saved groups at `{}`", path.display());
+        let _ = writeln!(s);
+        return s;
+    }
+    let _ = writeln!(s, "- File: `{}`", path.display());
+    match std::fs::metadata(&path) {
+        Ok(m) => { let _ = writeln!(s, "- Size: {} bytes", m.len()); }
+        Err(_) => {}
+    }
+    let raw = std::fs::read_to_string(&path).ok();
+    if let Some(contents) = raw {
+        let groups_count = contents.lines().filter(|l| l.starts_with("GROUP\t")).count();
+        let members_count = contents.lines().filter(|l| l.starts_with("MEMBER\t")).count();
+        let mut sessions: HashSet<String> = HashSet::new();
+        for line in contents.lines() {
+            if let Some(rest) = line.strip_prefix("TMUX\t") {
+                if let Some(name) = rest.split('\t').next() {
+                    sessions.insert(name.to_string());
+                }
+            }
+        }
+        let _ = writeln!(s, "- Groups: {}", groups_count);
+        let _ = writeln!(s, "- Members: {}", members_count);
+        let _ = writeln!(s, "- Tmux sessions referenced: {} (`{}`)", sessions.len(), sessions.iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    let _ = writeln!(s);
+    s
+}
+
+fn diagnose_section_live_ptm() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 7. Live PTM");
+    let snapshot_path = recipe_dump_path();
+    let self_pid = std::process::id();
+
+    // Find another ptm process via /proc walk (don't depend on pgrep).
+    let mut other_pid: Option<u32> = None;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            if pid == self_pid { continue; }
+            let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid))
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+                .unwrap_or_default();
+            // Match argv[0] basename = "ptm". (We can't easily distinguish from
+            // a binary literally named "ptm-something"; basename check is close
+            // enough for diagnostic purposes.)
+            if let Some(first) = cmdline.split_whitespace().next() {
+                let basename = std::path::Path::new(first)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if basename == "ptm" {
+                    other_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(pid) = other_pid {
+        let _ = writeln!(s, "- Live PTM found at pid {}", pid);
+        let pre_mtime = std::fs::metadata(&snapshot_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        // Send SIGUSR1.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+        // Poll for up to 500ms for the cache mtime to change.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut refreshed = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now_mtime = std::fs::metadata(&snapshot_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if now_mtime != pre_mtime {
+                refreshed = true;
+                break;
+            }
+        }
+        let label = if refreshed { "FRESH" } else { "STALE (no SIGUSR1 ack within 500ms)" };
+        let _ = writeln!(s, "- Snapshot label: {}", label);
+    } else {
+        let _ = writeln!(s, "- No other PTM process found");
+        let _ = writeln!(s, "- Snapshot label: HISTORICAL (no live PTM)");
+    }
+
+    if snapshot_path.exists() {
+        let _ = writeln!(s, "- Path: `{}`", snapshot_path.display());
+        if let Ok(contents) = std::fs::read_to_string(&snapshot_path) {
+            let total_lines = contents.lines().count();
+            let _ = writeln!(s, "- Total lines: {}", total_lines);
+            let _ = writeln!(s);
+            let _ = writeln!(s, "Last 200 lines:");
+            let _ = writeln!(s, "```");
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(200);
+            for line in &lines[start..] {
+                let _ = writeln!(s, "{}", line);
+            }
+            let _ = writeln!(s, "```");
+        }
+    } else {
+        let _ = writeln!(s, "- No snapshot file at `{}`", snapshot_path.display());
+    }
+    let _ = writeln!(s);
+    s
+}
+
+/// Run a closure on a worker thread with a wall-clock timeout. Returns
+/// None if the worker hasn't finished by the deadline. Stdlib-only — no
+/// `wait-timeout` crate. NB: on timeout the worker thread keeps running
+/// until its `f` returns; we drop the receiver and leak the thread.
+/// Acceptable for diagnose probes where this happens at most a handful
+/// of times per invocation.
+fn run_with_timeout<F, T>(timeout: std::time::Duration, f: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+fn run_diagnose(output: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let report = build_diagnose_report();
+    match output {
+        Some(path) => {
+            std::fs::write(&path, &report)?;
+            eprintln!("Wrote diagnose report to {}", path);
+        }
+        None => {
+            print!("{}", report);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CLI dispatch happens before any X11 connection so --version, --help,
+    // --print-terminal-command, and --diagnose work on headless systems.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_cli_args(&args) {
+        CliMode::Version => {
+            println!("ptm {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliMode::Help => {
+            print_help();
+            return Ok(());
+        }
+        CliMode::PrintTerminalCommand => {
+            run_print_terminal_command();
+            return Ok(());
+        }
+        CliMode::Diagnose { output } => {
+            return run_diagnose(output);
+        }
+        CliMode::Unknown(extra) => {
+            eprintln!("ptm: unknown arguments: {:?}", extra);
+            print_help();
+            std::process::exit(2);
+        }
+        CliMode::Normal => {} // fall through
+    }
+
     // Block SIGUSR1 process-wide BEFORE any thread spawn, so the dedicated
     // sigwait thread is the only one that ever sees it. Children inherit
     // the mask from their parent thread; if we did this after spawning the
@@ -9683,6 +10138,94 @@ mod tests {
         );
         assert!(s.contains("killed"), "names the kill action");
         assert!(s.contains("12345"), "names the child pid");
+    }
+
+    // ── CLI flag parsing (Phase 3) ──
+
+    fn args(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_cli_args_no_args_returns_normal() {
+        assert_eq!(super::parse_cli_args(&args(&[])), super::CliMode::Normal);
+    }
+
+    #[test]
+    fn parse_cli_args_version_flag() {
+        assert_eq!(super::parse_cli_args(&args(&["--version"])), super::CliMode::Version);
+        assert_eq!(super::parse_cli_args(&args(&["-V"])), super::CliMode::Version);
+    }
+
+    #[test]
+    fn parse_cli_args_help_flag() {
+        assert_eq!(super::parse_cli_args(&args(&["--help"])), super::CliMode::Help);
+        assert_eq!(super::parse_cli_args(&args(&["-h"])), super::CliMode::Help);
+    }
+
+    #[test]
+    fn parse_cli_args_print_terminal_command() {
+        assert_eq!(
+            super::parse_cli_args(&args(&["--print-terminal-command"])),
+            super::CliMode::PrintTerminalCommand
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_diagnose_without_output() {
+        assert_eq!(
+            super::parse_cli_args(&args(&["--diagnose"])),
+            super::CliMode::Diagnose { output: None }
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_diagnose_with_output() {
+        assert_eq!(
+            super::parse_cli_args(&args(&["--diagnose", "--output", "/tmp/x.md"])),
+            super::CliMode::Diagnose { output: Some("/tmp/x.md".to_string()) }
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_unknown_args_returns_unknown_with_payload() {
+        match super::parse_cli_args(&args(&["--nonsense", "foo"])) {
+            super::CliMode::Unknown(payload) => {
+                assert_eq!(payload, vec!["--nonsense".to_string(), "foo".to_string()]);
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    // ── Diagnose report shape ──
+    //
+    // The report sections are I/O-heavy and platform-dependent, but the
+    // *structure* (section headers) is a stable contract callers and the
+    // user rely on. These tests just verify each `## N. Title` header is
+    // emitted so a future refactor can't silently drop a section.
+
+    #[test]
+    fn diagnose_report_includes_all_seven_sections() {
+        let r = super::build_diagnose_report();
+        assert!(r.contains("## 1. Build & invocation"), "missing section 1");
+        assert!(r.contains("## 2. Environment"), "missing section 2");
+        assert!(r.contains("## 3. Tmux probes"), "missing section 3");
+        assert!(r.contains("## 4. Terminal probes"), "missing section 4");
+        assert!(r.contains("## 5. Process state"), "missing section 5");
+        assert!(r.contains("## 6. Saved state"), "missing section 6");
+        assert!(r.contains("## 7. Live PTM"), "missing section 7");
+    }
+
+    #[test]
+    fn diagnose_tmux_probe_uses_pid_qualified_socket() {
+        let r = super::diagnose_section_tmux();
+        let pid = std::process::id();
+        assert!(
+            r.contains(&format!("ptm-diag-{}", pid)),
+            "tmux probe must use a PID-qualified socket name to avoid colliding\n\
+             with concurrent diagnose runs; got section:\n{}",
+            r
+        );
     }
 
     // ── Session-binding carry-over ──

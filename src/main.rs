@@ -1229,6 +1229,99 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Debounce window for `notify-send` calls: re-entering the same
+/// failure state within this window does not fire another popup. The
+/// banner still updates immediately; only the toast is suppressed so
+/// a wedge loop doesn't carpet-bomb the notification daemon.
+const NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One-shot flag for "notify-send is missing" stderr noise: we log
+/// the absence once per process and never again, so a libnotify-less
+/// system doesn't print a warning every transition.
+static NOTIFY_SEND_MISSING_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Output of `decide_notify` — whether to fire `notify-send` for the
+/// just-applied transition, and the new debounce marker the caller
+/// should persist for the next call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NotifyDecision {
+    fire: bool,
+    new_marker: Option<(HealthState, std::time::Instant)>,
+}
+
+/// Pure debounce + filter for notify-send. Suppresses notifications
+/// when transitioning to Healthy (success doesn't need a toast) and
+/// when the same failure state was already announced within
+/// `NOTIFY_DEBOUNCE`. Caller owns the marker; we return the updated
+/// value so the App can persist it.
+fn decide_notify(
+    new_state: HealthState,
+    last_marker: Option<(HealthState, std::time::Instant)>,
+    now: std::time::Instant,
+) -> NotifyDecision {
+    if matches!(new_state, HealthState::Healthy) {
+        return NotifyDecision {
+            fire: false,
+            new_marker: last_marker,
+        };
+    }
+    if let Some((prior_state, prior_at)) = last_marker {
+        if prior_state == new_state
+            && now.saturating_duration_since(prior_at) < NOTIFY_DEBOUNCE
+        {
+            return NotifyDecision {
+                fire: false,
+                new_marker: Some((prior_state, prior_at)),
+            };
+        }
+    }
+    NotifyDecision {
+        fire: true,
+        new_marker: Some((new_state, now)),
+    }
+}
+
+/// Shell out to `notify-send` for a Degraded/Broken transition.
+/// Returns `true` if the spawn succeeded (the notification daemon
+/// may still reject it — we don't wait). Missing `notify-send` logs
+/// once and is otherwise silent.
+fn fire_notify_send(new_state: HealthState, summary: &str) -> bool {
+    let (title, urgency) = match new_state {
+        HealthState::Broken => ("PTM: terminals not opening", "critical"),
+        HealthState::Degraded => ("PTM: terminal spawn slow", "normal"),
+        HealthState::Healthy => return false,
+    };
+    let result = std::process::Command::new("notify-send")
+        .args([
+            "--app-name=PTM",
+            &format!("--urgency={}", urgency),
+            title,
+            summary,
+        ])
+        .spawn();
+    match result {
+        Ok(mut child) => {
+            // Reap immediately so we don't leak a zombie. The
+            // notify-send binary returns quickly; if it's slow we
+            // accept that the next refresh will reap.
+            let _ = child.wait();
+            true
+        }
+        Err(_) => {
+            if !NOTIFY_SEND_MISSING_LOGGED
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[ptm] notify-send not available; banner still works \
+                     (install `libnotify-bin` on Debian/Ubuntu to enable toasts)"
+                );
+            }
+            false
+        }
+    }
+}
+
 // ── Cluster 6: diagnosis + sniff helpers (popup brain) ──
 
 /// What the user actually clicks. Each enum case identifies the action
@@ -2004,6 +2097,11 @@ struct App {
     /// Mutually exclusive with `context_menu` / `confirm` / `rename`
     /// via the event-loop mode dispatch.
     health_popup: Option<HealthPopup>,
+    /// Last `(state, time)` PTM fired `notify-send` for. Drives the
+    /// debounce in `decide_notify` so a tight failure loop doesn't
+    /// produce a notification per event. In-memory only (a new PTM
+    /// process starts with a fresh debounce window).
+    last_notify_marker: Option<(HealthState, std::time::Instant)>,
 }
 
 /// How long a successful-drop row highlight stays visible before fading out.
@@ -2044,6 +2142,7 @@ impl App {
             health: HealthBoard::healthy(),
             health_dismissed_this_session: false,
             health_popup: None,
+            last_notify_marker: None,
         }
     }
 
@@ -2121,6 +2220,20 @@ impl App {
             // of "until-restart-or-next-event").
             self.health_dismissed_this_session = false;
             save_health_board(&self.health);
+            // Maybe-fire desktop notification. Debounce suppresses
+            // notifications for the same state within NOTIFY_DEBOUNCE
+            // so a rapid-fire wedge loop doesn't carpet-bomb the user's
+            // notification tray. Notification gated to !Healthy in
+            // decide_notify (success doesn't earn a toast).
+            let decision = decide_notify(
+                new_state,
+                self.last_notify_marker,
+                std::time::Instant::now(),
+            );
+            self.last_notify_marker = decision.new_marker;
+            if decision.fire {
+                fire_notify_send(new_state, &self.health.last_reason_short);
+            }
             return Some(new_state);
         }
         // Persist even without a state change so recent_events stays
@@ -16651,6 +16764,76 @@ mod tests {
             None => std::env::remove_var("XDG_CACHE_HOME"),
         }
         assert_eq!(resulting_state, super::HealthState::Healthy);
+    }
+
+    // ── Cluster 6 Commit 5: notify-send debounce ──
+
+    #[test]
+    fn decide_notify_suppresses_healthy_transition() {
+        let now = std::time::Instant::now();
+        let d = super::decide_notify(super::HealthState::Healthy, None, now);
+        assert!(!d.fire, "transitioning to Healthy must not fire notify-send");
+    }
+
+    #[test]
+    fn decide_notify_fires_on_first_failure_transition() {
+        let now = std::time::Instant::now();
+        let d = super::decide_notify(super::HealthState::Broken, None, now);
+        assert!(d.fire);
+        assert_eq!(d.new_marker, Some((super::HealthState::Broken, now)));
+    }
+
+    #[test]
+    fn decide_notify_debounces_same_state_within_window() {
+        let t0 = std::time::Instant::now();
+        let marker = Some((super::HealthState::Broken, t0));
+        // 30 s later — still inside the 60s debounce.
+        let t1 = t0 + std::time::Duration::from_secs(30);
+        let d = super::decide_notify(super::HealthState::Broken, marker, t1);
+        assert!(!d.fire, "re-entering Broken within 60s must suppress");
+        assert_eq!(d.new_marker, marker);
+    }
+
+    #[test]
+    fn decide_notify_fires_after_debounce_window_elapses() {
+        let t0 = std::time::Instant::now();
+        let marker = Some((super::HealthState::Broken, t0));
+        let t1 = t0 + std::time::Duration::from_secs(61);
+        let d = super::decide_notify(super::HealthState::Broken, marker, t1);
+        assert!(d.fire);
+        assert_eq!(d.new_marker, Some((super::HealthState::Broken, t1)));
+    }
+
+    #[test]
+    fn decide_notify_fires_on_state_change_even_within_window() {
+        // Healthy → Degraded → Broken in 10s: both transitions fire
+        // because the second one is to a different state.
+        let t0 = std::time::Instant::now();
+        let marker = Some((super::HealthState::Degraded, t0));
+        let t1 = t0 + std::time::Duration::from_secs(10);
+        let d = super::decide_notify(super::HealthState::Broken, marker, t1);
+        assert!(d.fire, "different state within debounce should still fire");
+        assert_eq!(d.new_marker, Some((super::HealthState::Broken, t1)));
+    }
+
+    #[test]
+    fn record_health_failure_updates_notify_marker() {
+        with_isolated_cache_home(|_cache| {
+            let mut app = make_app();
+            assert!(app.last_notify_marker.is_none());
+            app.record_health_failure(make_event(
+                1000,
+                super::HealthEventKind::SpawnWedged,
+            ));
+            assert!(
+                app.last_notify_marker.is_some(),
+                "transition to Broken should update notify marker"
+            );
+            assert_eq!(
+                app.last_notify_marker.as_ref().map(|m| m.0),
+                Some(super::HealthState::Broken)
+            );
+        });
     }
 
     #[test]

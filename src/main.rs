@@ -149,11 +149,29 @@ fn poke_self(conn: &impl Connection, window: Window, wake_atom: Atom) {
     let _ = conn.flush();
 }
 
-fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::Duration) {
+/// Default poll cadence (5s) used when no spawn is in flight. Refreshes
+/// pick up tmux session changes that happened outside PTM's view.
+const TMUX_POLL_INTERVAL_IDLE_MS: u64 = 5000;
+
+/// Fast poll cadence (1s) used while at least one spawn is in flight, so
+/// the watchdog hits its 5s/10s thresholds with at most 1s lag once the
+/// thread observes the change. First detection after a spawn-from-idle
+/// can still lag up to TMUX_POLL_INTERVAL_IDLE_MS because the thread
+/// reads the atomic at the *top* of each loop iteration.
+const TMUX_POLL_INTERVAL_ACTIVE_MS: u64 = 1000;
+
+fn spawn_tmux_poll_thread(
+    window: Window,
+    wake_atom: Atom,
+    interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         // Give the main loop a moment to reach wait_for_event before we start
         // pinging, so our first wake doesn't race the initial refresh.
-        std::thread::sleep(interval);
+        std::thread::sleep(std::time::Duration::from_millis(
+            interval_ms.load(Ordering::Relaxed),
+        ));
         let Ok((c, _)) = x11rb::connect(None) else {
             return;
         };
@@ -169,7 +187,12 @@ fn spawn_tmux_poll_thread(window: Window, wake_atom: Atom, interval: std::time::
             };
             let _ = c.send_event(false, window, EventMask::NO_EVENT, ev);
             let _ = c.flush();
-            std::thread::sleep(interval);
+            // Read interval at the top of each iteration; changes are
+            // observed once the current sleep completes (up to 5s lag
+            // for first detection — see plan, Decision E).
+            std::thread::sleep(std::time::Duration::from_millis(
+                interval_ms.load(Ordering::Relaxed),
+            ));
         }
     });
 }
@@ -413,7 +436,7 @@ enum ConfirmAction {
 }
 
 /// What `pending_spawn` is waiting for. Whichever variant is set, the next
-/// newly-detected wid (claimed by `claim_pending_spawn` from refresh_items)
+/// newly-detected wid (claimed by `claim_pending_spawns` from refresh_items)
 /// is snapped to the sidebar anchor. The Attach variant additionally binds
 /// the wid to its tmux session in `Item::session`.
 #[derive(Clone, Debug)]
@@ -424,10 +447,349 @@ enum PendingSpawnKind {
     Terminal,
 }
 
+/// State machine for the spawn watchdog. Multiple PendingSpawns can be
+/// queued; only the *first* entry whose state is Fresh or Warned is
+/// "active" — its child is running and the watchdog ticks against its
+/// `spawned_at`. Queued entries wait their turn so wid attribution stays
+/// sound under gnome-terminal-server (where every window reparents under
+/// PID 2380 and we cannot disambiguate concurrent spawns by pid).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchdogState {
+    /// Enqueued but not yet dispatched. No child, empty before_wids.
+    Queued,
+    /// Active spawn within WATCHDOG_SLOW_THRESHOLD; child running.
+    Fresh,
+    /// Active spawn past WATCHDOG_SLOW_THRESHOLD; one "slow" event emitted.
+    Warned,
+}
+
+/// Watchdog thresholds. Slow at 5s emits a first warning; wedged at 10s
+/// kills the child and removes the entry.
+const WATCHDOG_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+const WATCHDOG_WEDGE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cap on how many spawn requests can be in flight before we start
+/// dropping. Mostly protects against runaway click-fests when something
+/// is wedged.
+const PENDING_SPAWN_QUEUE_CAP: usize = 5;
+
+/// Closure result for non-blocking child polling. Translates
+/// `std::process::Child::try_wait()` into a flat enum so tests can
+/// inject canned values without constructing real `ExitStatus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildPollResult {
+    /// Process still running.
+    Running,
+    /// Process exited with the given raw code (0 = success on Unix).
+    Exited(i32),
+    /// try_wait returned Err — child handle is unusable; drop it.
+    Errored,
+}
+
+/// Result of `App::enqueue_spawn`. Tells the caller whether to spawn
+/// synchronously now (queue was empty) or wait for a later dispatch
+/// (queue had entries).
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueDecision {
+    /// Caller should call the spawn fn now and then `record_dispatch`.
+    DispatchNow,
+    /// Entry sits Queued behind the active spawn; refresh_items'
+    /// dispatch_head_if_queued will start it when the head clears.
+    Queued,
+    /// Queue at PENDING_SPAWN_QUEUE_CAP — nothing pushed. Caller emits
+    /// WatchdogEvent::QueueFull.
+    QueueFull,
+}
+
+/// Structured event emitted by `tick_watchdog`. The caller drains these
+/// to stderr + a capped log file so the user can see what happened even
+/// when PTM was launched from a desktop entry with no controlling TTY.
 #[derive(Clone, Debug)]
+enum WatchdogEvent {
+    /// Active spawn crossed the SLOW threshold (5s). No window yet.
+    SpawnSlow {
+        kind: PendingSpawnKind,
+        elapsed: std::time::Duration,
+        child_pid: Option<u32>,
+    },
+    /// Active spawn crossed the WEDGE threshold (10s). The child was
+    /// killed if `killed` is true (it may already have exited).
+    SpawnWedged {
+        kind: PendingSpawnKind,
+        elapsed: std::time::Duration,
+        killed: bool,
+        child_pid: Option<u32>,
+    },
+    /// Active spawn's child exited with a non-zero status before any
+    /// window appeared. Often means the user's terminal binary itself
+    /// rejected its arguments.
+    SpawnExitedNonZero {
+        kind: PendingSpawnKind,
+        code: i32,
+    },
+    /// Enqueue was rejected because the queue is at PENDING_SPAWN_QUEUE_CAP.
+    QueueFull { dropped_kind: PendingSpawnKind },
+}
+
 struct PendingSpawn {
     kind: PendingSpawnKind,
+    /// When this entry became *active* (dispatched). Set at enqueue
+    /// time for the head entry, or at dispatch-from-Queued time for
+    /// subsequent entries. The watchdog measures elapsed from here.
     spawned_at: std::time::Instant,
+    /// Handle for the spawned process so we can `try_wait` non-blockingly
+    /// and `kill` on wedge. None while Queued; None after a clean exit
+    /// (we've already reaped); None if Command::spawn itself failed.
+    child: Option<std::process::Child>,
+    state: WatchdogState,
+}
+
+impl PendingSpawn {
+    /// Construct a Queued entry: waiting to dispatch. spawned_at is a
+    /// placeholder — gets overwritten by record_dispatch when this entry
+    /// becomes head and is dispatched.
+    fn queued(kind: PendingSpawnKind) -> Self {
+        Self {
+            kind,
+            spawned_at: std::time::Instant::now(),
+            child: None,
+            state: WatchdogState::Queued,
+        }
+    }
+}
+
+/// Run one watchdog tick over the spawn queue. Operates only on the
+/// head entry (the active one) — Queued entries wait their turn and
+/// only get dispatched by the caller after the head is removed.
+///
+/// Behaviour:
+/// 1. Poll the child via `poll_child`. Non-zero exit → emit
+///    `SpawnExitedNonZero` + drop entry. Clean exit → keep entry (the
+///    spawner may have exited but the window can still appear via
+///    reparent under gnome-terminal-server).
+/// 2. Check elapsed since spawned_at.
+///    - >= WEDGE: emit `SpawnWedged`, kill child if still alive, drop entry.
+///    - >= SLOW and state == Fresh: emit `SpawnSlow`, transition to Warned.
+///    - State already Warned: no second SLOW event (idempotent under
+///      repeated calls within the same window).
+///
+/// Pure: `now`, `poll_child`, and `kill_child` are all injected, so the
+/// function is fully testable without real processes or a clock.
+fn tick_watchdog(
+    spawns: &mut Vec<PendingSpawn>,
+    now: std::time::Instant,
+    mut poll_child: impl FnMut(&mut std::process::Child) -> ChildPollResult,
+    mut kill_child: impl FnMut(&mut std::process::Child),
+) -> Vec<WatchdogEvent> {
+    let mut events = Vec::new();
+    let Some(head) = spawns.first_mut() else { return events };
+    if !matches!(head.state, WatchdogState::Fresh | WatchdogState::Warned) {
+        return events;
+    }
+    let child_pid = head.child.as_ref().map(|c| c.id());
+
+    // Phase 1: poll for child exit.
+    if let Some(child) = head.child.as_mut() {
+        match poll_child(child) {
+            ChildPollResult::Exited(code) if code != 0 => {
+                events.push(WatchdogEvent::SpawnExitedNonZero {
+                    kind: head.kind.clone(),
+                    code,
+                });
+                spawns.remove(0);
+                return events;
+            }
+            ChildPollResult::Exited(_) => {
+                // Clean exit. The spawner is gone but a window may still
+                // appear (gnome-terminal-server reparent pattern). Drop
+                // the handle so we don't keep poll-checking, but leave
+                // the entry for claim_pending_spawns to resolve.
+                head.child = None;
+            }
+            ChildPollResult::Errored => {
+                head.child = None;
+            }
+            ChildPollResult::Running => {}
+        }
+    }
+
+    // Re-borrow because we may have removed the head above.
+    let Some(head) = spawns.first_mut() else { return events };
+    let elapsed = now.saturating_duration_since(head.spawned_at);
+    if elapsed >= WATCHDOG_WEDGE_THRESHOLD {
+        let kind = head.kind.clone();
+        let killed = head.child.is_some();
+        if let Some(ref mut child) = head.child {
+            kill_child(child);
+        }
+        spawns.remove(0);
+        events.push(WatchdogEvent::SpawnWedged {
+            kind,
+            elapsed,
+            killed,
+            child_pid,
+        });
+    } else if elapsed >= WATCHDOG_SLOW_THRESHOLD
+        && matches!(head.state, WatchdogState::Fresh)
+    {
+        head.state = WatchdogState::Warned;
+        events.push(WatchdogEvent::SpawnSlow {
+            kind: head.kind.clone(),
+            elapsed,
+            child_pid,
+        });
+    }
+    events
+}
+
+/// Render a kind into a short user-facing string for log lines.
+fn kind_display(kind: &PendingSpawnKind) -> String {
+    match kind {
+        PendingSpawnKind::Terminal => "new terminal".to_string(),
+        PendingSpawnKind::Attach(name) => format!("attach tmux session `{}`", name),
+    }
+}
+
+/// Format a WatchdogEvent into a multi-line user-facing block. Lines are
+/// laid out so triple-clicking a command line selects only the command
+/// (no leading `[ptm]` prefix on action commands).
+fn format_watchdog_event(event: &WatchdogEvent) -> String {
+    use std::fmt::Write;
+    let timestamp = current_timestamp();
+    let mut out = String::new();
+    match event {
+        WatchdogEvent::SpawnSlow { kind, elapsed, child_pid } => {
+            let _ = writeln!(
+                out,
+                "{} [ptm] spawn slow: {} — no window after {:.1}s (child_pid={})",
+                timestamp,
+                kind_display(kind),
+                elapsed.as_secs_f64(),
+                child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+            );
+        }
+        WatchdogEvent::SpawnWedged { kind, elapsed, killed, child_pid } => {
+            let _ = writeln!(
+                out,
+                "{} [ptm] spawn wedged: {} — no window after {:.1}s; {}child_pid={}",
+                timestamp,
+                kind_display(kind),
+                elapsed.as_secs_f64(),
+                if *killed { "killed " } else { "" },
+                child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+            );
+            let _ = writeln!(out, "       Likely: gnome-terminal-server is unresponsive to new-window IPC.");
+            let _ = writeln!(out, "       To fix, run one of these (each line is copy-paste safe):");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "    pkill -f gnome-terminal-server");
+            let _ = writeln!(out, "    export PTM_TERMINAL_CMD=xterm");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "       Full log: {}", warnings_log_path().display());
+        }
+        WatchdogEvent::SpawnExitedNonZero { kind, code } => {
+            let _ = writeln!(
+                out,
+                "{} [ptm] spawn exited non-zero: {} — code={}",
+                timestamp,
+                kind_display(kind),
+                code,
+            );
+        }
+        WatchdogEvent::QueueFull { dropped_kind } => {
+            let _ = writeln!(
+                out,
+                "{} [ptm] spawn queue full ({} entries): dropped {}",
+                timestamp,
+                PENDING_SPAWN_QUEUE_CAP,
+                kind_display(dropped_kind),
+            );
+        }
+    }
+    out
+}
+
+/// Where the rolling warnings log lives. Mirrors the recipe-dump path
+/// pattern: `$XDG_CACHE_HOME/ptm/ptm-warnings.log` with `~/.cache` fallback.
+fn warnings_log_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".cache");
+            p
+        });
+    let mut p = base;
+    p.push("ptm");
+    p.push("ptm-warnings.log");
+    p
+}
+
+/// Max log file size in bytes. When exceeded, we keep only the most
+/// recent half on the next write — a naive ring with no rotation deps.
+const WARNINGS_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// Append a formatted event to the warnings log. If the file is over
+/// WARNINGS_LOG_MAX_BYTES, truncate to the last 128 KiB before writing.
+/// Errors are silent — logging must not crash PTM.
+fn append_to_warnings_log(formatted: &str) {
+    let path = warnings_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Truncate if oversize. Reading + rewriting last 128 KiB is fine for a
+    // 256 KiB cap; if logs ever grow large enough that this becomes hot,
+    // revisit with a proper rotation crate.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > WARNINGS_LOG_MAX_BYTES {
+            if let Ok(data) = std::fs::read(&path) {
+                let keep = (WARNINGS_LOG_MAX_BYTES / 2) as usize;
+                let start = data.len().saturating_sub(keep);
+                // Try to start at a newline so the truncated file doesn't
+                // begin mid-line.
+                let trim_to = data[start..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| start + p + 1)
+                    .unwrap_or(start);
+                let _ = std::fs::write(&path, &data[trim_to..]);
+            }
+        }
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(formatted.as_bytes());
+    }
+}
+
+/// Emit a watchdog event to both stderr and the rolling log file. Single
+/// entry point so callers don't repeat the routing logic.
+fn emit_watchdog_event(event: &WatchdogEvent) {
+    let s = format_watchdog_event(event);
+    eprint!("{}", s);
+    append_to_warnings_log(&s);
+}
+
+/// If the queue head is Queued, dispatch it: call the right spawn fn for
+/// its kind, attach the resulting `Child` via `record_dispatch`. Called
+/// from `refresh_items` after `claim_pending_spawns` / `tick_watchdog`
+/// to start the next entry whenever the head clears.
+fn dispatch_head_if_queued(app: &mut App) {
+    let kind = match app.pending_spawns.first() {
+        Some(s) if matches!(s.state, WatchdogState::Queued) => s.kind.clone(),
+        _ => return,
+    };
+    let child = match &kind {
+        PendingSpawnKind::Terminal => spawn_default_terminal(),
+        PendingSpawnKind::Attach(name) => spawn_attach_terminal(name),
+    };
+    app.record_dispatch(child);
 }
 
 /// Successful claim from `claim_pending_spawn`. The caller snaps the wid
@@ -743,14 +1105,26 @@ struct App {
     our_wid: u32,
     subscribed_wids: HashSet<u32>,
     // PTM tracks "we just spawned a window, please claim and snap it" via
-    // pending_spawn. Set when the user clicks an orphan session row, when
+    // pending_spawns. Set when the user clicks an orphan session row, when
     // either of the `+ New *` buttons fire, or any other ptm-initiated
     // window spawn. The next newly-appearing wid (per refresh_items'
     // delta) is snapped to the sidebar anchor; for Attach kinds the wid
     // is also bound to its tmux session. Process-tree-based marker
     // detection can't reliably do this — terminals that fork through a
     // shared server pid (gnome-terminal, konsole) hide their parent.
-    pending_spawn: Option<PendingSpawn>,
+    //
+    // Modelled as a queue (depth-cap PENDING_SPAWN_QUEUE_CAP). Only the
+    // first entry whose state is Fresh/Warned is active; subsequent
+    // entries are Queued and dispatched in order. Serializing dispatch
+    // keeps wid-attribution sound under gnome-terminal-server, where
+    // every window reparents to PID 2380 and we can't disambiguate two
+    // concurrent spawns by pid.
+    pending_spawns: Vec<PendingSpawn>,
+    /// Shared atomic read by the tmux poll thread. Bumped to
+    /// TMUX_POLL_INTERVAL_ACTIVE_MS (1000) while any spawn is in flight
+    /// so the watchdog hits its thresholds quickly; reverts to
+    /// TMUX_POLL_INTERVAL_IDLE_MS (5000) when the queue empties.
+    tmux_poll_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Maps each tmux `#{session_id}` (e.g. "$0") to the session's ORIGINAL
     /// name as observed at first sighting. Survives user-initiated renames
     /// so the UI can keep showing the origin (typically a small integer)
@@ -805,7 +1179,10 @@ impl App {
             height: WIN_H,
             our_wid,
             subscribed_wids: HashSet::new(),
-            pending_spawn: None,
+            pending_spawns: Vec::new(),
+            tmux_poll_interval_ms: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(TMUX_POLL_INTERVAL_IDLE_MS),
+            ),
             session_origins: HashMap::new(),
             live_sessions: Vec::new(),
             first_dirty_at: None,
@@ -827,6 +1204,54 @@ impl App {
 
     fn hit_test_header_button(&self, y: i16) -> bool {
         y >= 0 && y < HEADER_H as i16
+    }
+
+    /// Queue a spawn request. If the queue was empty, returns
+    /// `EnqueueDecision::DispatchNow` — caller must spawn the process
+    /// next and then call `record_dispatch` so the watchdog attaches the
+    /// `Child` to the head entry. Otherwise the entry sits in state
+    /// Queued until the active head is removed (by claim/exit/wedge).
+    /// Side-effect: bumps the poll interval to ACTIVE so the watchdog
+    /// gets ticked once a second.
+    fn enqueue_spawn(&mut self, kind: PendingSpawnKind) -> EnqueueDecision {
+        if self.pending_spawns.len() >= PENDING_SPAWN_QUEUE_CAP {
+            return EnqueueDecision::QueueFull;
+        }
+        let dispatch_now = self.pending_spawns.is_empty();
+        self.pending_spawns.push(PendingSpawn::queued(kind));
+        self.tmux_poll_interval_ms.store(
+            TMUX_POLL_INTERVAL_ACTIVE_MS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if dispatch_now {
+            EnqueueDecision::DispatchNow
+        } else {
+            EnqueueDecision::Queued
+        }
+    }
+
+    /// Call after every queue-mutation in refresh_items so the poll
+    /// thread reverts to its idle cadence when nothing's pending.
+    fn sync_poll_interval(&self) {
+        let target = if self.pending_spawns.is_empty() {
+            TMUX_POLL_INTERVAL_IDLE_MS
+        } else {
+            TMUX_POLL_INTERVAL_ACTIVE_MS
+        };
+        self.tmux_poll_interval_ms
+            .store(target, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Attach a freshly-spawned Child to the head entry and transition
+    /// it from Queued to Fresh. The watchdog starts ticking from now.
+    /// `child` may be None if spawn() itself failed; we still mark the
+    /// entry Fresh so the timeout path can declare it wedged.
+    fn record_dispatch(&mut self, child: Option<std::process::Child>) {
+        if let Some(head) = self.pending_spawns.first_mut() {
+            head.spawned_at = std::time::Instant::now();
+            head.child = child;
+            head.state = WatchdogState::Fresh;
+        }
     }
 
     /// Returns which top button (if any) is at point (x, y) in window coords.
@@ -2141,12 +2566,13 @@ fn refresh_items(
     // just clicked an orphan row or hit a `+ New *` button, we know the
     // next new window is ours — much more reliable than walking through
     // a gnome-terminal-server pid collision.
-    let claim = claim_pending_spawn(
-        &mut app.pending_spawn,
+    let now = std::time::Instant::now();
+    let claim = claim_pending_spawns(
+        &mut app.pending_spawns,
         &prior_wids,
         &mut new_items,
         PENDING_ATTACH_TIMEOUT,
-        std::time::Instant::now(),
+        now,
     );
     let mut pre_assigned: HashSet<String> = HashSet::new();
     if let Some(c) = &claim {
@@ -2154,6 +2580,29 @@ fn refresh_items(
             pre_assigned.insert(name.clone());
         }
     }
+    // Watchdog tick: catches timeouts on the active spawn (slow @5s,
+    // wedge @10s). Emits events for stderr + the rolling log. If the
+    // head was removed by either claim above or the watchdog here, and
+    // a Queued entry sits behind it, dispatch the next one.
+    let events = tick_watchdog(
+        &mut app.pending_spawns,
+        now,
+        |child| match child.try_wait() {
+            Ok(Some(status)) => ChildPollResult::Exited(status.code().unwrap_or(-1)),
+            Ok(None) => ChildPollResult::Running,
+            Err(_) => ChildPollResult::Errored,
+        },
+        |child| {
+            let _ = child.kill();
+            // Reap so we don't leave a zombie even if kill succeeds.
+            let _ = child.wait();
+        },
+    );
+    for ev in &events {
+        emit_watchdog_event(ev);
+    }
+    dispatch_head_if_queued(app);
+    app.sync_poll_interval();
 
     // Carry forward any session bindings from the prior refresh's items.
     // Necessary because walk_to_window_owner returns None for users on
@@ -3455,39 +3904,51 @@ fn derive_recipe(
     }
 }
 
-// True if there's already an in-flight attach for the same session. Used
+// True if any in-flight entry is attaching to the same session. Used
 // to debounce rapid repeat clicks on an orphan row — otherwise every
 // click spawns another terminal while we wait for the first spawn's
-// window to register.
+// window to register. Scans the whole queue: a Queued entry counts as
+// "pending" too, so we won't enqueue a duplicate while one waits to
+// dispatch.
 fn is_attach_pending_for(
-    pending: &Option<PendingSpawn>,
+    pending: &[PendingSpawn],
     session_name: &str,
 ) -> bool {
-    matches!(pending, Some(PendingSpawn { kind: PendingSpawnKind::Attach(n), .. }) if n == session_name)
+    pending.iter().any(|s| {
+        matches!(&s.kind, PendingSpawnKind::Attach(n) if n == session_name)
+    })
 }
 
-// Consume a pending spawn: if exactly one new wid has appeared since the
-// previous refresh, claim it. For Attach kinds the wid is bound to its
-// tmux session in `Item::session`; for Terminal kinds nothing is bound
-// (the caller still snaps the wid). Returns Some(PendingClaim) when a
-// claim is made, None otherwise.
+// Consume the active pending spawn (queue head): if exactly one new wid
+// has appeared since the previous refresh, claim it. For Attach kinds the
+// wid is bound to its tmux session in `Item::session`; for Terminal kinds
+// nothing is bound (the caller still snaps the wid). Returns
+// Some(PendingClaim) when a claim is made, None otherwise.
 //
 // "Exactly one new wid" is the safe case — we know which window is ours.
 // Zero new wids → window hasn't appeared yet, keep waiting. Multiple new
 // wids → can't disambiguate (user opened something else in parallel), also
-// keep waiting. Either way, the pending entry stays until it times out.
+// keep waiting. Queued (non-head) entries are not eligible: only the head
+// is active, others wait for dispatch.
+//
+// On successful claim or timeout, the head entry is removed. The caller
+// then runs `dispatch_head_if_queued` to start the next entry (if any).
 //
 // Pure: `now` is injected so tests can simulate timeout without sleeping.
-fn claim_pending_spawn(
-    pending: &mut Option<PendingSpawn>,
+fn claim_pending_spawns(
+    pending: &mut Vec<PendingSpawn>,
     prior_wids: &HashSet<u32>,
     new_items: &mut [Item],
     timeout: std::time::Duration,
     now: std::time::Instant,
 ) -> Option<PendingClaim> {
-    let spawn = pending.as_ref()?;
-    if now.saturating_duration_since(spawn.spawned_at) > timeout {
-        *pending = None;
+    let head = pending.first()?;
+    // Queued entries aren't active yet; nothing to claim against.
+    if matches!(head.state, WatchdogState::Queued) {
+        return None;
+    }
+    if now.saturating_duration_since(head.spawned_at) > timeout {
+        pending.remove(0);
         return None;
     }
     let new_wids: Vec<u32> = new_items
@@ -3499,7 +3960,8 @@ fn claim_pending_spawn(
         return None;
     }
     let claimed_wid = new_wids[0];
-    let attach_session = match &spawn.kind {
+    let kind = head.kind.clone();
+    let attach_session = match kind {
         PendingSpawnKind::Attach(name) => {
             let session = name.clone();
             if let Some(item) = new_items.iter_mut().find(|i| i.wid == claimed_wid) {
@@ -3509,7 +3971,7 @@ fn claim_pending_spawn(
         }
         PendingSpawnKind::Terminal => None,
     };
-    *pending = None;
+    pending.remove(0);
     Some(PendingClaim { wid: claimed_wid, attach_session })
 }
 
@@ -3596,18 +4058,23 @@ fn binary_on_path(name: &str) -> bool {
     false
 }
 
-fn spawn_default_terminal() {
+/// Spawn the user's default terminal. Returns the `Child` handle so the
+/// spawn watchdog can hold it, `try_wait` non-blockingly each refresh
+/// tick, and `kill` it if the spawn wedges past WATCHDOG_WEDGE_THRESHOLD.
+/// Returns None if argv was empty (no terminal detected) or spawn failed.
+fn spawn_default_terminal() -> Option<std::process::Child> {
     let argv = detect_terminal_command(
         std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
         std::env::var("TERMINAL").ok().as_deref(),
         binary_on_path,
     );
     if argv.is_empty() {
-        return;
+        return None;
     }
-    let _ = std::process::Command::new(&argv[0])
+    std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .spawn();
+        .spawn()
+        .ok()
 }
 
 // Extract the basename of a path, then strip a single `.wrapper` or
@@ -3661,7 +4128,10 @@ fn terminal_argv_for_attach(term_argv: &[String], session_name: &str) -> Vec<Str
     out
 }
 
-fn spawn_attach_terminal(session_name: &str) {
+/// Spawn a terminal that attaches to an existing tmux session. Returns
+/// the `Child` so the watchdog can monitor it. None on argv empty (no
+/// terminal detected) or spawn failure.
+fn spawn_attach_terminal(session_name: &str) -> Option<std::process::Child> {
     let term = detect_terminal_command(
         std::env::var("PTM_TERMINAL_CMD").ok().as_deref(),
         std::env::var("TERMINAL").ok().as_deref(),
@@ -3669,11 +4139,12 @@ fn spawn_attach_terminal(session_name: &str) {
     );
     let argv = terminal_argv_for_attach(&term, session_name);
     if argv.is_empty() {
-        return;
+        return None;
     }
-    let _ = std::process::Command::new(&argv[0])
+    std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .spawn();
+        .spawn()
+        .ok()
 }
 
 /// Create a fresh tmux session with an auto-generated name (detached) and
@@ -4840,12 +5311,23 @@ fn execute_menu_action(
         }
         MenuAction::AttachSession => {
             if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
-                if !is_attach_pending_for(&app.pending_spawn, name) {
-                    app.pending_spawn = Some(PendingSpawn {
-                        kind: PendingSpawnKind::Attach(name.clone()),
-                        spawned_at: std::time::Instant::now(),
-                    });
-                    spawn_attach_terminal(name);
+                if !is_attach_pending_for(&app.pending_spawns, name) {
+                    let name_owned = name.clone();
+                    match app.enqueue_spawn(PendingSpawnKind::Attach(name_owned.clone())) {
+                        EnqueueDecision::DispatchNow => {
+                            let child = spawn_attach_terminal(&name_owned);
+                            app.record_dispatch(child);
+                        }
+                        EnqueueDecision::Queued => {
+                            // Head spawn still in flight; this entry waits for
+                            // dispatch_head_if_queued on the next refresh.
+                        }
+                        EnqueueDecision::QueueFull => {
+                            emit_watchdog_event(&WatchdogEvent::QueueFull {
+                                dropped_kind: PendingSpawnKind::Attach(name_owned),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -6118,7 +6600,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Background thread that pokes the main loop every 5 s so tmux state
     // changes (sessions created or destroyed outside PTM) show up promptly.
-    spawn_tmux_poll_thread(window, atoms.ptm_wake, std::time::Duration::from_secs(5));
+    spawn_tmux_poll_thread(window, atoms.ptm_wake, app.tmux_poll_interval_ms.clone());
 
     // Save-tick thread: pings the main loop every 250 ms so the dirty-flag
     // debounce can fire even during pure-idle periods. Distinct atom from
@@ -6513,25 +6995,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(button) = app.hit_test_top_buttons(ev.event_x, ev.event_y) {
                             match button {
                                 TopButton::NewTerminal => {
-                                    // Register a Terminal pending_spawn BEFORE
-                                    // forking so the next refresh's wid-delta
-                                    // grabs and snaps the new window.
-                                    app.pending_spawn = Some(PendingSpawn {
-                                        kind: PendingSpawnKind::Terminal,
-                                        spawned_at: std::time::Instant::now(),
-                                    });
-                                    spawn_default_terminal();
+                                    // Enqueue Terminal kind. If the queue was
+                                    // empty, spawn synchronously and record
+                                    // the Child for the watchdog. Otherwise
+                                    // wait for dispatch_head_if_queued.
+                                    match app.enqueue_spawn(PendingSpawnKind::Terminal) {
+                                        EnqueueDecision::DispatchNow => {
+                                            let child = spawn_default_terminal();
+                                            app.record_dispatch(child);
+                                        }
+                                        EnqueueDecision::Queued => {}
+                                        EnqueueDecision::QueueFull => {
+                                            emit_watchdog_event(&WatchdogEvent::QueueFull {
+                                                dropped_kind: PendingSpawnKind::Terminal,
+                                            });
+                                        }
+                                    }
                                 }
                                 TopButton::NewTmux => {
                                     if let Some(name) = create_new_tmux_session() {
-                                        // Register Attach BEFORE the terminal
-                                        // forks so the resulting window is
-                                        // bound to its session AND snapped.
-                                        app.pending_spawn = Some(PendingSpawn {
-                                            kind: PendingSpawnKind::Attach(name.clone()),
-                                            spawned_at: std::time::Instant::now(),
-                                        });
-                                        spawn_attach_terminal(&name);
+                                        match app.enqueue_spawn(
+                                            PendingSpawnKind::Attach(name.clone()),
+                                        ) {
+                                            EnqueueDecision::DispatchNow => {
+                                                let child = spawn_attach_terminal(&name);
+                                                app.record_dispatch(child);
+                                            }
+                                            EnqueueDecision::Queued => {}
+                                            EnqueueDecision::QueueFull => {
+                                                emit_watchdog_event(&WatchdogEvent::QueueFull {
+                                                    dropped_kind: PendingSpawnKind::Attach(name),
+                                                });
+                                            }
+                                        }
                                     }
                                     // Wake the main loop so the new session
                                     // shows up immediately rather than waiting
@@ -6733,12 +7229,20 @@ fn handle_release(
             {
                 return Some(req);
             }
-            if !is_attach_pending_for(&app.pending_spawn, &name) {
-                app.pending_spawn = Some(PendingSpawn {
-                    kind: PendingSpawnKind::Attach(name.clone()),
-                    spawned_at: std::time::Instant::now(),
-                });
-                spawn_attach_terminal(&name);
+            if !is_attach_pending_for(&app.pending_spawns, &name) {
+                let name_for_kind = name.clone();
+                match app.enqueue_spawn(PendingSpawnKind::Attach(name_for_kind.clone())) {
+                    EnqueueDecision::DispatchNow => {
+                        let child = spawn_attach_terminal(&name_for_kind);
+                        app.record_dispatch(child);
+                    }
+                    EnqueueDecision::Queued => {}
+                    EnqueueDecision::QueueFull => {
+                        emit_watchdog_event(&WatchdogEvent::QueueFull {
+                            dropped_kind: PendingSpawnKind::Attach(name_for_kind),
+                        });
+                    }
+                }
             }
             None
         }
@@ -8745,18 +9249,22 @@ mod tests {
         }
     }
 
-    fn pending_attach(name: &str, when: std::time::Instant) -> Option<super::PendingSpawn> {
-        Some(super::PendingSpawn {
+    fn pending_attach(name: &str, when: std::time::Instant) -> Vec<super::PendingSpawn> {
+        vec![super::PendingSpawn {
             kind: super::PendingSpawnKind::Attach(name.to_string()),
             spawned_at: when,
-        })
+            child: None,
+            state: super::WatchdogState::Fresh,
+        }]
     }
 
-    fn pending_terminal(when: std::time::Instant) -> Option<super::PendingSpawn> {
-        Some(super::PendingSpawn {
+    fn pending_terminal(when: std::time::Instant) -> Vec<super::PendingSpawn> {
+        vec![super::PendingSpawn {
             kind: super::PendingSpawnKind::Terminal,
             spawned_at: when,
-        })
+            child: None,
+            state: super::WatchdogState::Fresh,
+        }]
     }
 
     #[test]
@@ -8765,7 +9273,7 @@ mod tests {
         let mut pending = pending_attach("demo", now);
         let prior: HashSet<u32> = [1, 2].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8778,7 +9286,7 @@ mod tests {
         assert_eq!(items[2].session.as_deref(), Some("demo"));
         assert!(items[0].session.is_none());
         assert!(items[1].session.is_none());
-        assert!(pending.is_none(), "claim should clear pending");
+        assert!(pending.is_empty(), "claim should clear pending");
     }
 
     #[test]
@@ -8787,7 +9295,7 @@ mod tests {
         let mut pending = pending_terminal(now);
         let prior: HashSet<u32> = [1].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(7)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8798,7 +9306,7 @@ mod tests {
         assert_eq!(claim.wid, 7);
         assert!(claim.attach_session.is_none(), "Terminal kind binds no session");
         assert!(items[1].session.is_none(), "Terminal kind must not set item.session");
-        assert!(pending.is_none(), "claim should clear pending");
+        assert!(pending.is_empty(), "claim should clear pending");
     }
 
     #[test]
@@ -8807,7 +9315,7 @@ mod tests {
         let mut pending = pending_attach("demo", now);
         let prior: HashSet<u32> = [1, 2].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8815,7 +9323,7 @@ mod tests {
             now,
         );
         assert!(claim.is_none());
-        assert!(pending.is_some(), "pending stays until window appears or timeout");
+        assert!(!pending.is_empty(), "pending stays until window appears or timeout");
     }
 
     #[test]
@@ -8826,7 +9334,7 @@ mod tests {
         let mut pending = pending_attach("demo", now);
         let prior: HashSet<u32> = [1].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2), mk_item(3)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8836,7 +9344,7 @@ mod tests {
         assert!(claim.is_none());
         assert!(items[1].session.is_none());
         assert!(items[2].session.is_none());
-        assert!(pending.is_some());
+        assert!(!pending.is_empty());
     }
 
     #[test]
@@ -8846,7 +9354,7 @@ mod tests {
         let mut pending = pending_attach("demo", spawn);
         let prior: HashSet<u32> = [1].iter().copied().collect();
         let mut items = vec![mk_item(1), mk_item(2)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8855,7 +9363,7 @@ mod tests {
         );
         assert!(claim.is_none());
         assert!(items[1].session.is_none());
-        assert!(pending.is_none(), "timed-out pending should be cleared");
+        assert!(pending.is_empty(), "timed-out pending should be cleared");
     }
 
     #[test]
@@ -8876,17 +9384,17 @@ mod tests {
 
     #[test]
     fn is_attach_pending_for_none() {
-        let pending: Option<super::PendingSpawn> = None;
+        let pending: Vec<super::PendingSpawn> = Vec::new();
         assert!(!is_attach_pending_for(&pending, "demo"));
     }
 
     #[test]
     fn pending_spawn_none_is_noop() {
         let now = std::time::Instant::now();
-        let mut pending: Option<super::PendingSpawn> = None;
+        let mut pending: Vec<super::PendingSpawn> = Vec::new();
         let prior: HashSet<u32> = HashSet::new();
         let mut items = vec![mk_item(1)];
-        let claim = claim_pending_spawn(
+        let claim = claim_pending_spawns(
             &mut pending,
             &prior,
             &mut items,
@@ -8895,7 +9403,286 @@ mod tests {
         );
         assert!(claim.is_none());
         assert!(items[0].session.is_none());
-        assert!(pending.is_none());
+        assert!(pending.is_empty());
+    }
+
+    // ── Spawn watchdog (Phase 2) ──
+    //
+    // Verifies `tick_watchdog` state-machine transitions, kill-on-wedge,
+    // queue dispatch ordering, and the queue cap. Tests inject canned
+    // ChildPollResult values via closures so we don't depend on real
+    // process behaviour; a placeholder `/bin/true` Child satisfies the
+    // closure's &mut Child signature without affecting the canned reply.
+
+    /// Returns a real Child handle whose process is /bin/true. Used as a
+    /// placeholder so we can call tick_watchdog's closures with &mut Child
+    /// even though we want to inject canned results.
+    fn placeholder_child() -> std::process::Child {
+        std::process::Command::new("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/true should succeed")
+    }
+
+    fn watchdog_entry(
+        kind: super::PendingSpawnKind,
+        spawned_at: std::time::Instant,
+        state: super::WatchdogState,
+        child: Option<std::process::Child>,
+    ) -> super::PendingSpawn {
+        super::PendingSpawn {
+            kind,
+            spawned_at,
+            child,
+            state,
+        }
+    }
+
+    #[test]
+    fn watchdog_no_event_when_fresh_and_under_threshold() {
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(2),
+            super::WatchdogState::Fresh,
+            None,
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Running,
+            |_c| {},
+        );
+        assert!(events.is_empty(), "no events under SLOW threshold");
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].state, super::WatchdogState::Fresh);
+    }
+
+    #[test]
+    fn watchdog_warns_at_5s_threshold() {
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(5),
+            super::WatchdogState::Fresh,
+            None,
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Running,
+            |_c| {},
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], super::WatchdogEvent::SpawnSlow { .. }));
+        assert_eq!(spawns.len(), 1, "entry retained for further ticks");
+        assert_eq!(spawns[0].state, super::WatchdogState::Warned);
+    }
+
+    #[test]
+    fn watchdog_idempotent_under_repeated_ticks_in_warned_state() {
+        // Subsequent ticks within the same warned window should not
+        // re-emit SpawnSlow. Catches the "log spam every refresh" failure.
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(7),
+            super::WatchdogState::Warned,
+            None,
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Running,
+            |_c| {},
+        );
+        assert!(events.is_empty(), "Warned state suppresses repeat SLOW event");
+        assert_eq!(spawns[0].state, super::WatchdogState::Warned);
+    }
+
+    #[test]
+    fn watchdog_kills_and_reports_at_10s_threshold() {
+        let now = std::time::Instant::now();
+        let child = placeholder_child();
+        let child_pid = child.id();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(11),
+            super::WatchdogState::Warned,
+            Some(child),
+        )];
+        let mut kill_count = 0;
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Running,
+            |_c| kill_count += 1,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::WatchdogEvent::SpawnWedged { killed, child_pid: pid, .. } => {
+                assert!(*killed, "killed flag set");
+                assert_eq!(*pid, Some(child_pid));
+            }
+            other => panic!("expected SpawnWedged, got {:?}", other),
+        }
+        assert_eq!(kill_count, 1, "kill closure called exactly once");
+        assert!(spawns.is_empty(), "wedged entry removed");
+    }
+
+    #[test]
+    fn watchdog_removes_entry_on_nonzero_child_exit() {
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(1),
+            super::WatchdogState::Fresh,
+            Some(placeholder_child()),
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Exited(2),
+            |_c| {},
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::WatchdogEvent::SpawnExitedNonZero { code, .. } => assert_eq!(*code, 2),
+            other => panic!("expected SpawnExitedNonZero, got {:?}", other),
+        }
+        assert!(spawns.is_empty(), "non-zero exit removes entry");
+    }
+
+    #[test]
+    fn watchdog_clean_child_exit_keeps_entry_pending_wid_claim() {
+        // gnome-terminal-server pattern: the spawner exits cleanly (the
+        // python wrapper returns 0 immediately) but the window appears
+        // later via reparent under server PID. Watchdog must NOT remove
+        // the entry on clean exit — claim_pending_spawns still needs it
+        // to attribute the new wid.
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(1),
+            super::WatchdogState::Fresh,
+            Some(placeholder_child()),
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Exited(0),
+            |_c| {},
+        );
+        assert!(events.is_empty(), "no event on clean child exit");
+        assert_eq!(spawns.len(), 1, "entry retained for wid claim");
+        assert!(spawns[0].child.is_none(), "child handle dropped (already reaped)");
+    }
+
+    #[test]
+    fn watchdog_skips_queued_entries() {
+        // Queued entries aren't active yet — no spawn has happened, no
+        // child to poll, nothing to tick. Watchdog must no-op cleanly.
+        let now = std::time::Instant::now();
+        let mut spawns = vec![watchdog_entry(
+            super::PendingSpawnKind::Terminal,
+            now - std::time::Duration::from_secs(20),
+            super::WatchdogState::Queued,
+            None,
+        )];
+        let events = super::tick_watchdog(
+            &mut spawns,
+            now,
+            |_c| super::ChildPollResult::Running,
+            |_c| {},
+        );
+        assert!(events.is_empty());
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].state, super::WatchdogState::Queued);
+    }
+
+    #[test]
+    fn watchdog_empty_queue_is_noop() {
+        let mut spawns: Vec<super::PendingSpawn> = Vec::new();
+        let events = super::tick_watchdog(
+            &mut spawns,
+            std::time::Instant::now(),
+            |_c| super::ChildPollResult::Running,
+            |_c| {},
+        );
+        assert!(events.is_empty());
+        assert!(spawns.is_empty());
+    }
+
+    // ── Queue enqueue / cap behaviour ──
+
+    fn fresh_app() -> App {
+        super::App::new(0)
+    }
+
+    #[test]
+    fn enqueue_first_returns_dispatch_now() {
+        let mut app = fresh_app();
+        let outcome = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        assert_eq!(outcome, super::EnqueueDecision::DispatchNow);
+        assert_eq!(app.pending_spawns.len(), 1);
+        assert_eq!(app.pending_spawns[0].state, super::WatchdogState::Queued);
+    }
+
+    #[test]
+    fn enqueue_second_returns_queued() {
+        let mut app = fresh_app();
+        let _ = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        let outcome = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        assert_eq!(outcome, super::EnqueueDecision::Queued);
+        assert_eq!(app.pending_spawns.len(), 2);
+    }
+
+    #[test]
+    fn enqueue_at_cap_returns_queue_full() {
+        let mut app = fresh_app();
+        for _ in 0..super::PENDING_SPAWN_QUEUE_CAP {
+            let _ = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        }
+        let outcome = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        assert_eq!(outcome, super::EnqueueDecision::QueueFull);
+        assert_eq!(app.pending_spawns.len(), super::PENDING_SPAWN_QUEUE_CAP);
+    }
+
+    #[test]
+    fn record_dispatch_promotes_head_to_fresh() {
+        let mut app = fresh_app();
+        let _ = app.enqueue_spawn(super::PendingSpawnKind::Terminal);
+        app.record_dispatch(None);
+        assert_eq!(app.pending_spawns[0].state, super::WatchdogState::Fresh);
+    }
+
+    // ── Watchdog event formatter ──
+    //
+    // Wedged warnings are the most user-facing surface in this PR. The
+    // format must (a) name a sensible cause, (b) show the two fix
+    // commands as bare lines so triple-click copies them without prefix,
+    // and (c) point at the rolling log.
+
+    #[test]
+    fn format_wedged_event_includes_copy_paste_fix_lines() {
+        let event = super::WatchdogEvent::SpawnWedged {
+            kind: super::PendingSpawnKind::Terminal,
+            elapsed: std::time::Duration::from_secs(10),
+            killed: true,
+            child_pid: Some(12345),
+        };
+        let s = super::format_watchdog_event(&event);
+        assert!(
+            s.contains("\n    pkill -f gnome-terminal-server\n"),
+            "pkill line must be bare 4-space indented for triple-click"
+        );
+        assert!(
+            s.contains("\n    export PTM_TERMINAL_CMD=xterm\n"),
+            "export line must be bare 4-space indented"
+        );
+        assert!(s.contains("killed"), "names the kill action");
+        assert!(s.contains("12345"), "names the child pid");
     }
 
     // ── Session-binding carry-over ──
@@ -8945,7 +9732,7 @@ mod tests {
     }
 
     #[test]
-    fn carry_over_does_not_overwrite_claim_pending_spawn() {
+    fn carry_over_does_not_overwrite_claim_pending_spawns() {
         let prior = vec![mk_item_with_session(100, Some("0"))];
         let mut new_items = vec![mk_item_with_session(100, Some("X"))];
         let live = live_session_set(&["0", "X"]);

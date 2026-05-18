@@ -101,3 +101,37 @@ fn tmux_row_reattaches_via_tier_0a_after_restart() {
         out
     );
 }
+
+/// Reproducer for the missing green tmux marker / missing tmux status bar:
+/// clicking "+ New tmux" must produce an xterm that is actually a tmux
+/// client (keystroke round-trip via xdotool → tmux capture-pane) AND PTM
+/// must bind that row's `item.session` so the sidebar marker renders
+/// (verified via SIGUSR1 dump). Fails today because the in-flight refactor
+/// removed `bind_sessions`' claim+carry tiers.
+#[test]
+fn new_tmux_runs_tmux_and_binds_session() {
+    let (ok, out) = run_e2e_script("tmux_attach_runs_tmux.sh");
+    assert!(
+        ok,
+        "'+ New tmux' should spawn a tmux client AND PTM should bind item.session\n{}",
+        out
+    );
+}
+
+/// Reproducer for the Debian-wrapper bug: when PTM's chosen terminal is a
+/// `.wrapper` Perl/bash shim (mimicking `/usr/bin/gnome-terminal.wrapper`),
+/// the spawn must use `-e` so the wrapper sees and forwards the command.
+/// Sibling test above sets PTM_TERMINAL_CMD=xterm, which dodges this code
+/// path; this script installs a fake `gnome-terminal.wrapper` that mimics
+/// the real wrapper's "drop everything not behind -e" behaviour and
+/// verifies the marker still round-trips. Would have caught the original
+/// "no green tmux status bar inside the spawned terminal" report.
+#[test]
+fn new_tmux_through_wrapper_still_runs_tmux() {
+    let (ok, out) = run_e2e_script("tmux_attach_through_wrapper.sh");
+    assert!(
+        ok,
+        "'+ New tmux' through a Debian wrapper shim must still run tmux\n{}",
+        out
+    );
+}

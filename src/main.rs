@@ -423,6 +423,13 @@ enum MenuAction {
     AttachSession,
     RenameSession,
     KillSession,
+    /// Spawn a bare terminal (like the top `+ New terminal` button) and
+    /// auto-attach the resulting window to the named group.
+    NewTerminalInGroup(u32),
+    /// Create a fresh tmux session, spawn a terminal attached to it
+    /// (like the top `+ New tmux` button), and auto-attach the resulting
+    /// window to the named group.
+    NewTmuxInGroup(u32),
 }
 
 struct MenuEntry {
@@ -3381,8 +3388,10 @@ fn refresh_items(
         std::time::Instant::now(),
         PENDING_ATTACH_TIMEOUT,
     );
-    for wid in &claimed_wids {
-        let _ = snap_to_sidebar(conn, root, app.our_wid, *wid, atoms);
+    for claim in &claimed_wids {
+        if claim.snap {
+            let _ = snap_to_sidebar(conn, root, app.our_wid, claim.wid, atoms);
+        }
     }
 
     // FM-2 fix (Phase 2c): preserve members whose live wid disappeared as
@@ -3539,6 +3548,17 @@ fn refresh_items(
     app.active_wid = get_active_window(conn, root, atoms).unwrap_or(None);
 
     app.items = new_items;
+    // Apply any group-attach intents that rode on claim-tier attaches.
+    // Must run after `app.items` is updated so `make_group_member_for_wid`
+    // can read the new item's label/wm_class. `add_to_group` itself
+    // rebuilds display_rows and marks dirty; the final
+    // `build_display_rows()` below is a redundant no-op in that case
+    // (cheap, kept for clarity).
+    for claim in &claimed_wids {
+        if let Some(gid) = claim.target_group_id {
+            app.add_to_group(gid, claim.wid);
+        }
+    }
     app.build_display_rows();
 
     Ok(())
@@ -3898,30 +3918,69 @@ fn walk_to_window_owner(
 /// the user closed the window before it appeared.
 const PENDING_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// One outstanding "+ New tmux" or "Attach to session" click awaiting the
-/// terminal window it spawned. When that wid next shows up in
-/// `_NET_CLIENT_LIST`, `bind_sessions` consumes the head entry FIFO and
-/// writes `item.session = Some(session_name)`. This is the only path that
-/// works under gnome-terminal-server's PID collision.
+/// One outstanding "+ New tmux", "Attach to session", or group-context
+/// "New terminal/tmux" click awaiting the terminal window it spawned.
+/// When that wid next shows up in `_NET_CLIENT_LIST`, `bind_sessions`
+/// consumes the head entry FIFO and (when `session_name.is_some()`)
+/// writes `item.session = Some(name)`. The optional `target_group_id`
+/// causes `refresh_items` to auto-add the claimed wid to that group.
+/// FIFO-only attribution is the only path that works under
+/// gnome-terminal-server's PID collision.
 #[derive(Clone, Debug)]
 struct PendingAttach {
-    session_name: String,
+    /// `Some(session)` for tmux attaches (binds the new wid to the
+    /// session and triggers snap-to-sidebar); `None` for bare-terminal
+    /// spawns that only carry a group-attach intent.
+    session_name: Option<String>,
+    /// `Some(gid)` when the spawn originated from a group-header
+    /// right-click — claim tier emits this so the new wid is added to
+    /// the group on first sight.
+    target_group_id: Option<u32>,
     queued_at: std::time::Instant,
 }
 
+/// One row of the claim tier's output. `snap` is true when the attach
+/// carried EITHER a `session_name` OR a `target_group_id` — both signal
+/// the user explicitly anchored the spawn to a known sidebar slot
+/// (tmux-attached terminals via `+ New tmux`, or any group-context
+/// spawn via the group-header right-click menu). The top `+ New
+/// terminal` button doesn't queue an attach at all, so it stays
+/// unsnapped. `target_group_id` is forwarded so `refresh_items` can
+/// auto-add the claimed wid to the named group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaimedWid {
+    wid: u32,
+    snap: bool,
+    target_group_id: Option<u32>,
+}
+
 /// Queue a tmux-attach intent so `bind_sessions` can bind it to the next
-/// new wid. Called at every click site that invokes `spawn_attach_terminal`.
+/// new wid. Thin wrapper around `queue_pending_attach_with_group` for
+/// existing call sites that only carry a session name.
 fn queue_pending_attach(app: &mut App, session_name: &str) {
+    queue_pending_attach_with_group(app, Some(session_name), None);
+}
+
+/// Queue a pending attach with optional session and optional target
+/// group. `session_name.is_some()` triggers snap-to-sidebar on the
+/// claimed wid; `target_group_id.is_some()` triggers `add_to_group`.
+fn queue_pending_attach_with_group(
+    app: &mut App,
+    session_name: Option<&str>,
+    target_group_id: Option<u32>,
+) {
     app.pending_attaches.push(PendingAttach {
-        session_name: session_name.to_string(),
+        session_name: session_name.map(str::to_string),
+        target_group_id,
         queued_at: std::time::Instant::now(),
     });
 }
 
 /// Write `item.session` on each item in `new_items` using a three-tier
 /// cascade. Mutates `new_items` and drains consumed entries from
-/// `pending_attaches`. Returns the list of wids that consumed a pending
-/// attach (claim tier) so the caller can snap them to the sidebar.
+/// `pending_attaches`. Returns one `ClaimedWid` per wid that consumed a
+/// pending attach (claim tier) so the caller can snap (when the attach
+/// carried a session) and/or auto-add the wid to a target group.
 /// Pure with respect to the rest of `App`; all inputs are either
 /// by-value collections or injected closures so the helper is fully
 /// unit-testable without an X11 connection.
@@ -3931,10 +3990,13 @@ fn queue_pending_attach(app: &mut App, session_name: &str) {
 ///
 /// 1. **Claim** — for any item whose wid is NOT in `prior_wids` (i.e.
 ///    appeared since the last refresh), consume the head of
-///    `pending_attaches` (FIFO) and write its `session_name`. This is
-///    the only tier that fires under gnome-terminal-server, where
-///    `walk_to_window_owner` always collides. Wids consumed here are
-///    returned for snap-to-sidebar.
+///    `pending_attaches` (FIFO). If the attach carries a session_name,
+///    write it onto `item.session`. The returned `ClaimedWid` carries
+///    `snap = session_name.is_some() || target_group_id.is_some()` —
+///    either anchor (session or group) means the user placed the
+///    spawn deliberately, so snap-to-sidebar applies. Claim is the
+///    only tier that fires under gnome-terminal-server, where
+///    `walk_to_window_owner` always collides.
 ///
 /// 2. **Walk** — for each `(client_pid, session_name)` in
 ///    `tmux_clients`, walk up the process tree to the owning window via
@@ -3959,11 +4021,11 @@ fn bind_sessions(
     mut read_ppid_fn: impl FnMut(u32) -> Option<u32>,
     now: std::time::Instant,
     attach_timeout: std::time::Duration,
-) -> Vec<u32> {
+) -> Vec<ClaimedWid> {
     pending_attaches
         .retain(|p| now.saturating_duration_since(p.queued_at) < attach_timeout);
 
-    let mut claimed: Vec<u32> = Vec::new();
+    let mut claimed: Vec<ClaimedWid> = Vec::new();
     for item in new_items.iter_mut() {
         if prior_wids.contains(&item.wid) {
             continue;
@@ -3972,8 +4034,15 @@ fn bind_sessions(
             break;
         }
         let attach = pending_attaches.remove(0);
-        item.session = Some(attach.session_name);
-        claimed.push(item.wid);
+        let snap = attach.session_name.is_some() || attach.target_group_id.is_some();
+        if let Some(name) = attach.session_name {
+            item.session = Some(name);
+        }
+        claimed.push(ClaimedWid {
+            wid: item.wid,
+            snap,
+            target_group_id: attach.target_group_id,
+        });
     }
 
     for (&client_pid, session_name) in tmux_clients {
@@ -5995,12 +6064,28 @@ fn build_menu_entries(app: &App, row: usize) -> Vec<MenuEntry> {
     let attached_session = window_session_for_row(app, row);
     match &app.display_rows[row] {
         DisplayRow::GroupHeader { group_id } => {
-            let mut entries = vec![MenuEntry {
+            let mut entries = Vec::new();
+            let is_system = is_target_system_group(app, *group_id);
+            // "Spawn into this group" entries hidden for the TmuxSystem
+            // group: that group's members are rebuilt from
+            // `list_tmux_sessions()` on every poll, so any manually
+            // inserted window would be wiped at the next refresh.
+            if !is_system {
+                entries.push(MenuEntry {
+                    label: "New terminal".to_string(),
+                    action: MenuAction::NewTerminalInGroup(*group_id),
+                });
+                entries.push(MenuEntry {
+                    label: "New tmux".to_string(),
+                    action: MenuAction::NewTmuxInGroup(*group_id),
+                });
+            }
+            entries.push(MenuEntry {
                 label: "Rename Group".to_string(),
                 action: MenuAction::RenameGroup,
-            }];
+            });
             // System groups can't be deleted from the UI — they're auto-managed.
-            if !is_target_system_group(app, *group_id) {
+            if !is_system {
                 entries.push(MenuEntry {
                     label: "Delete Group".to_string(),
                     action: MenuAction::DeleteGroup,
@@ -6228,13 +6313,27 @@ struct ConfirmRequest {
     action: ConfirmAction,
 }
 
+/// Post-dispatch side-effects requested by `execute_menu_action`. Lets the
+/// X11-free menu dispatcher signal "open a confirm popup" and/or "wake the
+/// event loop so the next tmux poll happens immediately" without taking a
+/// connection / atoms.
+#[derive(Default)]
+struct MenuActionResult {
+    confirm: Option<ConfirmRequest>,
+    /// True when the action spawned a tmux session that the auto
+    /// TmuxSystem group should surface promptly (caller pokes the event
+    /// loop, same as the top `+ New tmux` button does).
+    wake: bool,
+}
+
 fn execute_menu_action(
     app: &mut App,
     action: MenuAction,
     target_row: usize,
-) -> Option<ConfirmRequest> {
+) -> MenuActionResult {
+    let mut result = MenuActionResult::default();
     if target_row >= app.display_rows.len() {
-        return None;
+        return result;
     }
     match action {
         MenuAction::CreateGroup => {
@@ -6298,7 +6397,7 @@ fn execute_menu_action(
                 }
                 DisplayRow::Window { .. } => {
                     if let Some(session) = window_session_for_row(app, target_row) {
-                        return Some(ConfirmRequest {
+                        result.confirm = Some(ConfirmRequest {
                             message: format!("Kill tmux session '{}'?", session),
                             action: ConfirmAction::KillSession(session),
                         });
@@ -6307,8 +6406,33 @@ fn execute_menu_action(
                 _ => {}
             }
         }
+        MenuAction::NewTerminalInGroup(gid) => {
+            // Mirrors the top `+ New terminal` button (no session, no
+            // snap) but queues a target_group_id so refresh_items adds
+            // the spawned wid to the chosen group on first sight.
+            let argv = argv_for_default_terminal();
+            queue_pending_attach_with_group(app, None, Some(gid));
+            if let Some(child) = spawn_default_terminal() {
+                record_spawned_child(app, &argv, child);
+            }
+        }
+        MenuAction::NewTmuxInGroup(gid) => {
+            // Mirrors the top `+ New tmux` button: create the session,
+            // queue an attach (with the group hint), spawn the terminal,
+            // then ask the event loop to poke itself so the auto
+            // TmuxSystem group surfaces the new session promptly rather
+            // than waiting for the next 5 s tmux poll.
+            if let Some(name) = create_new_tmux_session() {
+                let argv = argv_for_attach_terminal(&name);
+                queue_pending_attach_with_group(app, Some(&name), Some(gid));
+                if let Some(child) = spawn_attach_terminal(&name) {
+                    record_spawned_child(app, &argv, child);
+                }
+                result.wake = true;
+            }
+        }
     }
-    None
+    result
 }
 
 // ── Confirmation popup ──
@@ -8643,7 +8767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             close_context_menu(&conn, &mut app)?;
                             let follow_up =
                                 execute_menu_action(&mut app, action, target_row);
-                            if let Some(req) = follow_up {
+                            if let Some(req) = follow_up.confirm {
                                 open_confirm_popup(
                                     &conn,
                                     screen,
@@ -8654,6 +8778,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     menu_x,
                                     menu_y,
                                 )?;
+                            }
+                            if follow_up.wake {
+                                poke_self(&conn, window, atoms.ptm_wake);
                             }
                         } else {
                             close_context_menu(&conn, &mut app)?;
@@ -9699,15 +9826,22 @@ mod tests {
     }
 
     #[test]
-    fn menu_for_group_header_has_rename_and_delete() {
+    fn menu_for_group_header_has_spawn_rename_and_delete() {
+        // Group-header right-click on a Normal group surfaces (in this
+        // order) the two spawn-into-group entries plus the existing
+        // Rename / Delete entries.
         let mut app = make_app();
         add_item(&mut app, 1, "A");
         app.create_group(1);
 
         let entries = build_menu_entries(&app, 0); // group header
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].label, "Rename Group");
-        assert_eq!(entries[1].label, "Delete Group");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].label, "New terminal");
+        assert!(matches!(entries[0].action, MenuAction::NewTerminalInGroup(_)));
+        assert_eq!(entries[1].label, "New tmux");
+        assert!(matches!(entries[1].action, MenuAction::NewTmuxInGroup(_)));
+        assert_eq!(entries[2].label, "Rename Group");
+        assert_eq!(entries[3].label, "Delete Group");
     }
 
     // ── Tab rename ──
@@ -11249,7 +11383,23 @@ mod tests {
 
     fn pending(session: &str, now: std::time::Instant) -> super::PendingAttach {
         super::PendingAttach {
-            session_name: session.to_string(),
+            session_name: Some(session.to_string()),
+            target_group_id: None,
+            queued_at: now,
+        }
+    }
+
+    /// Build a PendingAttach with explicit session / group fields. Used by
+    /// the spawn-into-group tests where the attach may carry no session
+    /// (bare-terminal-in-group) or an explicit target_group_id.
+    fn pending_with_group(
+        session: Option<&str>,
+        target_group_id: Option<u32>,
+        now: std::time::Instant,
+    ) -> super::PendingAttach {
+        super::PendingAttach {
+            session_name: session.map(str::to_string),
+            target_group_id,
             queued_at: now,
         }
     }
@@ -11301,7 +11451,15 @@ mod tests {
             pending_attaches.is_empty(),
             "the attach was consumed"
         );
-        assert_eq!(claimed, vec![200], "claimed wid is returned for snap");
+        assert_eq!(
+            claimed,
+            vec![super::ClaimedWid {
+                wid: 200,
+                snap: true,
+                target_group_id: None,
+            }],
+            "claimed wid is returned for snap with snap=true (had session)"
+        );
     }
 
     #[test]
@@ -11514,6 +11672,168 @@ mod tests {
             "stale attach must not bind a fresh wid"
         );
         assert!(pending_attaches.is_empty(), "stale attach is pruned");
+    }
+
+    #[test]
+    fn bind_sessions_claim_carries_target_group_id_when_attach_has_session() {
+        // "New tmux in group 7": attach carries a session_name AND a
+        // target_group_id. Claim must bind item.session, emit snap=true,
+        // and forward target_group_id so refresh_items can add_to_group.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(200, None, Some(2380))];
+        let prior_items: Vec<super::Item> = vec![];
+        let prior_wids: HashSet<u32> = HashSet::new();
+        let tmux_clients: HashMap<u32, String> = HashMap::new();
+        let pid_to_wid: HashMap<u32, Vec<u32>> =
+            [(2380u32, vec![200u32])].iter().cloned().collect();
+        let mut pending_attaches = vec![pending_with_group(Some("0"), Some(7), now)];
+        let live = live_sessions_set(&["0"]);
+        let read = ppid_reader(HashMap::new());
+        let claimed = super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &tmux_clients,
+            &pid_to_wid,
+            &mut pending_attaches,
+            &prior_wids,
+            &live,
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("0"),
+            "session_name should bind item.session"
+        );
+        assert_eq!(
+            claimed,
+            vec![super::ClaimedWid {
+                wid: 200,
+                snap: true,
+                target_group_id: Some(7),
+            }],
+            "claim must forward both snap=true and target_group_id"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_claim_bare_terminal_in_group_snaps_keeps_no_session() {
+        // "New terminal in group 7": attach carries NO session but a
+        // target_group_id. Claim must leave item.session as None and
+        // still emit snap=true — the user explicitly placed the spawn
+        // into a known sidebar slot, so snap-to-sidebar applies.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(300, None, Some(4000))];
+        let prior_items: Vec<super::Item> = vec![];
+        let prior_wids: HashSet<u32> = HashSet::new();
+        let tmux_clients: HashMap<u32, String> = HashMap::new();
+        let pid_to_wid: HashMap<u32, Vec<u32>> =
+            [(4000u32, vec![300u32])].iter().cloned().collect();
+        let mut pending_attaches = vec![pending_with_group(None, Some(7), now)];
+        let live = live_sessions_set(&[]);
+        let read = ppid_reader(HashMap::new());
+        let claimed = super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &tmux_clients,
+            &pid_to_wid,
+            &mut pending_attaches,
+            &prior_wids,
+            &live,
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert!(
+            new_items[0].session.is_none(),
+            "bare-terminal attach must not bind item.session"
+        );
+        assert_eq!(
+            claimed,
+            vec![super::ClaimedWid {
+                wid: 300,
+                snap: true,
+                target_group_id: Some(7),
+            }],
+            "group-anchored claim must snap (anchor = group slot) and forward target_group_id"
+        );
+        assert!(pending_attaches.is_empty(), "the attach was consumed");
+    }
+
+    #[test]
+    fn bind_sessions_claim_fifo_preserved_across_mixed_intents() {
+        // User clicked, in order: "New terminal in 11", "New tmux in 22",
+        // then a plain top-button "+ New tmux" (no group hint). Three new
+        // wids appear (in `new_items` order). FIFO must hand each wid
+        // the head-of-queue attach with the matching snap/group flags.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![
+            mk_bound_item(401, None, Some(8000)),
+            mk_bound_item(402, None, Some(8000)),
+            mk_bound_item(403, None, Some(8000)),
+        ];
+        let prior_items: Vec<super::Item> = vec![];
+        let prior_wids: HashSet<u32> = HashSet::new();
+        let tmux_clients: HashMap<u32, String> = HashMap::new();
+        let pid_to_wid: HashMap<u32, Vec<u32>> =
+            [(8000u32, vec![401u32, 402, 403])].iter().cloned().collect();
+        let mut pending_attaches = vec![
+            pending_with_group(None, Some(11), now),
+            pending_with_group(Some("a"), Some(22), now),
+            pending_with_group(Some("b"), None, now),
+        ];
+        let live = live_sessions_set(&["a", "b"]);
+        let read = ppid_reader(HashMap::new());
+        let claimed = super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &tmux_clients,
+            &pid_to_wid,
+            &mut pending_attaches,
+            &prior_wids,
+            &live,
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            claimed,
+            vec![
+                super::ClaimedWid {
+                    wid: 401,
+                    // bare-terminal-in-group still snaps because the
+                    // group anchor signals deliberate placement.
+                    snap: true,
+                    target_group_id: Some(11),
+                },
+                super::ClaimedWid {
+                    wid: 402,
+                    snap: true,
+                    target_group_id: Some(22),
+                },
+                super::ClaimedWid {
+                    wid: 403,
+                    snap: true,
+                    target_group_id: None,
+                },
+            ],
+            "FIFO must hand each wid the head-of-queue attach with matching flags"
+        );
+        assert_eq!(
+            new_items.iter().find(|i| i.wid == 401).unwrap().session.as_deref(),
+            None,
+            "bare-terminal wid must not get a session"
+        );
+        assert_eq!(
+            new_items.iter().find(|i| i.wid == 402).unwrap().session.as_deref(),
+            Some("a"),
+        );
+        assert_eq!(
+            new_items.iter().find(|i| i.wid == 403).unwrap().session.as_deref(),
+            Some("b"),
+        );
+        assert!(pending_attaches.is_empty(), "all three attaches consumed");
     }
 
     // ── Wedge detector (Cluster 6) ──
@@ -13411,6 +13731,7 @@ mod tests {
         let mut app = make_app();
         add_attached_item(&mut app, 1, "term", "demo");
         let req = super::execute_menu_action(&mut app, super::MenuAction::KillSession, 0)
+            .confirm
             .expect("expected ConfirmRequest follow-up");
         assert!(
             matches!(req.action, super::ConfirmAction::KillSession(ref n) if n == "demo"),
@@ -14476,7 +14797,12 @@ mod tests {
     }
 
     #[test]
-    fn menu_for_system_group_header_excludes_delete_group() {
+    fn menu_for_system_group_header_excludes_delete_and_spawn_into_group() {
+        // The TmuxSystem group is auto-rebuilt every refresh from
+        // `list_tmux_sessions()`. Any manually added member (whether a
+        // bare terminal via "New terminal" or a tmux window via "New
+        // tmux") would be wiped on the next sync, so both spawn-into-
+        // group entries must be hidden alongside Delete Group.
         let mut app = make_app();
         make_system_group(&mut app, &[]);
         let entries = super::build_menu_entries(&app, 0);
@@ -14487,6 +14813,18 @@ mod tests {
         assert!(
             !entries.iter().any(|e| matches!(e.action, super::MenuAction::DeleteGroup)),
             "Delete Group must be suppressed for the system group"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.action, super::MenuAction::NewTerminalInGroup(_))),
+            "New terminal must be suppressed for the system group"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.action, super::MenuAction::NewTmuxInGroup(_))),
+            "New tmux must be suppressed for the system group"
         );
     }
 
@@ -14617,7 +14955,8 @@ mod tests {
         // Orphan path keeps direct invocation (no popup) — but in tests the
         // tmux command may or may not actually exist; what we verify is that
         // no ConfirmRequest comes back and the member is dropped optimistically.
-        assert!(req.is_none(), "orphan session path returns no confirm");
+        assert!(req.confirm.is_none(), "orphan session path returns no confirm");
+        assert!(!req.wake, "orphan kill should not poke the event loop");
         let group = app
             .groups
             .iter()

@@ -135,3 +135,17 @@ fn new_tmux_through_wrapper_still_runs_tmux() {
         out
     );
 }
+
+/// Reproducer: right-clicking a Normal group header → "New terminal"
+/// should snap the spawned xterm to the sidebar anchor (same as the
+/// tmux variant). Today the bare-terminal-in-group path lands at the
+/// WM default position — RED until the snap gate is fixed.
+#[test]
+fn new_terminal_in_group_snaps_to_sidebar_anchor() {
+    let (ok, out) = run_e2e_script("spawn_terminal_in_group.sh");
+    assert!(
+        ok,
+        "group-context 'New terminal' should snap the spawned xterm to the sidebar anchor\n{}",
+        out
+    );
+}

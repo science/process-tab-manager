@@ -18,7 +18,7 @@ It also works for non-terminal windows (browsers, editors) — anything the WM r
 - **Click to focus + snap** — click a row to activate that window and snap it beside the sidebar
 - **Tab grouping** — right-click to create groups, add/remove windows, collapse/expand
 - **Drag-and-drop reorder** — drag rows to reorder, drag between groups, drag out to ungroup
-- **Right-click context menu** — New Group, Add to Group, Remove from Group, Rename, Delete
+- **Right-click context menu** — New Group, Add to Group, Remove from Group, Rename, Delete; right-click a group header for New terminal / New tmux to spawn straight into that group
 - **Active window highlight** — blue accent stripe and tinted background on the focused window
 - **Hover feedback** — subtle highlight on mouse-over
 - **OneDark color scheme** — dark background, warm gray text, colorful accent stripes
@@ -88,10 +88,12 @@ Reload with `tmux source-file ~/.tmux.conf` in any attached session, or start a 
 ## Testing
 
 ```bash
-cargo test     # 220+ unit tests, no X11 display needed
+cargo test                          # 470+ unit tests + 7 Xvfb e2e tests (~25 s)
+cargo test --bin ptm                # unit tests only (~50 ms, no X11)
+cargo test --test e2e_kill_session  # e2e suite only (Xvfb-driven, ~25 s)
 ```
 
-Tests cover state management, group operations, drag-and-drop resolution, hit testing, context menu entry generation, rename text input (selection/word motion/word delete), and persistence (atomic writes, identity-based group restoration, ghost-member preservation across PTM restarts) — all pure logic that runs without a display server.
+Unit tests cover state management, group operations, drag-and-drop resolution, hit testing, context menu entry generation, rename text input (selection/word motion/word delete), and persistence (atomic writes, identity-based group restoration, ghost-member preservation across PTM restarts) — all pure logic that runs without a display server. The e2e suite spins up Xvfb + openbox and exercises real keyboard/mouse paths (context-menu kill, [x]-glyph kill, spawn-to-sidebar snapping, recipe-tier restore).
 
 ## Architecture
 

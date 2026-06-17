@@ -6,17 +6,19 @@ Vertical sidebar for managing application windows on Linux/X11. Pure X11 via x11
 
 ```bash
 source "$HOME/.cargo/env"
+./build.sh dev                                                    # Build dev binary into /tmp/ptm-dev (run in place)
+./build.sh release                                                # Build + copy binary to ~/.local/bin/ptm (persistent)
+./install.sh                                                      # build.sh release + desktop entry/icon/tmux dep
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 470 unit + 7 e2e (Xvfb, ~25s)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --bin ptm                # unit tests only (~50ms)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~25s)
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo build --release               # Build dev binary
-DISPLAY=:0 /tmp/ptm-dev/release/ptm                               # Run (needs X11 desktop)
+DISPLAY=:0 /tmp/ptm-dev/release/ptm                               # Run dev build (needs X11 desktop)
 PTM_BIN=/tmp/ptm-dev/release/ptm tests/e2e/<name>.sh              # Run a single e2e script standalone
 ```
 
 The crate is a single-binary package (no `[lib]` target), so unit tests live under the `ptm` binary — `cargo test --lib` errors out; use `--bin ptm` instead.
 
-**Dev vs production**: Dev builds use `/tmp/ptm-dev`. The installed launcher (`install.sh`) uses `/tmp/ptm-target`. This keeps `cargo build` during development from overwriting the production binary.
+**Dev vs production**: `build.sh` owns the build+place logic. Both modes compile into `/tmp` because `~/dev` is a `noexec` virtiofs mount — a binary built into the repo fails with "Bad address (os error 14)" (see `fix-virtiofs-exec.md`). `dev` targets `/tmp/ptm-dev` and you run it in place; `release` targets `/tmp/ptm-target` and then **copies** the binary to `~/.local/bin/ptm`. The copy (not a symlink into `/tmp`) is deliberate: `/tmp` is wiped on every reboot, so a symlink would dangle and PTM would look uninstalled after a restart — `~/.local/bin` is on persistent, exec-capable ext4. Separate target dirs keep a dev rebuild from clobbering the release artifact.
 
 **System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Seven scripts live under `tests/e2e/`:
 

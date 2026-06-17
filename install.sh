@@ -21,21 +21,11 @@ if ! command -v tmux >/dev/null 2>&1; then
     fi
 fi
 
-# Build release binary
-source "$HOME/.cargo/env"
-echo "Building ptm..."
-CARGO_TARGET_DIR=/tmp/ptm-target cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
-
-# Symlink binary
-mkdir -p "$INSTALL_DIR"
-src="/tmp/ptm-target/release/ptm"
-dst="$INSTALL_DIR/ptm"
-if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
-    echo "Binary symlink already correct"
-else
-    ln -sf "$src" "$dst"
-    echo "Linked $dst -> $src"
-fi
+# Build the release binary and copy it onto persistent disk. build.sh owns the
+# build+place logic (target dir, the noexec-virtiofs workaround, and the
+# copy-not-symlink so the install survives a reboot — /tmp is wiped on boot).
+# It installs to $HOME/.local/bin/ptm, which is INSTALL_DIR here.
+"$SCRIPT_DIR/build.sh" release
 
 # Surface the terminal PTM will pick so the user sees it at install time.
 # Probing the terminal itself is intentionally NOT done here: running

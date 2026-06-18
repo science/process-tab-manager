@@ -91,6 +91,12 @@ struct Atoms {
     /// Wake atom for the Phase 5a recipe-dump trigger (sent by the
     /// SIGUSR1 thread).
     ptm_dump_recipes: Atom,
+    /// `_PTM_ID` — the persistent per-window identity PTM stamps on every
+    /// window it spawns or that gets dragged into a group. Stored on the
+    /// X server attached to the window, so it survives title changes,
+    /// refreshes, and even a PTM restart while the window lives. This is
+    /// the anchor for the exclusive Tier-0 matching that stops group drift.
+    ptm_id: Atom,
 }
 
 impl Atoms {
@@ -111,6 +117,7 @@ impl Atoms {
         let c13 = conn.intern_atom(false, b"_PTM_WAKE")?;
         let c14 = conn.intern_atom(false, b"_PTM_SAVE_TICK")?;
         let c15 = conn.intern_atom(false, b"_PTM_DUMP_RECIPES")?;
+        let c16 = conn.intern_atom(false, b"_PTM_ID")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -128,6 +135,7 @@ impl Atoms {
             ptm_wake: c13.reply()?.atom,
             ptm_save_tick: c14.reply()?.atom,
             ptm_dump_recipes: c15.reply()?.atom,
+            ptm_id: c16.reply()?.atom,
         })
     }
 }
@@ -307,6 +315,12 @@ struct Item {
     /// dump path to drive Layer-1 / Layer-2 capture without re-querying
     /// X11 at dump time.
     pid: Option<u32>,
+    /// `_PTM_ID` read off the window, if PTM has ever stamped it (spawned
+    /// it or had it dragged into a group). This is the persistent identity
+    /// that drives the exclusive Tier-0 match — a window carrying one only
+    /// ever binds to the saved member with the same id, never to a fuzzy
+    /// label/wm_class fallback. None for windows PTM has never managed.
+    ptm_id: Option<String>,
 }
 
 impl Item {
@@ -367,6 +381,13 @@ struct GroupMember {
     /// populates this on every save tick; Phase 5c reads it for the
     /// recipe-tier matching cascade.
     recipe: Option<LaunchRecipe>,
+    /// Persistent identity that PTM stamped on this member's window
+    /// (`_PTM_ID`) and, for tmux members, its session (`@ptm_id`). When
+    /// present this is the authoritative, exclusive match key: the member
+    /// binds only to a live window whose `ptm_id` equals this, and never
+    /// fuzzy-grabs a different window via label/wm_class. None for legacy
+    /// members saved before this scheme (they keep the old cascade).
+    id: Option<String>,
 }
 
 impl Group {
@@ -2262,6 +2283,7 @@ impl App {
                 custom_prefix: item.custom_prefix.clone(),
                 live_wid: Some(wid),
                 recipe: None,
+                id: item.ptm_id.clone(),
             },
             None => GroupMember {
                 label: String::new(),
@@ -2269,6 +2291,7 @@ impl App {
                 custom_prefix: String::new(),
                 live_wid: Some(wid),
                 recipe: None,
+                id: None,
             },
         }
     }
@@ -2988,6 +3011,70 @@ fn get_window_pid(conn: &impl Connection, wid: u32, atoms: &Atoms) -> Option<u32
     }
 }
 
+/// Read the `_PTM_ID` property off a window, if PTM has stamped one.
+/// This is the persistent per-window identity used by the exclusive
+/// Tier-0 match. Returns None for windows PTM has never managed (every
+/// pre-existing window, until it's spawned or dragged into a group).
+fn get_window_ptm_id(conn: &impl Connection, wid: u32, atoms: &Atoms) -> Option<String> {
+    let reply = conn
+        .get_property(false, wid, atoms.ptm_id, atoms.utf8_string, 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.value.is_empty() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&reply.value).into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Stamp `_PTM_ID` onto a window. Idempotent — re-stamping with the same
+/// id is a no-op from the matcher's point of view. Errors are swallowed:
+/// a failed stamp just means the window falls back to the legacy
+/// (label, wm_class) tiers, which is the pre-existing behaviour.
+fn set_window_ptm_id(conn: &impl Connection, wid: u32, atoms: &Atoms, id: &str) {
+    let _ = conn.change_property8(
+        PropMode::REPLACE,
+        wid,
+        atoms.ptm_id,
+        atoms.utf8_string,
+        id.as_bytes(),
+    );
+    let _ = conn.flush();
+}
+
+/// Mint a fresh persistent identifier. Reads the kernel's UUID source
+/// (always present on Linux), so no external crate is needed. Falls back
+/// to a pid+nanos token on the vanishingly rare read failure so callers
+/// always get a usable, unique-enough id.
+fn new_ptm_uuid() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("ptm-{}-{}", std::process::id(), nanos)
+}
+
+/// Tag a tmux session with `@ptm_id <id>` so the identity survives detach,
+/// terminal death, and PTM restart for as long as the tmux server lives.
+/// Best-effort: failure just means the session relies on the window-level
+/// `_PTM_ID` and saved-member id instead.
+fn tmux_set_session_id(session: &str, id: &str) {
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", session, "@ptm_id", id])
+        .output();
+}
+
 fn get_window_title(
     conn: &impl Connection,
     wid: u32,
@@ -3321,6 +3408,8 @@ fn refresh_items(
             pid_to_wid.entry(pid).or_insert_with(Vec::new).push(wid);
         }
 
+        let ptm_id = get_window_ptm_id(conn, wid, atoms);
+
         new_items.push(Item {
             wid,
             label: display,
@@ -3329,6 +3418,7 @@ fn refresh_items(
             custom_prefix,
             session: None,
             pid: pid_opt,
+            ptm_id,
         });
     }
 
@@ -3392,6 +3482,30 @@ fn refresh_items(
         if claim.snap {
             let _ = snap_to_sidebar(conn, root, app.our_wid, claim.wid, atoms);
         }
+        // Stamp the spawn's persistent id onto the new window so it's
+        // drift-immune from birth (Tier 0 in the matching cascade). The
+        // in-memory item.ptm_id was already set by bind_sessions' claim tier.
+        if let Some(id) = &claim.ptm_id {
+            set_window_ptm_id(conn, claim.wid, atoms, id);
+        }
+    }
+
+    // Backstop: a window bound to a tmux session that PTM tagged with
+    // `@ptm_id` but which carries no `_PTM_ID` of its own (e.g. the session
+    // was reattached in a terminal PTM didn't spawn). Inherit the identity
+    // from the session and stamp the window, so the externally-attached
+    // window still gets Tier-0 drift immunity.
+    for item in new_items.iter_mut() {
+        if item.ptm_id.is_some() {
+            continue;
+        }
+        let Some(session) = item.session.clone() else {
+            continue;
+        };
+        if let Some(id) = tmux_get_session_id(&session) {
+            set_window_ptm_id(conn, item.wid, atoms, &id);
+            item.ptm_id = Some(id);
+        }
     }
 
     // FM-2 fix (Phase 2c): preserve members whose live wid disappeared as
@@ -3425,13 +3539,14 @@ fn refresh_items(
         if already_known.contains(wid) {
             continue;
         }
-        let (label, wm_class, session, item_pid) =
+        let (label, wm_class, session, item_pid, item_ptm_id) =
             match new_items.iter().find(|i| i.wid == *wid) {
                 Some(i) => (
                     i.label.clone(),
                     i.wm_class.clone(),
                     i.session.clone(),
                     i.pid,
+                    i.ptm_id.clone(),
                 ),
                 None => continue,
             };
@@ -3440,49 +3555,67 @@ fn refresh_items(
             // Phase 5c skips Tier 0a/0b for TmuxSystem; that group is
             // rebuilt every refresh from list_tmux_sessions().
             let can_recipe_match = matches!(group.kind, GroupKind::Normal);
-            // Phase 5c Tier 0a — tmux session match against ghost recipes.
-            let tmux_pos = if can_recipe_match {
-                group.members.iter().position(|m| {
-                    m.live_wid.is_none()
-                        && m.recipe
-                            .as_ref()
-                            .and_then(|r| r.tmux.as_ref())
-                            .map(|t| Some(t.session_name.as_str()) == session.as_deref())
-                            .unwrap_or(false)
-                })
+            let pos = if let Some(id) = &item_ptm_id {
+                // Tier 0 — EXCLUSIVE persistent-id match. An id-bearing
+                // window binds ONLY to the ghost member with the same id and
+                // NEVER falls through to the fuzzy tiers. This is the core
+                // anti-drift guarantee on the periodic poll path: a stamped
+                // tmux/terminal can't be re-homed by a same-wm_class ghost
+                // in some other group. If no member matches, it stays
+                // unbound (ungrouped) rather than drifting.
+                group
+                    .members
+                    .iter()
+                    .position(|m| m.live_wid.is_none() && m.id.as_deref() == Some(id.as_str()))
             } else {
-                None
-            };
-            // Phase 5c Tier 0b — pid match + label/wm_class corroborator.
-            let pid_pos = || {
-                if !can_recipe_match {
-                    return None;
-                }
-                let p = match item_pid {
-                    Some(p) => p,
-                    None => return None,
+                // Legacy window (no `_PTM_ID`). Match by tmux session / pid /
+                // exact (label, wm_class) only — the broad label-only and
+                // wm_class-only fallbacks are intentionally NOT run here, so
+                // periodic polls can no longer drift untagged windows. (The
+                // startup `restore_groups` path still has them for
+                // back-compat.) Members that carry their own id are skipped:
+                // they are owned by Tier 0 above.
+                // Tier 0a — tmux session match against ghost recipes.
+                let tmux_pos = if can_recipe_match {
+                    group.members.iter().position(|m| {
+                        m.live_wid.is_none()
+                            && m.id.is_none()
+                            && m.recipe
+                                .as_ref()
+                                .and_then(|r| r.tmux.as_ref())
+                                .map(|t| Some(t.session_name.as_str()) == session.as_deref())
+                                .unwrap_or(false)
+                    })
+                } else {
+                    None
                 };
-                group.members.iter().position(|m| {
-                    m.live_wid.is_none()
-                        && m.recipe.as_ref().and_then(|r| r.pid_at_save) == Some(p)
-                        && (m.label == label || m.wm_class == wm_class)
-                })
+                // Tier 0b — pid match + label/wm_class corroborator.
+                let pid_pos = || {
+                    if !can_recipe_match {
+                        return None;
+                    }
+                    let p = match item_pid {
+                        Some(p) => p,
+                        None => return None,
+                    };
+                    group.members.iter().position(|m| {
+                        m.live_wid.is_none()
+                            && m.id.is_none()
+                            && m.recipe.as_ref().and_then(|r| r.pid_at_save) == Some(p)
+                            && (m.label == label || m.wm_class == wm_class)
+                    })
+                };
+                // Tier 1 — exact (label, wm_class).
+                let exact_pos = || {
+                    group.members.iter().position(|m| {
+                        m.live_wid.is_none()
+                            && m.id.is_none()
+                            && m.label == label
+                            && m.wm_class == wm_class
+                    })
+                };
+                tmux_pos.or_else(pid_pos).or_else(exact_pos)
             };
-            // Phase 2c+2d tiers: exact → label → wm_class.
-            let exact_pos = || group.members.iter().position(|m| {
-                m.live_wid.is_none() && m.label == label && m.wm_class == wm_class
-            });
-            let label_only = || group.members.iter().position(|m| {
-                m.live_wid.is_none() && m.label == label
-            });
-            let class_only = || group.members.iter().position(|m| {
-                m.live_wid.is_none() && m.wm_class == wm_class
-            });
-            let pos = tmux_pos
-                .or_else(pid_pos)
-                .or_else(exact_pos)
-                .or_else(label_only)
-                .or_else(class_only);
             if let Some(p) = pos {
                 group.members[p].live_wid = Some(*wid);
                 if !group.members[p].custom_prefix.is_empty() {
@@ -3694,6 +3827,7 @@ fn sync_system_group_members(group: &mut Group, live_sessions: &[String]) {
                 custom_prefix: String::new(),
                 live_wid: None,
                 recipe: None,
+                id: None,
             });
         }
     }
@@ -3936,6 +4070,11 @@ struct PendingAttach {
     /// right-click — claim tier emits this so the new wid is added to
     /// the group on first sight.
     target_group_id: Option<u32>,
+    /// Persistent identity minted at spawn time. The claim tier stamps it
+    /// onto the new window's `_PTM_ID` and records it on the resulting
+    /// `GroupMember`, so the spawned window is drift-immune from birth.
+    /// `None` for spawns that predate this scheme / carry no identity.
+    ptm_id: Option<String>,
     queued_at: std::time::Instant,
 }
 
@@ -3952,26 +4091,28 @@ struct ClaimedWid {
     wid: u32,
     snap: bool,
     target_group_id: Option<u32>,
+    /// Identity to stamp on this wid's `_PTM_ID` (carried from the
+    /// consumed `PendingAttach`). `None` when the spawn carried no id.
+    ptm_id: Option<String>,
 }
 
 /// Queue a tmux-attach intent so `bind_sessions` can bind it to the next
 /// new wid. Thin wrapper around `queue_pending_attach_with_group` for
 /// existing call sites that only carry a session name.
-fn queue_pending_attach(app: &mut App, session_name: &str) {
-    queue_pending_attach_with_group(app, Some(session_name), None);
-}
-
-/// Queue a pending attach with optional session and optional target
-/// group. `session_name.is_some()` triggers snap-to-sidebar on the
-/// claimed wid; `target_group_id.is_some()` triggers `add_to_group`.
+/// Queue a pending attach with optional session, target group, and
+/// persistent id. `session_name.is_some()` triggers snap-to-sidebar on the
+/// claimed wid; `target_group_id.is_some()` triggers `add_to_group`;
+/// `ptm_id.is_some()` is stamped onto the new window's `_PTM_ID`.
 fn queue_pending_attach_with_group(
     app: &mut App,
     session_name: Option<&str>,
     target_group_id: Option<u32>,
+    ptm_id: Option<String>,
 ) {
     app.pending_attaches.push(PendingAttach {
         session_name: session_name.map(str::to_string),
         target_group_id,
+        ptm_id,
         queued_at: std::time::Instant::now(),
     });
 }
@@ -4038,10 +4179,14 @@ fn bind_sessions(
         if let Some(name) = attach.session_name {
             item.session = Some(name);
         }
+        if attach.ptm_id.is_some() {
+            item.ptm_id = attach.ptm_id.clone();
+        }
         claimed.push(ClaimedWid {
             wid: item.wid,
             snap,
             target_group_id: attach.target_group_id,
+            ptm_id: attach.ptm_id,
         });
     }
 
@@ -4419,6 +4564,26 @@ fn query_tmux_pane(session_name: &str) -> Option<(String, u32)> {
         return None;
     }
     parse_tmux_pane_query(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Read the `@ptm_id` user option off a tmux session, if PTM tagged it at
+/// creation. Used as the backstop for the "session reattached in a terminal
+/// PTM didn't spawn" case: the new window has no `_PTM_ID`, but the session
+/// still carries the identity, so we can re-stamp the window from it.
+fn tmux_get_session_id(session_name: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["show-options", "-v", "-t", session_name, "@ptm_id"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Path the SIGUSR1 dump writes to. `$XDG_CACHE_HOME/ptm/recipes-snapshot.md`
@@ -5110,7 +5275,11 @@ fn spawn_attach_terminal(session_name: &str) -> Option<std::process::Child> {
 /// return the assigned name. `tmux new-session -d -P -F '#{session_name}'`
 /// prints the assigned name on stdout. Caller is responsible for any
 /// follow-up (pending_spawn registration, then `spawn_attach_terminal`).
-fn create_new_tmux_session() -> Option<String> {
+/// Create a fresh detached tmux session and tag it with a persistent
+/// `@ptm_id`. Returns `(session_name, ptm_id)`. The id is mirrored onto
+/// the attaching window (via the pending attach) and the saved member, so
+/// the session is drift-immune across detach/reattach and PTM restart.
+fn create_new_tmux_session() -> Option<(String, String)> {
     let out = std::process::Command::new("tmux")
         .args(["new-session", "-d", "-P", "-F", "#{session_name}"])
         .output()
@@ -5119,7 +5288,24 @@ fn create_new_tmux_session() -> Option<String> {
         return None;
     }
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        return None;
+    }
+    let id = new_ptm_uuid();
+    tmux_set_session_id(&name, &id);
+    Some((name, id))
+}
+
+/// Return an existing session's `@ptm_id`, or mint and tag a fresh one.
+/// Used when PTM attaches to a session it didn't create (the menu
+/// `Attach session` action) so that session also gains a stable identity.
+fn ensure_session_ptm_id(session: &str) -> String {
+    if let Some(id) = tmux_get_session_id(session) {
+        return id;
+    }
+    let id = new_ptm_uuid();
+    tmux_set_session_id(session, &id);
+    id
 }
 
 // ── Property-change classification (pure, testable) ──
@@ -6324,6 +6510,11 @@ struct MenuActionResult {
     /// TmuxSystem group should surface promptly (caller pokes the event
     /// loop, same as the top `+ New tmux` button does).
     wake: bool,
+    /// Set to the wid that was just placed into a Normal group by an
+    /// explicit user action (`Add to group` / `Create group`). The caller
+    /// stamps it with a persistent `_PTM_ID` (this fn is kept X11-free for
+    /// tests, so the stamp itself happens at the call site).
+    stamp_wid: Option<u32>,
 }
 
 fn execute_menu_action(
@@ -6339,6 +6530,7 @@ fn execute_menu_action(
         MenuAction::CreateGroup => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
                 let wid = *wid;
+                result.stamp_wid = Some(wid);
                 let gid = app.create_group(wid);
                 // Drop straight into rename so a single keystroke replaces
                 // the default "Group N" name; Enter accepts the default.
@@ -6347,7 +6539,9 @@ fn execute_menu_action(
         }
         MenuAction::AddToGroup(gid) => {
             if let DisplayRow::Window { wid, .. } = &app.display_rows[target_row] {
-                app.add_to_group(gid, *wid);
+                let wid = *wid;
+                result.stamp_wid = Some(wid);
+                app.add_to_group(gid, wid);
             }
         }
         MenuAction::RemoveFromGroup => {
@@ -6374,7 +6568,8 @@ fn execute_menu_action(
             if let DisplayRow::Session { name, .. } = &app.display_rows[target_row] {
                 let name_owned = name.clone();
                 let argv = argv_for_attach_terminal(&name_owned);
-                queue_pending_attach(app, &name_owned);
+                let id = ensure_session_ptm_id(&name_owned);
+                queue_pending_attach_with_group(app, Some(&name_owned), None, Some(id));
                 if let Some(child) = spawn_attach_terminal(&name_owned) {
                     record_spawned_child(app, &argv, child);
                 }
@@ -6411,7 +6606,7 @@ fn execute_menu_action(
             // snap) but queues a target_group_id so refresh_items adds
             // the spawned wid to the chosen group on first sight.
             let argv = argv_for_default_terminal();
-            queue_pending_attach_with_group(app, None, Some(gid));
+            queue_pending_attach_with_group(app, None, Some(gid), Some(new_ptm_uuid()));
             if let Some(child) = spawn_default_terminal() {
                 record_spawned_child(app, &argv, child);
             }
@@ -6422,9 +6617,9 @@ fn execute_menu_action(
             // then ask the event loop to poke itself so the auto
             // TmuxSystem group surfaces the new session promptly rather
             // than waiting for the next 5 s tmux poll.
-            if let Some(name) = create_new_tmux_session() {
+            if let Some((name, id)) = create_new_tmux_session() {
                 let argv = argv_for_attach_terminal(&name);
-                queue_pending_attach_with_group(app, Some(&name), Some(gid));
+                queue_pending_attach_with_group(app, Some(&name), Some(gid), Some(id));
                 if let Some(child) = spawn_attach_terminal(&name) {
                     record_spawned_child(app, &argv, child);
                 }
@@ -7319,6 +7514,10 @@ struct SavedMember {
     /// `None` when the file is v1 or the member had no captured recipe at
     /// save time. Phase 5c uses this for the recipe-tier match cascade.
     recipe: Option<LaunchRecipe>,
+    /// Persistent `_PTM_ID` identity, loaded from the v2 file's `PTMID`
+    /// line. `None` for legacy members saved before this scheme. Drives the
+    /// exclusive Tier-0 match in `match_saved_member`.
+    id: Option<String>,
 }
 
 struct SavedGroup {
@@ -7410,6 +7609,7 @@ fn extract_saved_state(
                             wm_class: m.wm_class.clone(),
                             custom_prefix: m.custom_prefix.clone(),
                             recipe,
+                            id: m.id.clone(),
                         }
                     })
                     .collect();
@@ -7481,6 +7681,12 @@ fn save_groups_to(path: &std::path::Path, groups: &[SavedGroup]) {
                 "MEMBER\t{}\t{}\t{}\n",
                 member.label, member.wm_class, member.custom_prefix
             ));
+            // PTMID carries the persistent identity. Percent-encoded and
+            // emitted right after MEMBER. Older PTM (and the v2 reader's
+            // unknown-line skip) ignore it; on load it drives Tier-0 match.
+            if let Some(id) = &member.id {
+                buf.push_str(&format!("PTMID\t{}\n", percent_encode_field(id)));
+            }
             if let Some(recipe) = &member.recipe {
                 emit_layer1_line(&mut buf, recipe);
                 if let Some(tmux) = &recipe.tmux {
@@ -7590,6 +7796,7 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
     // Per-member layer-line presence flags, reset each MEMBER. A second
     // LAYER1/TMUX/LAYER2 for the same member rejects the load (invariant:
     // at most one of each per member).
+    let mut has_member_id = false;
     let mut has_layer1 = false;
     let mut has_tmux = false;
     let mut has_layer2 = false;
@@ -7620,6 +7827,7 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     kind,
                     members: Vec::new(),
                 });
+                has_member_id = false;
                 has_layer1 = false;
                 has_tmux = false;
                 has_layer2 = false;
@@ -7636,15 +7844,28 @@ fn load_groups_from(path: &std::path::Path) -> Option<Vec<SavedGroup>> {
                     wm_class: parts[2].to_string(),
                     custom_prefix: parts[3].to_string(),
                     recipe: None,
+                    id: None,
                 });
+                has_member_id = false;
                 has_layer1 = false;
                 has_tmux = false;
                 has_layer2 = false;
             }
-            Some(&"LAYER1") | Some(&"TMUX") | Some(&"LAYER2") if !is_v2 => {
-                // v1 files must never carry layer lines; if they do, the
+            Some(&"PTMID") | Some(&"LAYER1") | Some(&"TMUX") | Some(&"LAYER2") if !is_v2 => {
+                // v1 files must never carry PTMID/layer lines; if they do, the
                 // file is malformed.
                 return None;
+            }
+            Some(&"PTMID") => {
+                if has_member_id {
+                    return None;
+                }
+                if parts.len() != 2 {
+                    return None;
+                }
+                let member = current_member_mut(&mut groups)?;
+                member.id = Some(percent_decode_field(parts[1])?);
+                has_member_id = true;
             }
             Some(&"LAYER1") => {
                 if has_layer1 {
@@ -7826,6 +8047,10 @@ struct AvailableItem {
     session: Option<String>,
     pid: Option<u32>,
     wid: u32,
+    /// `_PTM_ID` read off this live window, if any. Drives the exclusive
+    /// Tier-0 match and the "ID-bearing windows are never fuzzy-grabbed"
+    /// guard in the lower tiers.
+    ptm_id: Option<String>,
 }
 
 /// Five-tier matching cascade for one saved member against the available
@@ -7856,12 +8081,31 @@ fn match_saved_member(
 ) -> Option<u32> {
     let can_recipe_match = matches!(group_kind, GroupKind::Normal);
 
+    // Tier 0 — Persistent `_PTM_ID` match. EXCLUSIVE and authoritative:
+    // if this member carries an id, it binds ONLY to the live window with
+    // the same id, and NEVER falls through to the fuzzy tiers below. This
+    // is what stops drift — a stamped tmux/terminal can't be re-homed by a
+    // same-wm_class ghost in another group. Applies to all group kinds.
+    if let Some(sid) = &sm.id {
+        return available
+            .iter()
+            .find(|it| !claimed.contains(&it.wid) && it.ptm_id.as_deref() == Some(sid.as_str()))
+            .map(|it| it.wid);
+    }
+
+    // Legacy member (no id). The tiers below match by tmux session / pid /
+    // label / wm_class, but must NEVER grab a window that already carries a
+    // `_PTM_ID` — such a window belongs to its own id'd member and is
+    // matched exclusively by Tier 0 above. Skipping id-bearing windows here
+    // keeps the broad fallbacks from stealing a stamped window.
+
     // Tier 0a — Tmux session match.
     if can_recipe_match {
         if let Some(recipe) = &sm.recipe {
             if let Some(tmux) = &recipe.tmux {
                 if let Some(it) = available.iter().find(|it| {
                     !claimed.contains(&it.wid)
+                        && it.ptm_id.is_none()
                         && it.session.as_deref() == Some(tmux.session_name.as_str())
                 }) {
                     return Some(it.wid);
@@ -7876,6 +8120,7 @@ fn match_saved_member(
             if let Some(saved_pid) = recipe.pid_at_save {
                 if let Some(it) = available.iter().find(|it| {
                     !claimed.contains(&it.wid)
+                        && it.ptm_id.is_none()
                         && it.pid == Some(saved_pid)
                         && (it.label == sm.label || it.wm_class == sm.wm_class)
                 }) {
@@ -7887,7 +8132,10 @@ fn match_saved_member(
 
     // Tier 1 — Exact (label, wm_class).
     if let Some(it) = available.iter().find(|it| {
-        !claimed.contains(&it.wid) && it.label == sm.label && it.wm_class == sm.wm_class
+        !claimed.contains(&it.wid)
+            && it.ptm_id.is_none()
+            && it.label == sm.label
+            && it.wm_class == sm.wm_class
     }) {
         return Some(it.wid);
     }
@@ -7895,7 +8143,7 @@ fn match_saved_member(
     // Tier 2 — Label-only.
     if let Some(it) = available
         .iter()
-        .find(|it| !claimed.contains(&it.wid) && it.label == sm.label)
+        .find(|it| !claimed.contains(&it.wid) && it.ptm_id.is_none() && it.label == sm.label)
     {
         return Some(it.wid);
     }
@@ -7903,7 +8151,7 @@ fn match_saved_member(
     // Tier 3 — wm_class-only.
     if let Some(it) = available
         .iter()
-        .find(|it| !claimed.contains(&it.wid) && it.wm_class == sm.wm_class)
+        .find(|it| !claimed.contains(&it.wid) && it.ptm_id.is_none() && it.wm_class == sm.wm_class)
     {
         return Some(it.wid);
     }
@@ -7924,6 +8172,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
             session: item.session.clone(),
             pid: item.pid,
             wid: item.wid,
+            ptm_id: item.ptm_id.clone(),
         })
         .collect();
     let mut claimed: HashSet<u32> = HashSet::new();
@@ -7971,6 +8220,7 @@ fn restore_groups(app: &mut App, saved: &[SavedGroup]) {
                 custom_prefix: sm.custom_prefix.clone(),
                 live_wid,
                 recipe: sm.recipe.clone(),
+                id: sm.id.clone(),
             });
         }
 
@@ -8767,6 +9017,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             close_context_menu(&conn, &mut app)?;
                             let follow_up =
                                 execute_menu_action(&mut app, action, target_row);
+                            if let Some(wid) = follow_up.stamp_wid {
+                                stamp_grouped_wid(&conn, &atoms, &mut app, wid);
+                            }
                             if let Some(req) = follow_up.confirm {
                                 open_confirm_popup(
                                     &conn,
@@ -9143,9 +9396,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 TopButton::NewTmux => {
-                                    if let Some(name) = create_new_tmux_session() {
+                                    if let Some((name, id)) = create_new_tmux_session() {
                                         let argv = argv_for_attach_terminal(&name);
-                                        queue_pending_attach(&mut app, &name);
+                                        queue_pending_attach_with_group(
+                                            &mut app,
+                                            Some(&name),
+                                            None,
+                                            Some(id),
+                                        );
                                         if let Some(child) = spawn_attach_terminal(&name) {
                                             record_spawned_child(&mut app, &argv, child);
                                         }
@@ -9303,6 +9561,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// If `wid` is now a live member of a Normal group and that member has no
+/// persistent id yet, mint one and stamp it onto the window (`_PTM_ID`),
+/// the live item, and the member. Called after an explicit user action
+/// (drag-in, "Add to group") so a manually-grouped window becomes
+/// drift-immune just like a PTM-spawned one. No-op for windows that
+/// already carry an id, or that didn't land in a Normal group.
+fn stamp_grouped_wid(conn: &impl Connection, atoms: &Atoms, app: &mut App, wid: u32) {
+    let needs = app.groups.iter().any(|g| {
+        matches!(g.kind, GroupKind::Normal)
+            && g.members
+                .iter()
+                .any(|m| m.live_wid == Some(wid) && m.id.is_none())
+    });
+    if !needs {
+        return;
+    }
+    // Reuse an id the window may already carry (e.g. a tmux window that
+    // inherited `@ptm_id`); otherwise mint a fresh one.
+    let id = app
+        .items
+        .iter()
+        .find(|i| i.wid == wid)
+        .and_then(|i| i.ptm_id.clone())
+        .unwrap_or_else(new_ptm_uuid);
+    set_window_ptm_id(conn, wid, atoms, &id);
+    if let Some(item) = app.items.iter_mut().find(|i| i.wid == wid) {
+        item.ptm_id = Some(id.clone());
+    }
+    for group in app.groups.iter_mut() {
+        if !matches!(group.kind, GroupKind::Normal) {
+            continue;
+        }
+        for m in group.members.iter_mut() {
+            if m.live_wid == Some(wid) && m.id.is_none() {
+                m.id = Some(id.clone());
+            }
+        }
+    }
+}
+
 fn handle_release(
     conn: &impl Connection,
     root: Window,
@@ -9311,7 +9609,14 @@ fn handle_release(
 ) -> Option<ConfirmRequest> {
     let drag = app.drag.take()?;
     if drag.started {
+        let dragged_wid = match app.display_rows.get(drag.source_row) {
+            Some(DisplayRow::Window { wid, .. }) => Some(*wid),
+            _ => None,
+        };
         app.handle_drop(drag.source_row, drag.current_y);
+        if let Some(wid) = dragged_wid {
+            stamp_grouped_wid(conn, atoms, app, wid);
+        }
         return None;
     }
     // Click (no drag)
@@ -9352,7 +9657,8 @@ fn handle_release(
             }
             let name_for_kind = name.clone();
             let argv = argv_for_attach_terminal(&name_for_kind);
-            queue_pending_attach(app, &name_for_kind);
+            let id = ensure_session_ptm_id(&name_for_kind);
+            queue_pending_attach_with_group(app, Some(&name_for_kind), None, Some(id));
             if let Some(child) = spawn_attach_terminal(&name_for_kind) {
                 record_spawned_child(app, &argv, child);
             }
@@ -9380,6 +9686,7 @@ mod tests {
             custom_prefix: String::new(),
             session: None,
             pid: None,
+            ptm_id: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -10056,6 +10363,7 @@ mod tests {
             custom_prefix: String::new(),
             session: None,
             pid: None,
+            ptm_id: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
     }
@@ -10078,12 +10386,14 @@ mod tests {
                         wm_class: "Navigator".to_string(),
                         custom_prefix: "FF".to_string(),
                         recipe: None,
+                        id: None,
                     },
                     SavedMember {
                         label: "Chrome".to_string(),
                         wm_class: "google-chrome".to_string(),
                         custom_prefix: String::new(),
                         recipe: None,
+                        id: None,
                     },
                 ],
             },
@@ -10096,6 +10406,7 @@ mod tests {
                     wm_class: "gnome-terminal-server".to_string(),
                     custom_prefix: "Dev".to_string(),
                     recipe: None,
+                    id: None,
                 }],
             },
         ];
@@ -10200,6 +10511,7 @@ mod tests {
                 wm_class: "Navigator".to_string(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
 
@@ -10231,18 +10543,21 @@ mod tests {
                     wm_class: "Navigator".to_string(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
                 SavedMember {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal".to_string(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
                 SavedMember {
                     label: "Code".to_string(),
                     wm_class: "code".to_string(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
             ],
         }];
@@ -10273,6 +10588,7 @@ mod tests {
                 wm_class: "gnome-terminal".to_string(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
 
@@ -10306,6 +10622,7 @@ mod tests {
                     custom_prefix: "".into(),
                     live_wid: Some(11),
                     recipe: None,
+                    id: None,
                 },
                 GroupMember {
                     label: "B".into(),
@@ -10313,6 +10630,7 @@ mod tests {
                     custom_prefix: "".into(),
                     live_wid: None,
                     recipe: None,
+                    id: None,
                 },
                 GroupMember {
                     label: "C".into(),
@@ -10320,6 +10638,7 @@ mod tests {
                     custom_prefix: "".into(),
                     live_wid: Some(33),
                     recipe: None,
+                    id: None,
                 },
             ],
         };
@@ -10344,12 +10663,14 @@ mod tests {
                     wm_class: "Navigator".into(),
                     custom_prefix: "FF".into(),
                     recipe: None,
+                    id: None,
                 },
                 SavedMember {
                     label: "Slack".into(),
                     wm_class: "Slack".into(),
                     custom_prefix: "Chat".into(),
                     recipe: None,
+                    id: None,
                 },
             ],
         }];
@@ -10384,6 +10705,7 @@ mod tests {
                 wm_class: "Gnome-terminal".into(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10412,6 +10734,7 @@ mod tests {
                 wm_class: "Gnome-terminal".into(), // not Firefox
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10442,12 +10765,14 @@ mod tests {
                     wm_class: "Gnome-terminal".into(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
                 SavedMember {
                     label: "UAT-window-A".into(),
                     wm_class: "Gnome-terminal".into(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
             ],
         }];
@@ -10493,6 +10818,7 @@ mod tests {
                 wm_class: "Gnome-terminal".into(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10529,6 +10855,7 @@ mod tests {
                 custom_prefix: String::new(),
                 live_wid: None, // ghost
                 recipe: None,
+                id: None,
             }],
         });
         app.display_order.push(DisplaySlot::Group(gid));
@@ -10555,6 +10882,7 @@ mod tests {
                 wm_class: "xterm".to_string(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
 
@@ -10580,12 +10908,14 @@ mod tests {
                     wm_class: "Navigator".to_string(),
                     custom_prefix: "Browser".to_string(),
                     recipe: None,
+                    id: None,
                 },
                 SavedMember {
                     label: "Terminal".to_string(),
                     wm_class: "gnome-terminal".to_string(),
                     custom_prefix: String::new(),
                     recipe: None,
+                    id: None,
                 },
             ],
         }];
@@ -10612,6 +10942,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            id: None,
         }
     }
 
@@ -10624,6 +10955,7 @@ mod tests {
                 pid_at_save: Some(pid),
                 ..Default::default()
             }),
+            id: None,
         }
     }
 
@@ -10643,8 +10975,137 @@ mod tests {
             custom_prefix: "".into(),
             session: session.map(String::from),
             pid,
+            ptm_id: None,
         });
         app.display_order.push(super::DisplaySlot::Window(wid));
+    }
+
+    /// Push a live item carrying a `_PTM_ID` (`ptm_id`).
+    fn add_item_with_ptm_id(app: &mut App, wid: u32, label: &str, wm_class: &str, ptm_id: &str) {
+        app.items.push(super::Item {
+            wid,
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            accent_pixel: 0,
+            custom_prefix: "".into(),
+            session: None,
+            pid: None,
+            ptm_id: Some(ptm_id.to_string()),
+        });
+        app.display_order.push(super::DisplaySlot::Window(wid));
+    }
+
+    /// Build a one-element `AvailableItem` slice helper for direct
+    /// `match_saved_member` tests.
+    fn avail(wid: u32, label: &str, wm_class: &str, ptm_id: Option<&str>) -> super::AvailableItem {
+        super::AvailableItem {
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            session: None,
+            pid: None,
+            wid,
+            ptm_id: ptm_id.map(String::from),
+        }
+    }
+
+    fn saved_member_with_id(label: &str, wm_class: &str, id: &str) -> SavedMember {
+        SavedMember {
+            label: label.to_string(),
+            wm_class: wm_class.to_string(),
+            custom_prefix: String::new(),
+            recipe: None,
+            id: Some(id.to_string()),
+        }
+    }
+
+    #[test]
+    fn match_tier0_id_exclusive_hit() {
+        // Member carries an id; the window with the same _PTM_ID matches,
+        // even though its label and wm_class differ from the member's.
+        let m = saved_member_with_id("saved-label", "saved-class", "uuid-1");
+        let avails = vec![avail(200, "drifted-title", "other-class", Some("uuid-1"))];
+        let claimed = std::collections::HashSet::new();
+        assert_eq!(
+            super::match_saved_member(&m, GroupKind::Normal, &avails, &claimed),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn match_tier0_id_never_falls_through() {
+        // Member carries an id but NO live window has it. Even though a
+        // window matches the member's label AND wm_class exactly, the
+        // exclusive id tier must return None rather than fuzzy-grab it.
+        let m = saved_member_with_id("same-label", "same-class", "uuid-missing");
+        let avails = vec![avail(200, "same-label", "same-class", None)];
+        let claimed = std::collections::HashSet::new();
+        assert_eq!(
+            super::match_saved_member(&m, GroupKind::Normal, &avails, &claimed),
+            None
+        );
+    }
+
+    #[test]
+    fn match_legacy_member_never_grabs_id_bearing_window() {
+        // Legacy member (id None) would match by wm_class-only, but the only
+        // candidate carries a _PTM_ID belonging to some other id'd member —
+        // it must be skipped so it can't be stolen into the wrong group.
+        let m = SavedMember {
+            label: "x".into(),
+            wm_class: "term".into(),
+            custom_prefix: String::new(),
+            recipe: None,
+            id: None,
+        };
+        let avails = vec![avail(200, "totally-different", "term", Some("uuid-owned"))];
+        let claimed = std::collections::HashSet::new();
+        assert_eq!(
+            super::match_saved_member(&m, GroupKind::Normal, &avails, &claimed),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_groups_tier0_id_keeps_same_wmclass_windows_in_their_own_groups() {
+        // The drift scenario: two Normal groups, identical wm_class members,
+        // distinguished only by id. Each window must land in its own group —
+        // wm_class-only can no longer cross-bind them.
+        let mut app = make_app();
+        add_item_with_ptm_id(&mut app, 100, "term", "XTerm", "uuid-A");
+        add_item_with_ptm_id(&mut app, 200, "term", "XTerm", "uuid-B");
+        let saved = vec![
+            SavedGroup {
+                name: "A".into(),
+                collapsed: false,
+                kind: GroupKind::Normal,
+                members: vec![saved_member_with_id("term", "XTerm", "uuid-A")],
+            },
+            SavedGroup {
+                name: "B".into(),
+                collapsed: false,
+                kind: GroupKind::Normal,
+                members: vec![saved_member_with_id("term", "XTerm", "uuid-B")],
+            },
+        ];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, Some(100));
+        assert_eq!(app.groups[1].members[0].live_wid, Some(200));
+    }
+
+    #[test]
+    fn restore_groups_tier0_id_ghosts_when_window_absent() {
+        // An id'd member whose window isn't up stays a ghost (no fuzzy
+        // fallback to the same-wm_class window that IS up).
+        let mut app = make_app();
+        add_item_with_ptm_id(&mut app, 100, "term", "XTerm", "uuid-present");
+        let saved = vec![SavedGroup {
+            name: "A".into(),
+            collapsed: false,
+            kind: GroupKind::Normal,
+            members: vec![saved_member_with_id("term", "XTerm", "uuid-absent")],
+        }];
+        restore_groups(&mut app, &saved);
+        assert_eq!(app.groups[0].members[0].live_wid, None);
     }
 
     #[test]
@@ -10685,6 +11146,7 @@ mod tests {
                     pid_at_save: Some(90468),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10708,6 +11170,7 @@ mod tests {
                     pid_at_save: Some(90468),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10745,6 +11208,7 @@ mod tests {
                 wm_class: "Navigator".into(),
                 custom_prefix: "".into(),
                 recipe: None,
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10788,6 +11252,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app2, &saved2);
@@ -10835,6 +11300,7 @@ mod tests {
                     wm_class: "term".into(),
                     custom_prefix: "".into(),
                     recipe: None,
+                    id: None,
                 },
             ],
         }];
@@ -10892,6 +11358,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10935,6 +11402,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -10967,6 +11435,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -11001,6 +11470,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -11037,6 +11507,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                id: None,
             }],
         }];
         restore_groups(&mut app, &saved);
@@ -11374,6 +11845,7 @@ mod tests {
             custom_prefix: String::new(),
             session: session.map(String::from),
             pid,
+            ptm_id: None,
         }
     }
 
@@ -11386,6 +11858,7 @@ mod tests {
             session_name: Some(session.to_string()),
             target_group_id: None,
             queued_at: now,
+            ptm_id: None,
         }
     }
 
@@ -11401,6 +11874,7 @@ mod tests {
             session_name: session.map(str::to_string),
             target_group_id,
             queued_at: now,
+            ptm_id: None,
         }
     }
 
@@ -11457,6 +11931,7 @@ mod tests {
                 wid: 200,
                 snap: true,
                 target_group_id: None,
+                ptm_id: None,
             }],
             "claimed wid is returned for snap with snap=true (had session)"
         );
@@ -11712,6 +12187,7 @@ mod tests {
                 wid: 200,
                 snap: true,
                 target_group_id: Some(7),
+                ptm_id: None,
             }],
             "claim must forward both snap=true and target_group_id"
         );
@@ -11755,6 +12231,7 @@ mod tests {
                 wid: 300,
                 snap: true,
                 target_group_id: Some(7),
+                ptm_id: None,
             }],
             "group-anchored claim must snap (anchor = group slot) and forward target_group_id"
         );
@@ -11806,16 +12283,19 @@ mod tests {
                     // group anchor signals deliberate placement.
                     snap: true,
                     target_group_id: Some(11),
+                    ptm_id: None,
                 },
                 super::ClaimedWid {
                     wid: 402,
                     snap: true,
                     target_group_id: Some(22),
+                    ptm_id: None,
                 },
                 super::ClaimedWid {
                     wid: 403,
                     snap: true,
                     target_group_id: None,
+                    ptm_id: None,
                 },
             ],
             "FIFO must hand each wid the head-of-queue attach with matching flags"
@@ -12418,6 +12898,7 @@ mod tests {
             custom_prefix: String::new(),
             live_wid: None,
             recipe: None,
+            id: None,
         });
         app.build_display_rows();
     }
@@ -13458,6 +13939,7 @@ mod tests {
                 wm_class: "FooClass".to_string(),
                 custom_prefix: String::new(),
                 recipe: None,
+                id: None,
             }],
         }];
         super::restore_groups(&mut app, &saved);
@@ -13600,6 +14082,7 @@ mod tests {
             custom_prefix: String::new(),
             session: Some(session.to_string()),
             pid: None,
+            ptm_id: None,
         });
         app.display_order.push(DisplaySlot::Window(wid));
         app.build_display_rows();
@@ -14067,6 +14550,7 @@ mod tests {
                     tmux: None,
                     workload: super::WorkloadCapture::Idle,
                 }),
+                id: None,
             }],
         }];
         super::save_groups_to(&path, &saved);
@@ -14100,6 +14584,7 @@ mod tests {
                     tmux: None,
                     workload: super::WorkloadCapture::Idle,
                 }),
+                id: None,
             }],
         }];
         super::save_groups_to(&path, &saved);
@@ -14135,6 +14620,7 @@ mod tests {
                     }),
                     workload: super::WorkloadCapture::Idle,
                 }),
+                id: None,
             }],
         }];
         super::save_groups_to(&path, &saved);
@@ -14176,6 +14662,7 @@ mod tests {
                         cwd: Some("/home/steve/dev/process-tab-manager".to_string()),
                     },
                 }),
+                id: None,
             }],
         }];
 
@@ -14189,6 +14676,89 @@ mod tests {
         assert_eq!(first, second, "save→load→save must be byte-identical");
         // Spot-check structural correctness
         assert_eq!(loaded[0].members[0].recipe.as_ref().unwrap().pid_at_save, Some(90468));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_load_preserves_ptm_id() {
+        let dir = std::env::temp_dir().join("ptm_test_ptmid_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        let original = vec![SavedGroup {
+            name: "G".into(),
+            collapsed: false,
+            kind: super::GroupKind::Normal,
+            members: vec![SavedMember {
+                label: "term".into(),
+                wm_class: "XTerm".into(),
+                custom_prefix: "".into(),
+                recipe: None,
+                id: Some("abc-123-def".into()),
+            }],
+        }];
+        super::save_groups_to(&path, &original);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("PTMID\tabc-123-def\n"), "PTMID line emitted: {raw}");
+        let loaded = super::load_groups_from(&path).expect("loads back");
+        assert_eq!(loaded[0].members[0].id.as_deref(), Some("abc-123-def"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_v1_member_has_none_id() {
+        let dir = std::env::temp_dir().join("ptm_test_v1_none_id");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(&path, "v1\nGROUP\tWork\t0\nMEMBER\tA\tcls\t\n").unwrap();
+        let loaded = super::load_groups_from(&path).expect("v1 loads");
+        assert_eq!(loaded[0].members[0].id, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_v1_with_ptmid_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_v1_ptmid_reject");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(&path, "v1\nGROUP\tWork\t0\nMEMBER\tA\tcls\t\nPTMID\tx\n").unwrap();
+        assert!(super::load_groups_from(&path).is_none(), "v1 PTMID must reject");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_v2_duplicate_ptmid_rejects() {
+        let dir = std::env::temp_dir().join("ptm_test_dup_ptmid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(
+            &path,
+            "v2\nGROUP\tWork\t0\tnormal\nMEMBER\tA\tcls\t\nPTMID\tx\nPTMID\ty\n",
+        )
+        .unwrap();
+        assert!(
+            super::load_groups_from(&path).is_none(),
+            "duplicate PTMID for one member must reject"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_v2_skips_unknown_future_line() {
+        let dir = std::env::temp_dir().join("ptm_test_unknown_line");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups");
+        std::fs::write(
+            &path,
+            "v2\nGROUP\tWork\t0\tnormal\nMEMBER\tA\tcls\t\nPTMID\tx\nV3FUTURE\tblah\tblah\n",
+        )
+        .unwrap();
+        let loaded = super::load_groups_from(&path).expect("unknown v2 line is skipped");
+        assert_eq!(loaded[0].members[0].id.as_deref(), Some("x"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14217,6 +14787,7 @@ mod tests {
                         reason: "no _NET_WM_PID".to_string(),
                     },
                 }),
+                id: None,
             }],
         }];
         super::save_groups_to(&path, &saved);
@@ -14253,6 +14824,7 @@ mod tests {
                     tmux: None,
                     workload: super::WorkloadCapture::Idle,
                 }),
+                id: None,
             }],
         });
         app.display_order.push(super::DisplaySlot::Group(gid));
@@ -14276,6 +14848,7 @@ mod tests {
             custom_prefix: "".into(),
             session: None,
             pid: Some(100),
+            ptm_id: None,
         });
         let gid = app.next_group_id;
         app.next_group_id += 1;
@@ -14293,6 +14866,7 @@ mod tests {
                     exe: Some("/stale/exe".to_string()),
                     ..Default::default()
                 }),
+                id: None,
             }],
         });
         app.display_order.push(super::DisplaySlot::Group(gid));
@@ -14343,6 +14917,7 @@ mod tests {
                 custom_prefix: String::new(),
                 live_wid: None,
                 recipe: None,
+                id: None,
             })
             .collect();
         app.groups.push(super::Group {
@@ -14391,6 +14966,7 @@ mod tests {
                     custom_prefix: String::new(),
                     live_wid: None,
                     recipe: None,
+                    id: None,
                 },
                 super::GroupMember {
                     label: "b".into(),
@@ -14398,6 +14974,7 @@ mod tests {
                     custom_prefix: String::new(),
                     live_wid: None,
                     recipe: None,
+                    id: None,
                 },
             ],
         };
@@ -14420,6 +14997,7 @@ mod tests {
                     custom_prefix: String::new(),
                     live_wid: None,
                     recipe: None,
+                    id: None,
                 },
                 super::GroupMember {
                     label: "b".into(),
@@ -14427,6 +15005,7 @@ mod tests {
                     custom_prefix: String::new(),
                     live_wid: None,
                     recipe: None,
+                    id: None,
                 },
             ],
         };
@@ -15849,6 +16428,7 @@ mod tests {
             custom_prefix: String::new(),
             session: None,
             pid: Some(100),
+            ptm_id: None,
         });
         app.items.push(super::Item {
             wid: 20,
@@ -15858,6 +16438,7 @@ mod tests {
             custom_prefix: String::new(),
             session: None,
             pid: Some(200),
+            ptm_id: None,
         });
         app.items.push(super::Item {
             wid: 30,
@@ -15867,6 +16448,7 @@ mod tests {
             custom_prefix: String::new(),
             session: None,
             pid: Some(300),
+            ptm_id: None,
         });
         // Make a group containing wid=30.
         app.groups.push(super::Group {
@@ -15880,6 +16462,7 @@ mod tests {
                 custom_prefix: String::new(),
                 live_wid: Some(30),
                 recipe: None,
+                id: None,
             }],
         });
         app.next_group_id = 1;

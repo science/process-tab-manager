@@ -149,3 +149,18 @@ fn new_terminal_in_group_snaps_to_sidebar_anchor() {
         out
     );
 }
+
+/// Persistent-identity scheme: clicking "+ New tmux" must stamp a matching
+/// `@ptm_id` tmux option on the session AND a `_PTM_ID` X11 property on the
+/// spawned window. This is the half of the anti-drift design that unit
+/// tests can't reach (real X server + real tmux server); the matching that
+/// consumes these ids is covered by the `restore_groups_tier0_*` unit tests.
+#[test]
+fn new_tmux_stamps_matching_ptm_id_on_session_and_window() {
+    let (ok, out) = run_e2e_script("ptm_id_stamped_on_spawn.sh");
+    assert!(
+        ok,
+        "'+ New tmux' should stamp a matching persistent id on the session and the window\n{}",
+        out
+    );
+}

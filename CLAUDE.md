@@ -102,8 +102,15 @@ If Cinnamon crashes or becomes unresponsive:
 
 ## Git Workflow
 
+This is a solo project with no web deployment and no GitHub Actions, so the
+workflow is deliberately lightweight: **work directly on `main`.**
+
+- **Work, commit, and push on `main`.** No feature branches or PRs needed — commit to
+  `main` locally and push `main` to `origin` directly. (This overrides the generic "branch
+  before committing on the default branch" guidance.)
 - **Local commits are encouraged.** Make intermediate commits freely to checkpoint progress.
-- **Never push to origin without asking the user first.**
+- **Pushing to origin is fine without asking** — it's just `main` on GitHub, nothing
+  deploys or runs from it.
 
 ## TDD Workflow
 

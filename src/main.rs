@@ -97,6 +97,14 @@ struct Atoms {
     /// refreshes, and even a PTM restart while the window lives. This is
     /// the anchor for the exclusive Tier-0 matching that stops group drift.
     ptm_id: Atom,
+    /// `_PTM_SESSION` — the `@ptm_id` uuid of the tmux session this window
+    /// is bound to, stamped whenever `item.session` is set. Distinct from
+    /// `_PTM_ID` (window identity, which can diverge from the session's
+    /// tag via stamp_grouped_wid). This is the rebind tier's anchor: it
+    /// lives on the X server, so the session binding survives WM restarts,
+    /// desktop switches, and PTM restarts — everything that wipes the
+    /// carry tier's one-refresh memory.
+    ptm_session: Atom,
 }
 
 impl Atoms {
@@ -118,6 +126,7 @@ impl Atoms {
         let c14 = conn.intern_atom(false, b"_PTM_SAVE_TICK")?;
         let c15 = conn.intern_atom(false, b"_PTM_DUMP_RECIPES")?;
         let c16 = conn.intern_atom(false, b"_PTM_ID")?;
+        let c17 = conn.intern_atom(false, b"_PTM_SESSION")?;
         Ok(Self {
             net_client_list: c0.reply()?.atom,
             net_active_window: c1.reply()?.atom,
@@ -136,6 +145,7 @@ impl Atoms {
             ptm_save_tick: c14.reply()?.atom,
             ptm_dump_recipes: c15.reply()?.atom,
             ptm_id: c16.reply()?.atom,
+            ptm_session: c17.reply()?.atom,
         })
     }
 }
@@ -3047,6 +3057,45 @@ fn set_window_ptm_id(conn: &impl Connection, wid: u32, atoms: &Atoms, id: &str) 
     let _ = conn.flush();
 }
 
+/// Read a window's `_PTM_SESSION` — the `@ptm_id` uuid of the tmux session
+/// it was last bound to. None for windows never session-bound. Stale values
+/// (dead sessions) are harmless: the rebind tier resolves against the live
+/// uuid map, so a stale uuid simply never matches.
+fn get_window_ptm_session(
+    conn: &impl Connection,
+    wid: u32,
+    atoms: &Atoms,
+) -> Option<String> {
+    let reply = conn
+        .get_property(false, wid, atoms.ptm_session, atoms.utf8_string, 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.value.is_empty() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&reply.value).into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Stamp `_PTM_SESSION` onto a window. Errors are swallowed: a failed
+/// stamp just means the binding falls back to the carry tier's
+/// one-refresh memory, which is the pre-existing behaviour.
+fn set_window_ptm_session(conn: &impl Connection, wid: u32, atoms: &Atoms, uuid: &str) {
+    let _ = conn.change_property8(
+        PropMode::REPLACE,
+        wid,
+        atoms.ptm_session,
+        atoms.utf8_string,
+        uuid.as_bytes(),
+    );
+    let _ = conn.flush();
+}
+
 /// Mint a fresh persistent identifier. Reads the kernel's UUID source
 /// (always present on Linux), so no external crate is needed. Falls back
 /// to a pid+nanos token on the vanishingly rare read failure so callers
@@ -3363,6 +3412,10 @@ fn refresh_items(
     // and refuse to guess, rather than silently attributing a tmux session
     // to whichever window happened to enumerate first.
     let mut pid_to_wid: HashMap<u32, Vec<u32>> = HashMap::new();
+    // `_PTM_SESSION` per window, read once per refresh. Feeds the rebind
+    // tier (recover bindings after WM/PTM restarts) and doubles as the
+    // write-suppression baseline for the stamp pass below.
+    let mut stamped_sessions: HashMap<u32, String> = HashMap::new();
 
     for wid in wids {
         if wid == app.our_wid {
@@ -3409,6 +3462,9 @@ fn refresh_items(
         }
 
         let ptm_id = get_window_ptm_id(conn, wid, atoms);
+        if let Some(uuid) = get_window_ptm_session(conn, wid, atoms) {
+            stamped_sessions.insert(wid, uuid);
+        }
 
         new_items.push(Item {
             wid,
@@ -3429,6 +3485,14 @@ fn refresh_items(
     //   3. bind_sessions' carry-over tier — drop bindings whose session died
     let live_sessions = list_tmux_sessions();
     update_session_origins(&mut app.session_origins, &live_sessions);
+    // Session-name → @ptm_id uuid map (tagged live sessions only), plus its
+    // inversion for the rebind tier. One extra tmux fork per refresh, in the
+    // established cost envelope (list-clients + list-sessions already fork).
+    let session_to_uuid = list_tmux_session_uuids();
+    let uuid_to_session: HashMap<String, String> = session_to_uuid
+        .iter()
+        .map(|(name, uuid)| (uuid.clone(), name.clone()))
+        .collect();
     let live_session_names: Vec<String> =
         live_sessions.iter().map(|(_, n, _)| n.clone()).collect();
     let live_session_set: HashSet<String> = live_session_names.iter().cloned().collect();
@@ -3475,8 +3539,8 @@ fn refresh_items(
         &mut app.pending_attaches,
         &prior_wids,
         &live_session_set,
-        &HashMap::new(),
-        &HashMap::new(),
+        &stamped_sessions,
+        &uuid_to_session,
         read_ppid,
         std::time::Instant::now(),
         PENDING_ATTACH_TIMEOUT,
@@ -3509,6 +3573,23 @@ fn refresh_items(
             set_window_ptm_id(conn, item.wid, atoms, &id);
             item.ptm_id = Some(id);
         }
+    }
+
+    // Stamp `_PTM_SESSION` on every session-bound window whose stamp is
+    // missing or stale, so the rebind tier can recover the binding after
+    // the next WM/PTM restart. Diff-suppressed against the values read
+    // above — steady state is zero writes and zero forks. The mint path
+    // (session with no @ptm_id, e.g. created outside PTM and bound via
+    // walk) tags the session first; ensure re-reads live so a tag that
+    // landed after our list snapshot can't be double-minted.
+    let (session_stamps, session_mints) =
+        plan_session_stamps(&new_items, &session_to_uuid, &stamped_sessions);
+    for (wid, uuid) in &session_stamps {
+        set_window_ptm_session(conn, *wid, atoms, uuid);
+    }
+    for (wid, session_name) in &session_mints {
+        let uuid = ensure_session_ptm_id(session_name);
+        set_window_ptm_session(conn, *wid, atoms, &uuid);
     }
 
     // FM-2 fix (Phase 2c): preserve members whose live wid disappeared as
@@ -4281,6 +4362,44 @@ fn bind_sessions(
     }
 
     claimed
+}
+
+/// Decide which `_PTM_SESSION` writes this refresh needs. Pure planning —
+/// the caller performs the X writes and any tmux forks.
+///
+/// Returns `(stamps, mints)`:
+/// - `stamps`: `(wid, uuid)` pairs whose bound session resolves to a uuid
+///   that differs from the window's current stamp (including "no stamp
+///   yet"). Diff-suppression matters: refresh runs on every X property
+///   event, so an already-correct stamp must cost zero writes.
+/// - `mints`: `(wid, session_name)` pairs bound to a session with no known
+///   `@ptm_id` (created outside PTM, bound via walk). The caller runs
+///   `ensure_session_ptm_id(&name)` — which tags the session — and stamps
+///   the returned uuid; the next refresh's uuid map then covers it.
+///
+/// Unbound items are ignored even when they carry a stale stamp: stale
+/// stamps are inert (never resolved, never deleted).
+fn plan_session_stamps(
+    items: &[Item],
+    session_to_uuid: &HashMap<String, String>,
+    current_stamps: &HashMap<u32, String>,
+) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
+    let mut stamps = Vec::new();
+    let mut mints = Vec::new();
+    for item in items {
+        let Some(session) = item.session.as_ref() else {
+            continue;
+        };
+        match session_to_uuid.get(session) {
+            Some(uuid) => {
+                if current_stamps.get(&item.wid) != Some(uuid) {
+                    stamps.push((item.wid, uuid.clone()));
+                }
+            }
+            None => mints.push((item.wid, session.clone())),
+        }
+    }
+    (stamps, mints)
 }
 
 // ── Phase 5a: Recipe capture ──
@@ -12677,6 +12796,75 @@ mod tests {
             super::PENDING_ATTACH_TIMEOUT,
         );
         assert_eq!(new_items[0].session.as_deref(), Some("work"));
+    }
+
+    // ── plan_session_stamps (_PTM_SESSION write planning) ──
+
+    #[test]
+    fn plan_session_stamps_stamps_newly_bound_window() {
+        let items = vec![mk_bound_item(100, Some("work"), Some(2380))];
+        let (stamps, mints) = super::plan_session_stamps(
+            &items,
+            &uuid_map(&[("work", "uuid-a")]),
+            &HashMap::new(),
+        );
+        assert_eq!(stamps, vec![(100, "uuid-a".to_string())]);
+        assert!(mints.is_empty());
+    }
+
+    #[test]
+    fn plan_session_stamps_skips_unchanged_stamp() {
+        // Write-suppression contract: refresh runs on every X property
+        // event, so an already-correct stamp must produce zero writes.
+        let items = vec![mk_bound_item(100, Some("work"), Some(2380))];
+        let (stamps, mints) = super::plan_session_stamps(
+            &items,
+            &uuid_map(&[("work", "uuid-a")]),
+            &stamps(&[(100, "uuid-a")]),
+        );
+        assert!(stamps.is_empty());
+        assert!(mints.is_empty());
+    }
+
+    #[test]
+    fn plan_session_stamps_restamps_on_session_change() {
+        // The window was stamped for uuid-old, but walk just proved it now
+        // hosts the session with uuid-new (user attached a different
+        // session in place). The stamp must self-heal.
+        let items = vec![mk_bound_item(100, Some("other"), Some(2380))];
+        let (stamps, mints) = super::plan_session_stamps(
+            &items,
+            &uuid_map(&[("other", "uuid-new")]),
+            &stamps(&[(100, "uuid-old")]),
+        );
+        assert_eq!(stamps, vec![(100, "uuid-new".to_string())]);
+        assert!(mints.is_empty());
+    }
+
+    #[test]
+    fn plan_session_stamps_requests_mint_for_untagged_session() {
+        // Bound to a session with no @ptm_id yet (created outside PTM,
+        // bound via walk): the caller must ensure_session_ptm_id first,
+        // then stamp — surfaced as a mint entry carrying the NAME.
+        let items = vec![mk_bound_item(100, Some("external"), Some(7000))];
+        let (stamps, mints) =
+            super::plan_session_stamps(&items, &HashMap::new(), &HashMap::new());
+        assert!(stamps.is_empty());
+        assert_eq!(mints, vec![(100, "external".to_string())]);
+    }
+
+    #[test]
+    fn plan_session_stamps_ignores_unbound_items() {
+        // No binding → no action, even when the window carries a stale
+        // stamp (stale stamps are inert, never deleted).
+        let items = vec![mk_bound_item(100, None, Some(2380))];
+        let (stamps, mints) = super::plan_session_stamps(
+            &items,
+            &uuid_map(&[("work", "uuid-a")]),
+            &stamps(&[(100, "uuid-dead")]),
+        );
+        assert!(stamps.is_empty());
+        assert!(mints.is_empty());
     }
 
     // ── Wedge detector (Cluster 6) ──

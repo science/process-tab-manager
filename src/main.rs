@@ -3459,9 +3459,10 @@ fn refresh_items(
         app.note_successful_spawn();
     }
 
-    // Bind `item.session` via the three-tier cascade. Claim consumes
+    // Bind `item.session` via the four-tier cascade. Claim consumes
     // pending attaches on freshly-appeared wids; walk handles the
-    // single-pid-per-window terminals (xterm etc.); carry preserves the
+    // single-pid-per-window terminals (xterm etc.); rebind recovers
+    // stamped windows after WM/PTM restarts; carry preserves the
     // binding across refreshes for gnome-terminal where walk always
     // collides on the shared server PID. Returned wids are the ones the
     // claim tier matched — snap each to the sidebar anchor so
@@ -3474,6 +3475,8 @@ fn refresh_items(
         &mut app.pending_attaches,
         &prior_wids,
         &live_session_set,
+        &HashMap::new(),
+        &HashMap::new(),
         read_ppid,
         std::time::Instant::now(),
         PENDING_ATTACH_TIMEOUT,
@@ -4175,14 +4178,28 @@ fn queue_pending_attach_with_group(
 ///    `tmux_clients`, walk up the process tree to the owning window via
 ///    `walk_to_window_owner`. Sets `item.session` on the matched wid if
 ///    still None. Works for xterm and other single-window-per-pid
-///    terminals where collision doesn't bite.
+///    terminals where collision doesn't bite. Walk outranks rebind
+///    because it is live process-tree evidence of THIS window hosting
+///    THAT client right now, while the stamp is history; when they
+///    disagree the stamp pass re-stamps the fresh binding afterwards.
 ///
-/// 3. **Carry** — for any item still without a session, look up the
+/// 3. **Rebind** — for any item still without a session that carries a
+///    `_PTM_SESSION` stamp (in `stamped_sessions`), bind to the live
+///    session whose `@ptm_id` matches (via `uuid_to_session`). The
+///    stamp lives on the X window, so this tier survives everything
+///    that wipes the carry tier's one-refresh memory: WM restarts
+///    re-managing windows, desktop switches evicting off-desktop items,
+///    and PTM restarts. A stale stamp (dead session) simply misses the
+///    map — liveness validation is implicit. Rebind outranks carry
+///    because uuid identity beats name equality: after a rename plus
+///    name reuse, carry would bind the OLD name to the wrong session.
+///
+/// 4. **Carry** — for any item still without a session, look up the
 ///    same wid in `prior_items` and inherit its session if that session
 ///    is still present in `live_sessions`. Without this, gnome-terminal
 ///    users lose the marker on the very next refresh after a claim:
 ///    walk collides forever, so claim's one-shot binding has to be
-///    preserved by something.
+///    preserved by something (unstamped windows still need carry).
 fn bind_sessions(
     new_items: &mut [Item],
     prior_items: &[Item],
@@ -4191,6 +4208,8 @@ fn bind_sessions(
     pending_attaches: &mut Vec<PendingAttach>,
     prior_wids: &HashSet<u32>,
     live_sessions: &HashSet<String>,
+    stamped_sessions: &HashMap<u32, String>,
+    uuid_to_session: &HashMap<String, String>,
     mut read_ppid_fn: impl FnMut(u32) -> Option<u32>,
     now: std::time::Instant,
     attach_timeout: std::time::Duration,
@@ -4231,6 +4250,18 @@ fn bind_sessions(
                     item.session = Some(session_name.clone());
                 }
             }
+        }
+    }
+
+    for item in new_items.iter_mut() {
+        if item.session.is_some() {
+            continue;
+        }
+        let Some(uuid) = stamped_sessions.get(&item.wid) else {
+            continue;
+        };
+        if let Some(name) = uuid_to_session.get(uuid) {
+            item.session = Some(name.clone());
         }
     }
 
@@ -11980,6 +12011,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12035,6 +12068,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12069,6 +12104,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12103,6 +12140,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12139,6 +12178,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12176,6 +12217,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12211,6 +12254,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12245,6 +12290,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12290,6 +12337,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12343,6 +12392,8 @@ mod tests {
             &mut pending_attaches,
             &prior_wids,
             &live,
+            &HashMap::new(),
+            &HashMap::new(),
             read,
             now,
             super::PENDING_ATTACH_TIMEOUT,
@@ -12387,6 +12438,245 @@ mod tests {
             Some("b"),
         );
         assert!(pending_attaches.is_empty(), "all three attaches consumed");
+    }
+
+    // ── bind_sessions: rebind tier (_PTM_SESSION stamp recovery) ──
+
+    /// wid → stamped uuid map, mirroring what refresh_items reads off the
+    /// windows' `_PTM_SESSION` properties.
+    fn stamps(pairs: &[(u32, &str)]) -> HashMap<u32, String> {
+        pairs.iter().map(|(w, u)| (*w, u.to_string())).collect()
+    }
+
+    /// live `@ptm_id` uuid → current session name map, mirroring the
+    /// inverted `list_tmux_session_uuids()` output.
+    fn uuid_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(u, n)| (u.to_string(), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn bind_sessions_rebind_recovers_after_wm_restart_flap() {
+        // THE bug (2026-07-09): cinnamon --replace flapped _NET_CLIENT_LIST
+        // for one refresh, evicting the items. prior_items is empty, walk
+        // collides on the shared gnome-terminal-server pid, no pendings —
+        // before the rebind tier the binding was permanently lost. The
+        // _PTM_SESSION stamp on wid 100 must recover it; unstamped wid 200
+        // must stay unbound.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![
+            mk_bound_item(100, None, Some(2380)),
+            mk_bound_item(200, None, Some(2380)),
+        ];
+        let pid_to_wid: HashMap<u32, Vec<u32>> =
+            [(2380u32, vec![100u32, 200])].iter().cloned().collect();
+        let tmux_clients: HashMap<u32, String> =
+            [(605774u32, "work".to_string())].iter().cloned().collect();
+        let read = ppid_reader([(605774u32, 2380u32)].iter().cloned().collect());
+        let claimed = super::bind_sessions(
+            &mut new_items,
+            &[],
+            &tmux_clients,
+            &pid_to_wid,
+            &mut Vec::new(),
+            &HashSet::new(),
+            &live_sessions_set(&["work"]),
+            &stamps(&[(100, "uuid-a")]),
+            &uuid_map(&[("uuid-a", "work")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert!(claimed.is_empty(), "rebind is not a claim");
+        assert_eq!(
+            new_items.iter().find(|i| i.wid == 100).unwrap().session.as_deref(),
+            Some("work"),
+            "stamped window must rebind after the eviction flap"
+        );
+        assert_eq!(
+            new_items.iter().find(|i| i.wid == 200).unwrap().session.as_deref(),
+            None,
+            "unstamped window must stay unbound"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_rebind_recovers_new_name_after_rename() {
+        // `tmux rename-session old → new`: carry checks the OLD name
+        // against live names and drops the binding. The stamp's uuid still
+        // resolves — to the NEW name.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(100, None, Some(2380))];
+        let prior_items = vec![mk_bound_item(100, Some("old"), Some(2380))];
+        let prior_wids: HashSet<u32> = [100].iter().copied().collect();
+        let read = ppid_reader(HashMap::new());
+        super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Vec::new(),
+            &prior_wids,
+            &live_sessions_set(&["new"]),
+            &stamps(&[(100, "uuid-a")]),
+            &uuid_map(&[("uuid-a", "new")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("new"),
+            "rebind must follow the uuid to the session's current name"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_rebind_beats_carry_on_name_reuse() {
+        // Session "work" (uuid-a) renamed to "tmp"; a NEW session (uuid-b)
+        // took the name "work". Carry would see prior "work" still live and
+        // bind the window to the WRONG session. Uuid identity must win.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(100, None, Some(2380))];
+        let prior_items = vec![mk_bound_item(100, Some("work"), Some(2380))];
+        let prior_wids: HashSet<u32> = [100].iter().copied().collect();
+        let read = ppid_reader(HashMap::new());
+        super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Vec::new(),
+            &prior_wids,
+            &live_sessions_set(&["work", "tmp"]),
+            &stamps(&[(100, "uuid-a")]),
+            &uuid_map(&[("uuid-a", "tmp"), ("uuid-b", "work")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("tmp"),
+            "uuid identity must outrank carry's name equality"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_rebind_ignores_stale_uuid() {
+        // The stamped session died; its uuid is absent from the live map.
+        // The stamp is inert — no binding, no panic, carry has nothing.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(100, None, Some(2380))];
+        let read = ppid_reader(HashMap::new());
+        super::bind_sessions(
+            &mut new_items,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Vec::new(),
+            &HashSet::new(),
+            &live_sessions_set(&["other"]),
+            &stamps(&[(100, "uuid-dead")]),
+            &uuid_map(&[("uuid-live", "other")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(new_items[0].session.as_deref(), None);
+    }
+
+    #[test]
+    fn bind_sessions_claim_precedence_over_rebind() {
+        // A NEW wid with a pending attach for "a" also carries a (stale)
+        // stamp resolving to "b" — e.g. X recycled the window id. The
+        // user's explicit intent (claim) must win.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(300, None, Some(2380))];
+        let mut pending_attaches = vec![pending("a", now)];
+        let read = ppid_reader(HashMap::new());
+        super::bind_sessions(
+            &mut new_items,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut pending_attaches,
+            &HashSet::new(),
+            &live_sessions_set(&["a", "b"]),
+            &stamps(&[(300, "uuid-b")]),
+            &uuid_map(&[("uuid-b", "b")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("a"),
+            "claim must outrank rebind"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_walk_precedence_over_rebind() {
+        // xterm-style single-pid window: walk proves the window hosts a
+        // client of session "a" RIGHT NOW; the stamp says "b" (history —
+        // the user detached and attached a different session in place).
+        // Live evidence must win.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(100, None, Some(7000))];
+        let prior_wids: HashSet<u32> = [100].iter().copied().collect();
+        let tmux_clients: HashMap<u32, String> =
+            [(605774u32, "a".to_string())].iter().cloned().collect();
+        let pid_to_wid: HashMap<u32, Vec<u32>> =
+            [(7000u32, vec![100u32])].iter().cloned().collect();
+        let read = ppid_reader([(605774u32, 7000u32)].iter().cloned().collect());
+        super::bind_sessions(
+            &mut new_items,
+            &[],
+            &tmux_clients,
+            &pid_to_wid,
+            &mut Vec::new(),
+            &prior_wids,
+            &live_sessions_set(&["a", "b"]),
+            &stamps(&[(100, "uuid-b")]),
+            &uuid_map(&[("uuid-b", "b")]),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(
+            new_items[0].session.as_deref(),
+            Some("a"),
+            "walk's live evidence must outrank the stamp"
+        );
+    }
+
+    #[test]
+    fn bind_sessions_carry_still_fires_without_stamp() {
+        // Regression guard: an unstamped window with a live prior binding
+        // must still be carried, exactly as before the rebind tier.
+        let now = std::time::Instant::now();
+        let mut new_items = vec![mk_bound_item(100, None, Some(2380))];
+        let prior_items = vec![mk_bound_item(100, Some("work"), Some(2380))];
+        let prior_wids: HashSet<u32> = [100].iter().copied().collect();
+        let read = ppid_reader(HashMap::new());
+        super::bind_sessions(
+            &mut new_items,
+            &prior_items,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Vec::new(),
+            &prior_wids,
+            &live_sessions_set(&["work"]),
+            &HashMap::new(),
+            &HashMap::new(),
+            read,
+            now,
+            super::PENDING_ATTACH_TIMEOUT,
+        );
+        assert_eq!(new_items[0].session.as_deref(), Some("work"));
     }
 
     // ── Wedge detector (Cluster 6) ──

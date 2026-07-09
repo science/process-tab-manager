@@ -27,13 +27,18 @@ SESSION="ptm_e2e_restart_$$"
 PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
 HOME_DIR=$(mktemp -d -t ptm-e2e-restart.XXXXXX)
 export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-restart-tmux.XXXXXX)
+# Claude Code and dev shells often run INSIDE tmux. A leaked $TMUX makes
+# every tmux call here target the user's real server (TMUX_TMPDIR is
+# ignored when $TMUX is set) -- cleanup's kill-server would then nuke all
+# of the user's sessions. Sever the link before the first tmux command.
+unset TMUX
 
 cleanup() {
     [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
     [[ -n "${XTERM_PID:-}" ]] && kill "$XTERM_PID" 2>/dev/null || true
     [[ -n "${OPENBOX_PID:-}" ]] && kill "$OPENBOX_PID" 2>/dev/null || true
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-    tmux kill-server 2>/dev/null || true
+    [[ -n "${TMUX_TMPDIR:-}" && -d "$TMUX_TMPDIR" ]] && tmux kill-server 2>/dev/null || true
     rm -rf "$HOME_DIR" "$TMUX_TMPDIR"
     wait 2>/dev/null || true
 }

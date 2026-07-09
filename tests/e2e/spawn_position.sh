@@ -19,13 +19,18 @@ SHOTS=$(mktemp -d -t ptm-e2e-shots.XXXXXX)
 # (0, 1, 2…) and we don't want those to outlive the test or leak into
 # the user's real tmux server.
 export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-tmux.XXXXXX)
+# Claude Code and dev shells often run INSIDE tmux. A leaked $TMUX makes
+# every tmux call here target the user's real server (TMUX_TMPDIR is
+# ignored when $TMUX is set) -- cleanup's kill-server would then nuke all
+# of the user's sessions. Sever the link before the first tmux command.
+unset TMUX
 
 cleanup() {
     [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
     [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
     [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
     pkill -f "$DISPLAY_NUM.*xterm" 2>/dev/null || true
-    tmux kill-server 2>/dev/null || true
+    [[ -n "${TMUX_TMPDIR:-}" && -d "$TMUX_TMPDIR" ]] && tmux kill-server 2>/dev/null || true
     rm -rf "$HOME_DIR" "$TMUX_TMPDIR"
     wait 2>/dev/null || true
 }

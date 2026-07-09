@@ -155,6 +155,24 @@ fn new_terminal_in_group_snaps_to_sidebar_anchor() {
 /// spawned window. This is the half of the anti-drift design that unit
 /// tests can't reach (real X server + real tmux server); the matching that
 /// consumes these ids is covered by the `restore_groups_tier0_*` unit tests.
+/// Reproducer for the WM-restart binding loss: for gnome-terminal-style
+/// windows (shared _NET_WM_PID, walk tier collides) the carry tier's
+/// one-refresh memory was the only session-binding persistence, so a
+/// `cinnamon --replace` or PTM restart lost the marker forever. The fix
+/// stamps `_PTM_SESSION` (the session's @ptm_id) on the window and adds a
+/// rebind tier that reads it back. The script forces the collision by
+/// forging a decoy xterm's _NET_WM_PID, then kill -9s PTM and restarts it
+/// with a fresh HOME (no recipes) — the stamp is the only recovery path.
+#[test]
+fn session_binding_survives_ptm_restart_under_pid_collision() {
+    let (ok, out) = run_e2e_script("session_rebind_survives_restart.sh");
+    assert!(
+        ok,
+        "tmux session binding should survive a PTM restart via the _PTM_SESSION rebind tier\n{}",
+        out
+    );
+}
+
 #[test]
 fn new_tmux_stamps_matching_ptm_id_on_session_and_window() {
     let (ok, out) = run_e2e_script("ptm_id_stamped_on_spawn.sh");

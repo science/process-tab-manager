@@ -9,7 +9,7 @@ source "$HOME/.cargo/env"
 ./build.sh dev                                                    # Build dev binary into /tmp/ptm-dev (run in place)
 ./build.sh release                                                # Build + copy binary to ~/.local/bin/ptm (persistent)
 ./install.sh                                                      # build.sh release + desktop entry/icon/tmux dep
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 470 unit + 7 e2e (Xvfb, ~25s)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 496 unit + 9 e2e (Xvfb, ~30s)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --bin ptm                # unit tests only (~50ms)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~25s)
 DISPLAY=:0 /tmp/ptm-dev/release/ptm                               # Run dev build (needs X11 desktop)
@@ -20,7 +20,7 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 
 **Dev vs production**: `build.sh` owns the build+place logic. Both modes compile into `/tmp` because `~/dev` is a `noexec` virtiofs mount — a binary built into the repo fails with "Bad address (os error 14)" (see `fix-virtiofs-exec.md`). `dev` targets `/tmp/ptm-dev` and you run it in place; `release` targets `/tmp/ptm-target` and then **copies** the binary to `~/.local/bin/ptm`. The copy (not a symlink into `/tmp`) is deliberate: `/tmp` is wiped on every reboot, so a symlink would dangle and PTM would look uninstalled after a restart — `~/.local/bin` is on persistent, exec-capable ext4. Separate target dirs keep a dev rebuild from clobbering the release artifact.
 
-**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Seven scripts live under `tests/e2e/`:
+**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Nine scripts live under `tests/e2e/`:
 
 - `menu_kills_session.sh` — right-click → Kill Session via the context menu, popup-accept path.
 - `x_button_kills_session.sh` — click the `[x]` glyph on a session row, popup-accept path.
@@ -29,8 +29,10 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 - `tmux_attach_runs_tmux.sh` — `+ New tmux` actually spawns a tmux client AND PTM binds the row's `item.session` so the sidebar marker renders.
 - `tmux_attach_through_wrapper.sh` — when PTM's chosen terminal is a Debian `.wrapper` shim, the spawn uses `-e` so the wrapper forwards the command correctly.
 - `recipes_survive_restart.sh` — Phase 5c Tier 0a: a saved tmux MEMBER reattaches to its live xterm by session-name match after PTM restart.
+- `ptm_id_stamped_on_spawn.sh` — `+ New tmux` stamps a matching `@ptm_id` on the session AND `_PTM_ID` on the spawned window (persistent-identity scheme).
+- `session_rebind_survives_restart.sh` — the rebind tier: `_PTM_SESSION` is stamped on the bound window, and after a hard PTM restart under a forged `_NET_WM_PID` collision (walk tier useless) the session binding is recovered from the stamp.
 
-Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Tests share the user's tmux server (default socket) and serialize themselves via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
+Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Each script also runs against an isolated tmux server (`TMUX_TMPDIR` + `unset TMUX` — the unset matters: with `$TMUX` leaked from a tmux-hosted shell, tmux ignores `TMUX_TMPDIR` and cleanup's `kill-server` would destroy the USER'S server; this happened once, don't reintroduce it). Tests serialize via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
 
 ## Project Structure
 
@@ -48,6 +50,8 @@ tests/
     tmux_attach_runs_tmux.sh        # `+ New tmux` actually runs tmux + binds session marker
     tmux_attach_through_wrapper.sh  # Debian `.wrapper` shim forwards command via -e
     recipes_survive_restart.sh      # Phase 5c: tmux row reattaches after PTM restart
+    ptm_id_stamped_on_spawn.sh      # @ptm_id + _PTM_ID stamped at spawn
+    session_rebind_survives_restart.sh  # _PTM_SESSION rebind survives PTM restart
 LICENSE
 README.md
 ```
@@ -61,7 +65,7 @@ Single-file binary (~12000 LOC) with clean separation of concerns within `main.r
 - **Renderer**: double-buffered drawing to pixmap, copies to window. Items, group headers, ghost drag, drop indicators, hover, active highlight
 - **Context menu**: override-redirect popup with pointer grab. `build_menu_entries` / `open_context_menu` / `draw_context_menu`
 - **Event loop**: single `wait_for_event` loop with two modes: context menu (grab active) and normal
-- **Tests**: `#[cfg(test)] mod tests` at bottom of `src/main.rs` — 470 unit tests covering pure state logic. The Xvfb-driven e2e harness lives separately under `tests/`.
+- **Tests**: `#[cfg(test)] mod tests` at bottom of `src/main.rs` — 496 unit tests covering pure state logic. The Xvfb-driven e2e harness lives separately under `tests/`.
 
 ### What's testable without X11
 
@@ -118,7 +122,7 @@ Every behavior change starts with a failing test (RED), then implementation (GRE
 
 **Tier 1 — Unit tests (preferred).** `cargo test --bin ptm` for all state/group/DnD/parsing logic. No display needed; runs in ~50 ms.
 
-**Tier 2 — Xvfb e2e tests.** `cargo test --test e2e_kill_session` for end-to-end flows that need a real X server, real tmux, and real keyboard/mouse events. Each `#[test]` shells out to a script under `tests/e2e/` (`menu_kills_session.sh`, `x_button_kills_session.sh`, `spawn_position.sh`). Use this tier for behaviors that can't be reproduced from pure state — popup focus interactions, window-spawn snapping, EWMH side effects. Slow (~10 s for the suite); add a script only when a Tier-1 test cannot reach the bug.
+**Tier 2 — Xvfb e2e tests.** `cargo test --test e2e_kill_session` for end-to-end flows that need a real X server, real tmux, and real keyboard/mouse events. Each `#[test]` shells out to a script under `tests/e2e/` (`menu_kills_session.sh`, `x_button_kills_session.sh`, `spawn_position.sh`). Use this tier for behaviors that can't be reproduced from pure state — popup focus interactions, window-spawn snapping, EWMH side effects. Slow (~30 s for the suite); add a script only when a Tier-1 test cannot reach the bug.
 
 **Tier 3 — Manual visual review.** For rendering, colors, layout — launch the app and verify interactively.
 
@@ -206,6 +210,30 @@ Field values are percent-encoded: `%` → `%25`, `\t` → `%09`, `\n` → `%0a`.
 5. **Tier 3 — wm_class-only**.
 
 TmuxSystem groups skip Tier 0a/0b because they're rebuilt every refresh from `list_tmux_sessions()`.
+
+### Session-binding cascade (`bind_sessions`, 4 tiers)
+
+Distinct from the group-member cascade above: this one decides which tmux session a
+window row is bound to (`item.session`, the green marker). Runs every refresh:
+
+1. **Claim** — a freshly-appeared wid consumes the head pending attach (FIFO). The only
+   tier that fires at spawn under gnome-terminal-server's shared pid.
+2. **Walk** — walk the tmux client pid up to the owning window via `_NET_WM_PID`.
+   Returns None on pid collision (all gnome-terminal windows share the server pid), so
+   it only works for xterm-style one-pid-per-window terminals.
+3. **Rebind** — an unbound window carrying a `_PTM_SESSION` stamp (the session's
+   `@ptm_id` uuid) rebinds to the live session with that uuid. The stamp lives on the X
+   server, so this survives WM restarts (`cinnamon --replace`), desktop switches, and
+   PTM restarts — everything that wipes carry's one-refresh memory. Stale stamps are
+   inert (uuid absent from the live map) and never deleted. Rebind outranks carry
+   because uuid identity beats name equality: after a rename plus name reuse, carry
+   would bind the old name to the wrong session.
+4. **Carry** — inherit the previous refresh's binding for the same wid, if the session
+   name is still live. One refresh deep; still needed for unstamped windows.
+
+`refresh_items` stamps `_PTM_SESSION` on every bound window after the cascade
+(`plan_session_stamps` — diff-suppressed, so steady state is zero X writes; sessions
+without `@ptm_id` get tagged via `ensure_session_ptm_id` first).
 
 ### Capture-at-save cost
 

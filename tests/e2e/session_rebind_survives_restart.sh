@@ -25,64 +25,19 @@
 #
 # Tools required: Xvfb, xdotool, tmux, xterm, openbox, xdpyinfo, scrot.
 
-set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-DISPLAY_NUM=":99"
-PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
-HOME1=$(mktemp -d -t ptm-e2e-rebind-h1.XXXXXX)
-HOME2=$(mktemp -d -t ptm-e2e-rebind-h2.XXXXXX)
-SHOTS=$(mktemp -d -t ptm-e2e-rebind-shots.XXXXXX)
-export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-rebind-tmux.XXXXXX)
-# Claude Code and dev shells often run INSIDE tmux. A leaked $TMUX makes
-# every tmux call here target the user's real server (TMUX_TMPDIR is
-# ignored when $TMUX is set) -- cleanup's kill-server would then nuke all
-# of the user's sessions. Sever the link before the first tmux command.
-unset TMUX
+e2e_mktemp_dir HOME1 ptm-e2e-rebind-h1.XXXXXX
+e2e_mktemp_dir HOME2 ptm-e2e-rebind-h2.XXXXXX
+e2e_mktemp_dir SHOTS ptm-e2e-rebind-shots.XXXXXX
 
-cleanup() {
-    [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
-    [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
-    [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-    pkill -f "$DISPLAY_NUM.*xterm" 2>/dev/null || true
-    [[ -n "${TMUX_TMPDIR:-}" && -d "$TMUX_TMPDIR" ]] && tmux kill-server 2>/dev/null || true
-    rm -rf "$HOME1" "$HOME2" "$TMUX_TMPDIR" "$SHOTS"
-    wait 2>/dev/null || true
-}
-trap cleanup EXIT
-
-if [[ ! -x "$PTM" ]]; then
-    echo "FAIL: ptm binary not found at $PTM"; exit 2
-fi
-for tool in Xvfb xdotool tmux xterm xdpyinfo scrot openbox xprop; do
-    command -v "$tool" >/dev/null || { echo "FAIL: missing $tool"; exit 2; }
-done
-
-Xvfb "$DISPLAY_NUM" -screen 0 1024x768x24 >/dev/null 2>&1 &
-XVFB_PID=$!
-for i in {1..20}; do
-    DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 && break
-    sleep 0.1
-done
-DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 || { echo "FAIL: Xvfb did not become responsive"; exit 2; }
-export DISPLAY="$DISPLAY_NUM"
-
-openbox --sm-disable >/dev/null 2>&1 &
-WM_PID=$!
-sleep 0.4
+e2e_require xdotool tmux xterm scrot openbox xprop
+e2e_start_xvfb
+e2e_start_wm
 
 export PTM_TERMINAL_CMD=xterm
 
-HOME="$HOME1" "$PTM" >/tmp/ptm-e2e-rebind-1.log 2>&1 &
-PTM_PID=$!
-
-WID=""
-for i in {1..30}; do
-    WID=$(xdotool search --name "^ptm$" 2>/dev/null | head -1 || true)
-    [[ -n "$WID" ]] && break
-    sleep 0.1
-done
-[[ -z "$WID" ]] && { echo "FAIL: ptm window did not appear"; exit 1; }
-echo "[setup] ptm#1 wid=$WID pid=$PTM_PID"
+e2e_launch_ptm "$HOME1" /tmp/ptm-e2e-rebind-1.log
 
 sleep 0.6  # initial paint
 
@@ -185,17 +140,7 @@ echo "[act ] kill -9 ptm#1 (pid $PTM_PID), restart with fresh HOME"
 kill -9 "$PTM_PID" 2>/dev/null || true
 wait "$PTM_PID" 2>/dev/null || true
 
-HOME="$HOME2" "$PTM" >/tmp/ptm-e2e-rebind-2.log 2>&1 &
-PTM_PID=$!
-
-WID2=""
-for i in {1..30}; do
-    WID2=$(xdotool search --name "^ptm$" 2>/dev/null | head -1 || true)
-    [[ -n "$WID2" ]] && break
-    sleep 0.1
-done
-[[ -z "$WID2" ]] && { echo "FAIL: restarted ptm window did not appear"; exit 1; }
-echo "[setup] ptm#2 wid=$WID2 pid=$PTM_PID"
+e2e_launch_ptm "$HOME2" /tmp/ptm-e2e-rebind-2.log
 
 sleep 1.0  # first refresh: rebind tier reads _PTM_SESSION off the window
 scrot "$SHOTS/02-after-restart.png"

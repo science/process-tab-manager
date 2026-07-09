@@ -12,51 +12,17 @@
 #
 # Tools required: Xvfb, xdotool, tmux, xterm, openbox, xdpyinfo, scrot.
 
-set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-DISPLAY_NUM=":99"
-PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
-HOME_DIR=$(mktemp -d -t ptm-e2e-grp-term.XXXXXX)
+e2e_mktemp_dir HOME_DIR ptm-e2e-grp-term.XXXXXX
+# Plain mktemp (not e2e_mktemp_dir): screenshots survive for debugging.
 SHOTS=$(mktemp -d -t ptm-e2e-grp-term-shots.XXXXXX)
-# Per-test isolated tmux server socket so leftover sessions can't
-# contaminate row layout via the auto TmuxSystem group.
-export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-grp-term-tmux.XXXXXX)
-# Claude Code and dev shells often run INSIDE tmux. A leaked $TMUX makes
-# every tmux call here target the user's real server (TMUX_TMPDIR is
-# ignored when $TMUX is set) -- cleanup's kill-server would then nuke all
-# of the user's sessions. Sever the link before the first tmux command.
-unset TMUX
 
-cleanup() {
-    [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
-    [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
-    [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-    pkill -f "$DISPLAY_NUM.*xterm" 2>/dev/null || true
-    [[ -n "${TMUX_TMPDIR:-}" && -d "$TMUX_TMPDIR" ]] && tmux kill-server 2>/dev/null || true
-    rm -rf "$HOME_DIR" "$TMUX_TMPDIR"
-    wait 2>/dev/null || true
-}
-trap cleanup EXIT
-
-[[ -x "$PTM" ]] || { echo "FAIL: ptm binary not found at $PTM"; exit 2; }
-for tool in Xvfb xdotool tmux xterm xdpyinfo scrot openbox; do
-    command -v "$tool" >/dev/null || { echo "FAIL: missing $tool"; exit 2; }
-done
-
-Xvfb "$DISPLAY_NUM" -screen 0 1024x768x24 >/dev/null 2>&1 &
-XVFB_PID=$!
-for i in {1..20}; do
-    DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 && break
-    sleep 0.1
-done
-DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 || { echo "FAIL: Xvfb did not become responsive"; exit 2; }
-export DISPLAY="$DISPLAY_NUM"
-
+e2e_require xdotool tmux xterm scrot openbox
+e2e_start_xvfb
 # openbox maintains _NET_CLIENT_LIST and honours snap_to_sidebar's
 # ConfigureRequest move — same setup as spawn_position.sh.
-openbox --sm-disable >/dev/null 2>&1 &
-WM_PID=$!
-sleep 0.4
+e2e_start_wm
 
 # Pre-seed a Normal group named "spawn-test" so we can right-click its
 # header without first creating it via the UI. Restoration order is:
@@ -73,21 +39,7 @@ sed 's/^/    /' "$GROUPS_FILE"
 
 export PTM_TERMINAL_CMD=xterm
 
-HOME="$HOME_DIR" "$PTM" >/tmp/ptm-e2e-grp-term.log 2>&1 &
-PTM_PID=$!
-
-WID=""
-for i in {1..30}; do
-    WID=$(xdotool search --name "^ptm$" 2>/dev/null | head -1 || true)
-    [[ -n "$WID" ]] && break
-    sleep 0.1
-done
-[[ -z "$WID" ]] && {
-    echo "FAIL: ptm window did not appear"
-    tail -20 /tmp/ptm-e2e-grp-term.log 2>&1 | sed 's/^/  /'
-    exit 1
-}
-echo "[setup] ptm window id: $WID"
+e2e_launch_ptm "$HOME_DIR" /tmp/ptm-e2e-grp-term.log
 
 sleep 0.8
 eval "$(xdotool getwindowgeometry --shell "$WID")"

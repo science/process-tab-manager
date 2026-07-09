@@ -32,7 +32,7 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 - `ptm_id_stamped_on_spawn.sh` — `+ New tmux` stamps a matching `@ptm_id` on the session AND `_PTM_ID` on the spawned window (persistent-identity scheme).
 - `session_rebind_survives_restart.sh` — the rebind tier: `_PTM_SESSION` is stamped on the bound window, and after a hard PTM restart under a forged `_NET_WM_PID` collision (walk tier useless) the session binding is recovered from the stamp.
 
-Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). They spin up an isolated Xvfb display on `:99` so they don't touch the desktop session, and use a fresh `HOME` so saved groups state can't perturb row layout. Each script also runs against an isolated tmux server (`TMUX_TMPDIR` + `unset TMUX` — the unset matters: with `$TMUX` leaked from a tmux-hosted shell, tmux ignores `TMUX_TMPDIR` and cleanup's `kill-server` would destroy the USER'S server; this happened once, don't reintroduce it). Tests serialize via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
+Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). The shared prelude/teardown lives in `tests/e2e/lib.sh`, which every script sources first: isolated Xvfb display on `:99` (`e2e_start_xvfb`), openbox when the test spawns terminals (`e2e_start_wm`), fresh `HOME` dirs registered for cleanup (`e2e_mktemp_dir`), PTM launch + window wait (`e2e_launch_ptm`), tool preflight (`e2e_require`), and one EXIT trap. Critically, lib.sh also isolates tmux (`TMUX_TMPDIR` + `unset TMUX` — the unset matters: with `$TMUX` leaked from a tmux-hosted shell, tmux ignores `TMUX_TMPDIR` and cleanup's `kill-server` would destroy the USER'S server; this happened once, don't reintroduce it). Per-script extra teardown goes in an `e2e_extra_cleanup()` function. Tests serialize via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
 
 ## Project Structure
 
@@ -43,6 +43,7 @@ src/
 tests/
   e2e_kill_session.rs   # Cargo integration harness: one #[test] per script under tests/e2e/
   e2e/
+    lib.sh                          # shared prelude/teardown (tmux/X isolation, cleanup trap)
     menu_kills_session.sh           # right-click → Kill Session
     x_button_kills_session.sh       # [x] glyph + popup-accept
     spawn_position.sh               # `+ New tmux` snaps terminal to sidebar anchor
@@ -130,7 +131,7 @@ Every behavior change starts with a failing test (RED), then implementation (GRE
 
 1. Write or update a test:
    - Tier 1 → in the `#[cfg(test)] mod tests` block at the bottom of `src/main.rs`
-   - Tier 2 → add a new `#[test]` in `tests/e2e_kill_session.rs` and a driver under `tests/e2e/<name>.sh`; both `chmod +x` and `set -euo pipefail`
+   - Tier 2 → add a new `#[test]` in `tests/e2e_kill_session.rs` and a driver under `tests/e2e/<name>.sh`; `chmod +x` it and start it with `source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"` (provides `set -uo pipefail`, tmux/X isolation, and the cleanup trap)
 2. Run the test — confirm it fails (RED)
 3. Implement the change
 4. Run the test — confirm it passes (GREEN)

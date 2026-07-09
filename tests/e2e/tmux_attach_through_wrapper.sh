@@ -21,38 +21,15 @@
 #
 # Tools required: Xvfb, xdotool, tmux, xterm, openbox, xdpyinfo, scrot.
 
-set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-DISPLAY_NUM=":99"
-PTM="${PTM_BIN:-/tmp/ptm-dev/release/ptm}"
-HOME_DIR=$(mktemp -d -t ptm-e2e-wrap-home.XXXXXX)
+e2e_mktemp_dir HOME_DIR ptm-e2e-wrap-home.XXXXXX
+e2e_mktemp_dir WRAP_DIR ptm-e2e-wrap-bin.XXXXXX
+# Plain mktemp (not e2e_mktemp_dir): screenshots survive for debugging.
 SHOTS=$(mktemp -d -t ptm-e2e-wrap-shots.XXXXXX)
-WRAP_DIR=$(mktemp -d -t ptm-e2e-wrap-bin.XXXXXX)
-export TMUX_TMPDIR=$(mktemp -d -t ptm-e2e-wrap-tmux.XXXXXX)
-# Claude Code and dev shells often run INSIDE tmux. A leaked $TMUX makes
-# every tmux call here target the user's real server (TMUX_TMPDIR is
-# ignored when $TMUX is set) -- cleanup's kill-server would then nuke all
-# of the user's sessions. Sever the link before the first tmux command.
-unset TMUX
 MARKER="PTM_E2E_WRAP_$$_$(date +%s%N)"
 
-cleanup() {
-    [[ -n "${PTM_PID:-}" ]] && kill "$PTM_PID" 2>/dev/null || true
-    [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
-    [[ -n "${XVFB_PID:-}" ]] && kill "$XVFB_PID" 2>/dev/null || true
-    pkill -f "$DISPLAY_NUM.*xterm" 2>/dev/null || true
-    [[ -n "${TMUX_TMPDIR:-}" && -d "$TMUX_TMPDIR" ]] && tmux kill-server 2>/dev/null || true
-    rm -rf "$HOME_DIR" "$WRAP_DIR" "$TMUX_TMPDIR"
-    wait 2>/dev/null || true
-}
-trap cleanup EXIT
-
-if [[ ! -x "$PTM" ]]; then
-    echo "FAIL: ptm binary not found at $PTM"; exit 2
-fi
-for tool in Xvfb xdotool tmux xterm xdpyinfo scrot openbox; do
-    command -v "$tool" >/dev/null || { echo "FAIL: missing $tool"; exit 2; }
-done
+e2e_require xdotool tmux xterm scrot openbox
 
 # ── Fake Debian wrapper ─────────────────────────────────────────────
 # Behavioural match for the bug-relevant subset of the real
@@ -83,35 +60,15 @@ chmod +x "$WRAPPER"
 echo "[setup] fake wrapper installed at $WRAPPER"
 
 # ── Xvfb + openbox ──────────────────────────────────────────────────
-Xvfb "$DISPLAY_NUM" -screen 0 1024x768x24 >/dev/null 2>&1 &
-XVFB_PID=$!
-for i in {1..20}; do
-    DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 && break
-    sleep 0.1
-done
-DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 || { echo "FAIL: Xvfb did not become responsive"; exit 2; }
-export DISPLAY="$DISPLAY_NUM"
-
-openbox --sm-disable >/dev/null 2>&1 &
-WM_PID=$!
-sleep 0.4
+e2e_start_xvfb
+e2e_start_wm
 
 # Point PTM at the fake wrapper. PTM_TERMINAL_CMD wins over the
 # PATH-based detection, so this is what spawn_attach_terminal will
 # launch.
 export PTM_TERMINAL_CMD="$WRAPPER"
 
-HOME="$HOME_DIR" "$PTM" >/tmp/ptm-e2e-wrap.log 2>&1 &
-PTM_PID=$!
-
-WID=""
-for i in {1..30}; do
-    WID=$(xdotool search --name "^ptm$" 2>/dev/null | head -1 || true)
-    [[ -n "$WID" ]] && break
-    sleep 0.1
-done
-[[ -z "$WID" ]] && { echo "FAIL: ptm window did not appear"; exit 1; }
-echo "[setup] ptm wid=$WID pid=$PTM_PID"
+e2e_launch_ptm "$HOME_DIR" /tmp/ptm-e2e-wrap.log
 
 sleep 0.6
 scrot "$SHOTS/01-before-click.png"

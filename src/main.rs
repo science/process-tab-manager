@@ -3930,6 +3930,38 @@ fn list_tmux_sessions() -> Vec<(String, String, bool)> {
     }
 }
 
+// Parse `tmux list-sessions -F '#{session_name}\t#{@ptm_id}'` output into a
+// name → uuid map. The uuid is split off at the LAST tab so a session name
+// containing anything (spaces, even tabs) survives; uuids are PTM-minted and
+// never contain tabs. Untagged sessions print an empty uuid field and are
+// omitted — absence from the map is the rebind tier's "cannot resolve" signal,
+// covering dead sessions and untagged ones with one lookup.
+fn parse_tmux_session_uuids(stdout: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        let Some(tab) = line.rfind('\t') else {
+            continue;
+        };
+        let name = &line[..tab];
+        let uuid = line[tab + 1..].trim();
+        if name.is_empty() || uuid.is_empty() {
+            continue;
+        }
+        map.insert(name.to_string(), uuid.to_string());
+    }
+    map
+}
+
+fn list_tmux_session_uuids() -> HashMap<String, String> {
+    match std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}\t#{@ptm_id}"])
+        .output()
+    {
+        Ok(o) => parse_tmux_session_uuids(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => HashMap::new(),
+    }
+}
+
 // ── Session origin tracking ──
 //
 // These helpers track each tmux session's ORIGINAL name (the name observed
@@ -11706,6 +11738,47 @@ mod tests {
         let input = "noprefix demo 0\n$0 ok 1\n";
         let v = parse_tmux_list_sessions(input);
         assert_eq!(v, vec![("$0".to_string(), "ok".to_string(), true)]);
+    }
+
+    // ── `tmux list-sessions -F '#{session_name}\t#{@ptm_id}'` parsing ──
+
+    #[test]
+    fn parse_tmux_session_uuids_basic() {
+        let input = "work\tuuid-a\ntmp\tuuid-b\n";
+        let m = parse_tmux_session_uuids(input);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("work").map(String::as_str), Some("uuid-a"));
+        assert_eq!(m.get("tmp").map(String::as_str), Some("uuid-b"));
+    }
+
+    #[test]
+    fn parse_tmux_session_uuids_name_with_spaces_and_tabs() {
+        // The uuid is the LAST tab-separated field; everything before it —
+        // including spaces and even embedded tabs — is the name verbatim.
+        let input = "hello world\tuuid-a\nweird\tname\tuuid-b\n";
+        let m = parse_tmux_session_uuids(input);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("hello world").map(String::as_str), Some("uuid-a"));
+        assert_eq!(m.get("weird\tname").map(String::as_str), Some("uuid-b"));
+    }
+
+    #[test]
+    fn parse_tmux_session_uuids_skips_untagged() {
+        // A session with no @ptm_id prints an empty last field; it must be
+        // absent from the map ("absent" is the rebind tier's no-op signal).
+        let input = "untagged\t\ntagged\tuuid-a\n";
+        let m = parse_tmux_session_uuids(input);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("tagged").map(String::as_str), Some("uuid-a"));
+    }
+
+    #[test]
+    fn parse_tmux_session_uuids_skips_malformed() {
+        // No tab at all, empty name, blank lines, empty input — all dropped.
+        assert!(parse_tmux_session_uuids("").is_empty());
+        assert!(parse_tmux_session_uuids("notabhere\n").is_empty());
+        assert!(parse_tmux_session_uuids("\tuuid-only\n").is_empty());
+        assert!(parse_tmux_session_uuids("\n\n").is_empty());
     }
 
     // ── /proc/<pid>/status parsing ──

@@ -9,7 +9,7 @@ source "$HOME/.cargo/env"
 ./build.sh dev                                                    # Build dev binary into /tmp/ptm-dev (run in place)
 ./build.sh release                                                # Build + copy binary to ~/.local/bin/ptm (persistent)
 ./install.sh                                                      # build.sh release + desktop entry/icon/tmux dep
-CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 496 unit + 9 e2e (Xvfb, ~30s)
+CARGO_TARGET_DIR=/tmp/ptm-dev cargo test                          # 506 unit + 10 e2e (Xvfb, ~30s)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --bin ptm                # unit tests only (~50ms)
 CARGO_TARGET_DIR=/tmp/ptm-dev cargo test --test e2e_kill_session  # only the e2e suite (~25s)
 DISPLAY=:0 /tmp/ptm-dev/release/ptm                               # Run dev build (needs X11 desktop)
@@ -20,7 +20,7 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 
 **Dev vs production**: `build.sh` owns the build+place logic. Both modes compile into `/tmp` because `~/dev` is a `noexec` virtiofs mount — a binary built into the repo fails with "Bad address (os error 14)" (see `fix-virtiofs-exec.md`). `dev` targets `/tmp/ptm-dev` and you run it in place; `release` targets `/tmp/ptm-target` and then **copies** the binary to `~/.local/bin/ptm`. The copy (not a symlink into `/tmp`) is deliberate: `/tmp` is wiped on every reboot, so a symlink would dangle and PTM would look uninstalled after a restart — `~/.local/bin` is on persistent, exec-capable ext4. Separate target dirs keep a dev rebuild from clobbering the release artifact.
 
-**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Nine scripts live under `tests/e2e/`:
+**System dependencies**: building needs Rust + X11 dev headers. Running needs an X11 display. The e2e suite is driven by `tests/e2e_kill_session.rs`, a thin Cargo integration wrapper that shells out to one shell script per `#[test]`. Ten scripts live under `tests/e2e/`:
 
 - `menu_kills_session.sh` — right-click → Kill Session via the context menu, popup-accept path.
 - `x_button_kills_session.sh` — click the `[x]` glyph on a session row, popup-accept path.
@@ -31,8 +31,9 @@ The crate is a single-binary package (no `[lib]` target), so unit tests live und
 - `recipes_survive_restart.sh` — Phase 5c Tier 0a: a saved tmux MEMBER reattaches to its live xterm by session-name match after PTM restart.
 - `ptm_id_stamped_on_spawn.sh` — `+ New tmux` stamps a matching `@ptm_id` on the session AND `_PTM_ID` on the spawned window (persistent-identity scheme).
 - `session_rebind_survives_restart.sh` — the rebind tier: `_PTM_SESSION` is stamped on the bound window, and after a hard PTM restart under a forged `_NET_WM_PID` collision (walk tier useless) the session binding is recovered from the stamp.
+- `geometry_roundtrip_restart.sh` — the sidebar's screen position survives a graceful quit + relaunch under openbox (geometry is saved as the visible frame's root origin, never raw frame-relative ConfigureNotify coords).
 
-Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils`). The shared prelude/teardown lives in `tests/e2e/lib.sh`, which every script sources first: isolated Xvfb display on `:99` (`e2e_start_xvfb`), openbox when the test spawns terminals (`e2e_start_wm`), fresh `HOME` dirs registered for cleanup (`e2e_mktemp_dir`), PTM launch + window wait (`e2e_launch_ptm`), tool preflight (`e2e_require`), and one EXIT trap. Critically, lib.sh also isolates tmux (`TMUX_TMPDIR` + `unset TMUX` — the unset matters: with `$TMUX` leaked from a tmux-hosted shell, tmux ignores `TMUX_TMPDIR` and cleanup's `kill-server` would destroy the USER'S server; this happened once, don't reintroduce it). Per-script extra teardown goes in an `e2e_extra_cleanup()` function. Tests serialize via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
+Each script needs `xvfb`, `xdotool`, `xterm`, `openbox`, `tmux`, `scrot`, `wmctrl`, `xdpyinfo` (`sudo apt install xvfb xdotool xterm openbox tmux scrot wmctrl x11-utils`). The shared prelude/teardown lives in `tests/e2e/lib.sh`, which every script sources first: isolated Xvfb display on `:99` (`e2e_start_xvfb`), openbox when the test spawns terminals (`e2e_start_wm`), fresh `HOME` dirs registered for cleanup (`e2e_mktemp_dir`), PTM launch + window wait (`e2e_launch_ptm`), tool preflight (`e2e_require`), and one EXIT trap. Critically, lib.sh also isolates tmux (`TMUX_TMPDIR` + `unset TMUX` — the unset matters: with `$TMUX` leaked from a tmux-hosted shell, tmux ignores `TMUX_TMPDIR` and cleanup's `kill-server` would destroy the USER'S server; this happened once, don't reintroduce it). Per-script extra teardown goes in an `e2e_extra_cleanup()` function. Tests serialize via a `Mutex` in the wrapper (`E2E_LOCK`); each script picks PID-derived session names so reruns don't collide. The spawn-position test sets `PTM_TERMINAL_CMD=xterm` so it doesn't depend on gnome-terminal/DBus, runs openbox inside Xvfb so ptm sees `_NET_CLIENT_LIST` updates, and uses window-relative `xdotool mousemove --window` clicks so the openbox frame offset doesn't affect coordinates.
 
 ## Project Structure
 
@@ -53,6 +54,7 @@ tests/
     recipes_survive_restart.sh      # Phase 5c: tmux row reattaches after PTM restart
     ptm_id_stamped_on_spawn.sh      # @ptm_id + _PTM_ID stamped at spawn
     session_rebind_survives_restart.sh  # _PTM_SESSION rebind survives PTM restart
+    geometry_roundtrip_restart.sh   # sidebar position survives graceful quit + relaunch
 LICENSE
 README.md
 ```

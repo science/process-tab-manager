@@ -69,7 +69,7 @@ e2e_require() {
     local tool
     for tool in Xvfb xdpyinfo "$@"; do
         command -v "$tool" >/dev/null || {
-            echo "FAIL: missing $tool (sudo apt install xvfb xdotool xterm openbox tmux scrot x11-utils)"
+            echo "FAIL: missing $tool (sudo apt install xvfb xdotool xterm openbox tmux scrot wmctrl x11-utils)"
             exit 2
         }
     done

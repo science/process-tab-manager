@@ -86,6 +86,11 @@ struct Atoms {
     wm_protocols: Atom,
     wm_delete_window: Atom,
     net_wm_pid: Atom,
+    /// `_NET_WM_STATE` / `_NET_WM_STATE_FULLSCREEN` — used by the
+    /// decapitation self-heal (`heal_decapitation`) to force the WM to
+    /// relayout our frame after a broken re-adoption.
+    net_wm_state: Atom,
+    net_wm_state_fullscreen: Atom,
     ptm_wake: Atom,
     ptm_save_tick: Atom,
     /// Wake atom for the Phase 5a recipe-dump trigger (sent by the
@@ -122,6 +127,8 @@ impl Atoms {
         let c10 = conn.intern_atom(false, b"WM_PROTOCOLS")?;
         let c11 = conn.intern_atom(false, b"WM_DELETE_WINDOW")?;
         let c12 = conn.intern_atom(false, b"_NET_WM_PID")?;
+        let c18 = conn.intern_atom(false, b"_NET_WM_STATE")?;
+        let c19 = conn.intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")?;
         let c13 = conn.intern_atom(false, b"_PTM_WAKE")?;
         let c14 = conn.intern_atom(false, b"_PTM_SAVE_TICK")?;
         let c15 = conn.intern_atom(false, b"_PTM_DUMP_RECIPES")?;
@@ -141,6 +148,8 @@ impl Atoms {
             wm_protocols: c10.reply()?.atom,
             wm_delete_window: c11.reply()?.atom,
             net_wm_pid: c12.reply()?.atom,
+            net_wm_state: c18.reply()?.atom,
+            net_wm_state_fullscreen: c19.reply()?.atom,
             ptm_wake: c13.reply()?.atom,
             ptm_save_tick: c14.reply()?.atom,
             ptm_dump_recipes: c15.reply()?.atom,
@@ -1909,6 +1918,15 @@ struct App {
     /// produce a notification per event. In-memory only (a new PTM
     /// process starts with a fresh debounce window).
     last_notify_marker: Option<(HealthState, std::time::Instant)>,
+    /// When set, the save tick runs `detect_decapitation` once this
+    /// instant passes. Scheduled ~1.5 s after a ReparentNotify on our own
+    /// window (a WM came or went) so the WM finishes its normal
+    /// post-reparent child placement before we judge the result.
+    frame_check_at: Option<std::time::Instant>,
+    /// Fullscreen-toggle heals attempted since the last ReparentNotify.
+    /// Bounded so a WM that keeps mis-framing us can't trigger an endless
+    /// toggle loop.
+    frame_heal_attempts: u8,
 }
 
 /// How long a successful-drop row highlight stays visible before fading out.
@@ -1948,6 +1966,8 @@ impl App {
             health_dismissed_this_session: false,
             health_popup: None,
             last_notify_marker: None,
+            frame_check_at: None,
+            frame_heal_attempts: 0,
         }
     }
 
@@ -3322,6 +3342,79 @@ fn get_window_geometry(
         geo.width as u32,
         geo.height as u32,
     ))
+}
+
+/// True when our client window is buried under its own titlebar:
+/// reparented into a WM frame, the WM advertises a non-zero top decoration
+/// via _NET_FRAME_EXTENTS, yet the client sits above where that decoration
+/// ends. This is muffin's stale-seed re-adoption bug (frame.c reparents
+/// the client at (0,0) and skips the follow-up move when its cached client
+/// rect — pre-adoption ROOT coords — happens to equal the frame-relative
+/// target). `parent_is_root` guards the WM-dead window where the extents
+/// property lingers but no frame exists.
+fn is_decapitated(parent_is_root: bool, rel_y: i32, frame_extents_top: i32) -> bool {
+    !parent_is_root && frame_extents_top > 0 && rel_y < frame_extents_top
+}
+
+/// X-side wrapper for `is_decapitated`: query our parent and our offset
+/// within it. get_geometry x/y are parent-relative, which is exactly the
+/// coordinate the bug corrupts.
+fn detect_decapitation(
+    conn: &impl Connection,
+    root: Window,
+    window: Window,
+    atoms: &Atoms,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let parent = conn.query_tree(window)?.reply()?.parent;
+    let geo = conn.get_geometry(window)?.reply()?;
+    let (_, _, top, _) = get_frame_extents(conn, window, atoms)?;
+    Ok(is_decapitated(parent == root, geo.y as i32, top))
+}
+
+const NET_WM_STATE_REMOVE: u32 = 0;
+const NET_WM_STATE_ADD: u32 = 1;
+
+fn send_net_wm_fullscreen(
+    conn: &impl Connection,
+    root: Window,
+    window: Window,
+    atoms: &Atoms,
+    action: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // data32: [action, property1, property2, source (1 = application), 0]
+    let data = ClientMessageData::from([action, atoms.net_wm_state_fullscreen, 0, 1, 0]);
+    let event = ClientMessageEvent {
+        response_type: 33,
+        format: 32,
+        sequence: 0,
+        window,
+        type_: atoms.net_wm_state,
+        data,
+    };
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    Ok(())
+}
+
+/// Recover from the mis-framed state: a fullscreen round-trip forces the
+/// WM to relayout the frame with zero borders and back, re-placing the
+/// client inside the frame on both transitions. (A decoration toggle is
+/// NOT reliable here — if the bare client lands back on the trigger
+/// coordinates, the re-frame skips the child move again.)
+fn heal_decapitation(
+    conn: &impl Connection,
+    root: Window,
+    window: Window,
+    atoms: &Atoms,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_net_wm_fullscreen(conn, root, window, atoms, NET_WM_STATE_ADD)?;
+    send_net_wm_fullscreen(conn, root, window, atoms, NET_WM_STATE_REMOVE)?;
+    conn.flush()?;
+    Ok(())
 }
 
 fn activate_window(
@@ -7666,6 +7759,48 @@ fn geometry_path() -> std::path::PathBuf {
     data_dir().join("geometry")
 }
 
+/// Convert our client window's root-absolute origin into the coordinates
+/// worth persisting: the visible frame's top-left. Restoring issues a
+/// ConfigureRequest, which EWMH-compliant WMs interpret (under the default
+/// NorthWest win_gravity) as positioning the FRAME — so saving the frame
+/// origin is what makes the position round-trip exactly.
+///
+/// ConfigureNotify x/y must never be used for this: real (non-synthetic)
+/// events report coordinates relative to the WM frame, which is how the
+/// frame's interior child offset (literally "10 44") once ended up
+/// persisted as a screen position.
+fn frame_origin_from_client_root(
+    client_root_x: i32,
+    client_root_y: i32,
+    extents_left: i32,
+    extents_top: i32,
+) -> (i16, i16) {
+    let clamp = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    (
+        clamp(client_root_x - extents_left),
+        clamp(client_root_y - extents_top),
+    )
+}
+
+/// Query the position `save_geometry` should persist for our own window:
+/// translate (0,0) to root coordinates (immune to the frame-relative
+/// ConfigureNotify ambiguity) and back out the visible frame extents.
+fn query_own_frame_origin(
+    conn: &impl Connection,
+    window: Window,
+    atoms: &Atoms,
+) -> Result<(i16, i16), Box<dyn std::error::Error>> {
+    let geo = conn.get_geometry(window)?.reply()?;
+    let trans = conn.translate_coordinates(window, geo.root, 0, 0)?.reply()?;
+    let (left, _, top, _) = get_frame_extents(conn, window, atoms)?;
+    Ok(frame_origin_from_client_root(
+        trans.dst_x as i32,
+        trans.dst_y as i32,
+        left,
+        top,
+    ))
+}
+
 fn save_geometry(x: i16, y: i16, w: u16, h: u16) {
     let path = geometry_path();
     let content = format!("{} {} {} {}\n", x, y, w, h);
@@ -9064,10 +9199,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = conn.wait_for_event()?;
 
+        // WM-restart detection, in any mode: our window being reparented
+        // (frame destroyed → root child, or root → a new WM's frame) is the
+        // signal that a WM came or went. Schedule a frame-sanity check for
+        // after the WM settles — muffin's re-adoption can leave our client
+        // at (0,0) inside the frame, buried under our own titlebar (see
+        // is_decapitated).
+        if let Event::ReparentNotify(ev) = &event {
+            if ev.window == window {
+                app.frame_check_at = Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(1500),
+                );
+                app.frame_heal_attempts = 0;
+            }
+        }
+
         // Handle WM_DELETE_WINDOW and our own wake pings in any mode.
         if let Event::ClientMessage(ev) = &event {
             if ev.window == window && ev.data.as_data32()[0] == atoms.wm_delete_window {
-                save_geometry(app.x, app.y, app.width, app.height);
+                let (gx, gy) =
+                    query_own_frame_origin(&conn, window, &atoms).unwrap_or((app.x, app.y));
+                save_geometry(gx, gy, app.width, app.height);
                 save_groups(&app);
                 app.clear_dirty();
                 break;
@@ -9080,8 +9232,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let now = std::time::Instant::now();
                     if should_save_now(app.first_dirty_at, app.last_dirty_at, now) {
                         save_groups(&app);
-                        save_geometry(app.x, app.y, app.width, app.height);
+                        let (gx, gy) = query_own_frame_origin(&conn, window, &atoms)
+                            .unwrap_or((app.x, app.y));
+                        save_geometry(gx, gy, app.width, app.height);
                         app.clear_dirty();
+                    }
+                }
+                // Deferred frame-sanity check (scheduled by ReparentNotify).
+                if let Some(when) = app.frame_check_at {
+                    if std::time::Instant::now() >= when {
+                        app.frame_check_at = None;
+                        if detect_decapitation(&conn, root, window, &atoms).unwrap_or(false) {
+                            if app.frame_heal_attempts < 2 {
+                                app.frame_heal_attempts += 1;
+                                eprintln!(
+                                    "ptm: client buried under its own titlebar (WM re-adoption bug); forcing a re-frame via fullscreen toggle (attempt {})",
+                                    app.frame_heal_attempts
+                                );
+                                let _ = heal_decapitation(&conn, root, window, &atoms);
+                                // Re-check after the toggle settles.
+                                app.frame_check_at = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(2),
+                                );
+                            } else {
+                                eprintln!(
+                                    "ptm: still mis-framed after 2 heal attempts; giving up until the next reparent"
+                                );
+                            }
+                        }
                     }
                 }
                 // T3.5: while a post-drop highlight is mid-fade, request a
@@ -10528,6 +10707,83 @@ mod tests {
         assert_eq!(load_geometry_from(&path), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── frame-origin coordinate translation (geometry save) ──
+    //
+    // ConfigureNotify x/y are frame-RELATIVE for real (non-synthetic)
+    // events under a reparenting WM, so they must never be persisted as a
+    // screen position — that's how "10 44" (muffin's frame interior
+    // offset) once ended up in the geometry file. What we persist instead
+    // is the visible frame's root origin: client root position minus the
+    // visible _NET_FRAME_EXTENTS, matching EWMH NorthWest-gravity restore
+    // semantics (a ConfigureRequest positions the frame, not the client).
+
+    #[test]
+    fn frame_origin_muffin_titlebar_only() {
+        // muffin visible extents: left 0, top 36 (titlebar only).
+        assert_eq!(frame_origin_from_client_root(100, 200, 0, 36), (100, 164));
+    }
+
+    #[test]
+    fn frame_origin_openbox_borders() {
+        // openbox-style: visible border on all sides.
+        assert_eq!(frame_origin_from_client_root(105, 225, 5, 25), (100, 200));
+    }
+
+    #[test]
+    fn frame_origin_no_wm_is_identity() {
+        assert_eq!(frame_origin_from_client_root(137, 211, 0, 0), (137, 211));
+    }
+
+    #[test]
+    fn frame_origin_clamps_to_i16() {
+        assert_eq!(
+            frame_origin_from_client_root(40_000, -40_000, 0, 0),
+            (i16::MAX, i16::MIN)
+        );
+    }
+
+    // ── decapitation detection (muffin stale-seed re-adoption bug) ──
+    //
+    // Broken state: client reparented into a WM frame but left at y=0
+    // inside it, burying the titlebar under the client. Healthy muffin
+    // puts the client at rel-y 44 (36 visible + 8 invisible); healthy
+    // openbox at rel-y == extents top exactly.
+
+    #[test]
+    fn decapitated_when_client_at_frame_origin_under_titlebar() {
+        // The observed bug: framed, 36px titlebar advertised, client at 0.
+        assert!(is_decapitated(false, 0, 36));
+    }
+
+    #[test]
+    fn decapitated_when_client_partially_buries_titlebar() {
+        assert!(is_decapitated(false, 20, 36));
+    }
+
+    #[test]
+    fn not_decapitated_healthy_muffin_offsets() {
+        // rel-y 44 (incl. invisible border) vs visible top 36.
+        assert!(!is_decapitated(false, 44, 36));
+    }
+
+    #[test]
+    fn not_decapitated_healthy_exact_boundary() {
+        // openbox: client rel-y equals the visible top extent exactly.
+        assert!(!is_decapitated(false, 25, 25));
+    }
+
+    #[test]
+    fn not_decapitated_when_unframed_with_stale_extents() {
+        // WM died: client is a root child but _NET_FRAME_EXTENTS lingers.
+        // No frame → nothing to heal (and no WM to answer the toggle).
+        assert!(!is_decapitated(true, 0, 36));
+    }
+
+    #[test]
+    fn not_decapitated_when_undecorated() {
+        assert!(!is_decapitated(false, 0, 0));
     }
 
     // ── Group persistence ──

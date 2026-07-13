@@ -6,8 +6,8 @@
 //! they're serialized via `E2E_LOCK`. Each script picks unique tmux session
 //! names (PID-derived) so they don't trample each other across runs.
 //!
-//! Required system tools: Xvfb, xdotool, tmux, scrot, xdpyinfo.
-//! Install: `sudo apt install xvfb xdotool tmux scrot x11-utils`.
+//! Required system tools: Xvfb, xdotool, tmux, scrot, wmctrl, xdpyinfo.
+//! Install: `sudo apt install xvfb xdotool tmux scrot wmctrl x11-utils`.
 //!
 //! The wrapper points each script at the cargo-built binary via
 //! `CARGO_BIN_EXE_ptm` (set automatically by cargo for binary crates) so a
@@ -179,6 +179,24 @@ fn new_tmux_stamps_matching_ptm_id_on_session_and_window() {
     assert!(
         ok,
         "'+ New tmux' should stamp a matching persistent id on the session and the window\n{}",
+        out
+    );
+}
+
+/// Regression guard for the frame-relative geometry-save bug: PTM used to
+/// persist raw ConfigureNotify x/y (frame-relative under a reparenting WM),
+/// so the geometry file ended up holding the frame's interior child offset
+/// ("10 44") and every restart drifted the window by the frame extents.
+/// The fix persists the visible frame's root origin via
+/// translate_coordinates + _NET_FRAME_EXTENTS. The script moves the window,
+/// closes PTM gracefully (WM_DELETE → shutdown save), relaunches, and
+/// asserts the client's absolute position is unchanged.
+#[test]
+fn geometry_roundtrips_across_restart_under_reparenting_wm() {
+    let (ok, out) = run_e2e_script("geometry_roundtrip_restart.sh");
+    assert!(
+        ok,
+        "sidebar position should survive a graceful quit + relaunch\n{}",
         out
     );
 }
